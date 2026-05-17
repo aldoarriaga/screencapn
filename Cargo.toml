@@ -1,0 +1,17 @@
+[workspace]
+members = [
+  "crates/screencaptn-core",
+  "crates/screencaptn-win",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Screen Captn"]
+license = "MIT"
+repository = "https://example.invalid/screencaptn"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
