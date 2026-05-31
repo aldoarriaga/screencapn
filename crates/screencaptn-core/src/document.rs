@@ -68,11 +68,24 @@ impl CaptureDocument {
         hit
     }
 
-    pub fn selected_mut(&mut self) -> Option<&mut Annotation> {
-        let selected = self.selected_annotation_id?;
+    pub fn annotation(&self, id: AnnotationId) -> Option<&Annotation> {
+        self.annotations
+            .iter()
+            .find(|annotation| annotation.id == id)
+    }
+
+    pub fn annotation_mut(&mut self, id: AnnotationId) -> Option<&mut Annotation> {
         self.annotations
             .iter_mut()
-            .find(|annotation| annotation.id == selected)
+            .find(|annotation| annotation.id == id)
+    }
+
+    pub fn selected(&self) -> Option<&Annotation> {
+        self.annotation(self.selected_annotation_id?)
+    }
+
+    pub fn selected_mut(&mut self) -> Option<&mut Annotation> {
+        self.annotation_mut(self.selected_annotation_id?)
     }
 }
 

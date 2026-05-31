@@ -8,7 +8,7 @@ pub struct Color {
 
 impl Color {
     pub const BLACK: Self = Self::rgb(0, 0, 0);
-    pub const BLUE: Self = Self::rgb(41, 98, 255);
+    pub const BLUE: Self = Self::rgb(10, 132, 255);
     pub const RED: Self = Self::rgb(230, 57, 70);
     pub const YELLOW: Self = Self::rgba(255, 214, 10, 130);
     pub const WHITE: Self = Self::rgb(255, 255, 255);
@@ -41,7 +41,7 @@ impl StrokeStyle {
 
 impl Default for StrokeStyle {
     fn default() -> Self {
-        Self::new(3.0, Color::BLUE)
+        Self::new(8.0, Color::BLUE)
     }
 }
 

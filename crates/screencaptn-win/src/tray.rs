@@ -1,3 +1,4 @@
+use crate::overlay::AppTheme;
 use windows::core::w;
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, POINT};
@@ -11,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub const WM_TRAYICON: u32 = WM_APP + 1;
+pub const TRAY_TOGGLE_THEME_COMMAND: usize = 9000;
 pub const TRAY_EXIT_COMMAND: usize = 9001;
 const TRAY_UID: u32 = 1;
 
@@ -43,8 +45,13 @@ pub unsafe fn remove_tray_icon(hwnd: HWND) {
     let _ = Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
-pub unsafe fn show_tray_menu(hwnd: HWND) -> Option<usize> {
+pub unsafe fn show_tray_menu(hwnd: HWND, theme: AppTheme) -> Option<usize> {
     let menu = CreatePopupMenu().ok()?;
+    let toggle_label = match theme {
+        AppTheme::Light => w!("Switch to dark mode"),
+        AppTheme::Dark => w!("Switch to light mode"),
+    };
+    AppendMenuW(menu, MF_STRING, TRAY_TOGGLE_THEME_COMMAND, toggle_label).ok()?;
     AppendMenuW(menu, MF_STRING, TRAY_EXIT_COMMAND, w!("Exit Screen Captn")).ok()?;
 
     let mut cursor = POINT::default();
