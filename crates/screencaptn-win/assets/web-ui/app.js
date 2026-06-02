@@ -16,9 +16,11 @@
     height: window.innerHeight,
   });
   const committedLayer = new Konva.Layer({ listening: false });
+  const selectionLayer = new Konva.Layer({ listening: false });
   const previewLayer = new Konva.Layer({ listening: false });
   const uiLayer = new Konva.Layer();
   stage.add(committedLayer);
+  stage.add(selectionLayer);
   stage.add(previewLayer);
   stage.add(uiLayer);
 
@@ -43,6 +45,20 @@
   let caretVisible = true;
   let hoveredSlider = null;
   let sliderHotzones = [];
+  let renderScheduled = false;
+  let previewRenderScheduled = false;
+  let pendingState = null;
+  let pointerMoveScheduled = false;
+  let pendingPointerMove = null;
+  const previewNodes = new Map();
+  let previewDynamicGroup = null;
+  const annotationNodeCache = new Map();
+  const mosaicCanvasCache = new Map();
+  let committedTarget = committedLayer;
+  const perf = {
+    enabled: false,
+    counters: new Map(),
+  };
 
   const tools = [
     { action: "grip", width: 36, icon: "grip" },
@@ -64,7 +80,7 @@
     { action: "cancel", width: 36, icon: "cancel" },
   ];
 
-  const colors = ["#0A84FF", "#FF3B30", "#FFD60A", "#00C853", "#BF5AF2"];
+  const colors = ["#FF3B30", "#0A84FF", "#FFD60A", "#00C853", "#BF5AF2"];
   const TOOL_HOVER_EFFECT = {
     enabled: true,
     scale: 1.1,
@@ -146,7 +162,7 @@
 
   function hexColor(color) {
     if (!color) {
-      return "#0A84FF";
+      return "#FF3B30";
     }
     const part = (n) => Math.max(0, Math.min(255, n || 0)).toString(16).padStart(2, "0");
     return `#${part(color.r)}${part(color.g)}${part(color.b)}`.toUpperCase();
@@ -474,17 +490,96 @@
     host(Object.assign({ type }, extra || {}));
   }
 
+  function measure(name, fn) {
+    if (!perf.enabled || !window.performance) {
+      return fn();
+    }
+    const start = performance.now();
+    try {
+      return fn();
+    } finally {
+      const duration = performance.now() - start;
+      const current = perf.counters.get(name) || { count: 0, total: 0, max: 0 };
+      current.count += 1;
+      current.total += duration;
+      current.max = Math.max(current.max, duration);
+      perf.counters.set(name, current);
+      if (current.count % 120 === 0) {
+        console.debug(
+          `[ScreenCaptn perf] ${name}: avg=${(current.total / current.count).toFixed(2)}ms max=${current.max.toFixed(2)}ms`
+        );
+      }
+    }
+  }
+
+  function scheduleRender(nextState) {
+    if (nextState) {
+      pendingState = nextState;
+    }
+    if (renderScheduled) {
+      return;
+    }
+    renderScheduled = true;
+    requestAnimationFrame(() => {
+      renderScheduled = false;
+      if (pendingState) {
+        state = pendingState;
+        pendingState = null;
+      }
+      measure("full-render", render);
+    });
+  }
+
+  function schedulePreviewRender() {
+    if (previewRenderScheduled) {
+      return;
+    }
+    previewRenderScheduled = true;
+    requestAnimationFrame(() => {
+      previewRenderScheduled = false;
+      measure("preview-render", renderPreview);
+      previewLayer.batchDraw();
+    });
+  }
+
+  function schedulePointerMove(point) {
+    pendingPointerMove = point;
+    if (pointerMoveScheduled) {
+      return;
+    }
+    pointerMoveScheduled = true;
+    requestAnimationFrame(() => {
+      pointerMoveScheduled = false;
+      if (!pendingPointerMove) {
+        return;
+      }
+      const point = pendingPointerMove;
+      pendingPointerMove = null;
+      command("pointerMove", cssToPhysicalPoint(point));
+    });
+  }
+
+  function flushPointerMove() {
+    if (!pendingPointerMove) {
+      return;
+    }
+    const point = pendingPointerMove;
+    pendingPointerMove = null;
+    command("pointerMove", cssToPhysicalPoint(point));
+  }
+
   function render() {
     sliderHotzones = [];
     uiLayer.destroyChildren();
-    committedLayer.destroyChildren();
-    previewLayer.destroyChildren();
     renderCommittedAnnotations();
     renderPreview();
     const rect = toolbarRect();
     if (!rect) {
       watermarkInput.style.display = "none";
+      clearAnnotationNodeCache();
+      selectionLayer.destroyChildren();
       committedLayer.batchDraw();
+      selectionLayer.batchDraw();
       uiLayer.batchDraw();
       previewLayer.batchDraw();
       return;
@@ -492,6 +587,7 @@
     drawToolbar(rect);
     drawSubmenu(rect);
     committedLayer.batchDraw();
+    selectionLayer.batchDraw();
     uiLayer.batchDraw();
     previewLayer.batchDraw();
   }
@@ -969,6 +1065,11 @@
       x = drawOptionIcon(group, x, "calendar", !!state.watermarkDateEnabled, () => command("setWatermarkMode", { mode: "date" }), p, s);
       x = drawOptionIcon(group, x, "lineText", state.watermarkMode === "text", () => command("focusWatermarkText"), p, s);
       x = drawOptionIcon(group, x, "image", state.watermarkMode === "image", () => command("setWatermarkMode", { mode: "image" }), p, s);
+      x = drawOptionIcon(group, x, "cancel", false, () => {
+        watermarkInput.value = "";
+        watermarkInput.blur();
+        command("clearWatermark");
+      }, p, s);
       x = drawDivider(group, x, p, s);
       positionWatermarkInput(layout.x + x, layout.y + 3 * s, 122 * s, 18 * s);
       x += 132 * s;
@@ -989,7 +1090,7 @@
       highlighter: 304,
       text: 326,
       tag: 374,
-      watermark: 374,
+      watermark: 380,
       mosaic: 250,
       step: 72,
     };
@@ -1304,8 +1405,7 @@
     }
     preview = shouldStartPreview(point) ? { start: point, current: point, points: [point] } : null;
     command("pointerDown", cssToPhysicalPoint(point));
-    renderPreview();
-    previewLayer.batchDraw();
+    schedulePreviewRender();
   });
 
   stage.on("mousemove touchmove", (evt) => {
@@ -1332,10 +1432,9 @@
           preview.points.push(current);
         }
       }
-      renderPreview();
-      previewLayer.batchDraw();
+      schedulePreviewRender();
     }
-    command("pointerMove", cssToPhysicalPoint(point));
+    schedulePointerMove(point);
   });
 
   stage.on("mouseup touchend", (evt) => {
@@ -1352,10 +1451,10 @@
     if (!point) {
       return;
     }
+    flushPointerMove();
     command("pointerUp", cssToPhysicalPoint(point));
     preview = null;
-    renderPreview();
-    previewLayer.batchDraw();
+    schedulePreviewRender();
   });
 
   stage.on("dblclick dbltap", (evt) => {
@@ -1371,18 +1470,69 @@
 
   function renderCommittedAnnotations() {
     if (!state || !state.captureRegion || !Array.isArray(state.annotations)) {
+      clearAnnotationNodeCache();
+      selectionLayer.destroyChildren();
       return;
     }
-    for (const annotation of state.annotations) {
-      drawCommittedAnnotation(annotation);
-      if (annotation.stepNumber != null) {
-        drawStepBadge(autoStepBadgeCenter(annotation), annotation.stepNumber, annotation.id);
+    const seen = new Set();
+    state.annotations.forEach((annotation, index) => {
+      seen.add(annotation.id);
+      const signature = annotationRenderSignature(annotation);
+      let cached = annotationNodeCache.get(annotation.id);
+      if (!cached || cached.signature !== signature) {
+        if (cached) {
+          cached.group.destroy();
+        }
+        const group = new Konva.Group({ listening: false, name: `annotation-${annotation.id}` });
+        const previousTarget = committedTarget;
+        committedTarget = group;
+        drawCommittedAnnotation(annotation);
+        if (annotation.stepNumber != null) {
+          drawStepBadge(autoStepBadgeCenter(annotation), annotation.stepNumber, annotation.id, strokeColor(annotation));
+        }
+        committedTarget = previousTarget;
+        committedLayer.add(group);
+        cached = { signature, group };
+        annotationNodeCache.set(annotation.id, cached);
+      }
+      cached.group.zIndex(index);
+    });
+    for (const [id, cached] of annotationNodeCache) {
+      if (!seen.has(id)) {
+        cached.group.destroy();
+        annotationNodeCache.delete(id);
       }
     }
+    selectionLayer.destroyChildren();
     const selected = state.annotations.find((annotation) => annotation.id === state.selectedAnnotationId);
     if (selected) {
       drawSelection(selected);
     }
+  }
+
+  function clearAnnotationNodeCache() {
+    for (const cached of annotationNodeCache.values()) {
+      cached.group.destroy();
+    }
+    annotationNodeCache.clear();
+    committedLayer.destroyChildren();
+  }
+
+  function annotationRenderSignature(annotation) {
+    return JSON.stringify({
+      annotation,
+      scale: scale(),
+      viewportScale: viewportScale(),
+      renderStyle: renderStyle(),
+      editingTextId: state && state.editingTextId,
+      editingStepNumberId: state && state.editingStepNumberId,
+      caretVisible,
+    });
+  }
+
+  function addCommitted(node) {
+    committedTarget.add(node);
+    return node;
   }
 
   function drawCommittedAnnotation(annotation) {
@@ -1393,27 +1543,27 @@
     const opacity = strokeOpacity(annotation);
     const style = renderStyle();
     if (kind.type === "rectangle") {
-      committedLayer.add(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, stroke: color, strokeWidth: width, opacity }));
+      addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, stroke: color, strokeWidth: width, opacity }));
     } else if (kind.type === "oval") {
-      committedLayer.add(new Konva.Ellipse({ x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2, radiusX: bounds.width / 2, radiusY: bounds.height / 2, stroke: color, strokeWidth: width, opacity }));
+      addCommitted(new Konva.Ellipse({ x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2, radiusX: bounds.width / 2, radiusY: bounds.height / 2, stroke: color, strokeWidth: width, opacity }));
     } else if (kind.type === "line") {
       const start = physicalToCssPoint(kind.start);
       const end = physicalToCssPoint(kind.end);
-      committedLayer.add(new Konva.Line({ points: [start.x, start.y, end.x, end.y], stroke: color, strokeWidth: width, opacity, lineCap: "round" }));
+      addCommitted(new Konva.Line({ points: [start.x, start.y, end.x, end.y], stroke: color, strokeWidth: width, opacity, lineCap: "round" }));
     } else if (kind.type === "arrow") {
       const start = physicalToCssPoint(kind.start);
       const end = physicalToCssPoint(kind.end);
       const head = arrowHeadSize(width, style);
-      committedLayer.add(new Konva.Arrow({ points: [start.x, start.y, end.x, end.y], stroke: color, fill: color, strokeWidth: width, opacity, pointerLength: head.length, pointerWidth: head.width, lineCap: "round" }));
+      addCommitted(new Konva.Arrow({ points: [start.x, start.y, end.x, end.y], stroke: color, fill: color, strokeWidth: width, opacity, pointerLength: head.length, pointerWidth: head.width, lineCap: "round" }));
     } else if (kind.type === "pen" || kind.type === "penArrow") {
       const points = smoothFlatPoints(flattenPhysicalPoints(kind.points));
       if (points.length < 4) {
         return;
       }
       if (kind.type === "penArrow") {
-        drawPenArrowPath(committedLayer, points, color, width, opacity);
+        drawPenArrowPath(committedTarget, points, color, width, opacity);
       } else {
-        committedLayer.add(new Konva.Line({ points, stroke: color, strokeWidth: width, opacity, lineCap: "round", lineJoin: "round", tension: style.penTension == null ? 0.35 : style.penTension }));
+        addCommitted(new Konva.Line({ points, stroke: color, strokeWidth: width, opacity, lineCap: "round", lineJoin: "round", tension: style.penTension == null ? 0.35 : style.penTension }));
       }
     } else if (kind.type === "highlighter") {
       drawCommittedHighlighter(annotation, kind, bounds, color, width);
@@ -1424,7 +1574,7 @@
     } else if (kind.type === "tag") {
       drawCommittedTag(annotation, kind, bounds, color);
     } else if (kind.type === "step") {
-      drawStepBadge(explicitStepBadgeCenter(annotation), kind.number, annotation.id);
+      drawStepBadge(explicitStepBadgeCenter(annotation), kind.number, annotation.id, strokeColor(annotation));
     }
   }
 
@@ -1496,7 +1646,7 @@
         stroke: color,
         strokeWidth: width,
         opacity,
-        lineCap: "butt",
+        lineCap: "round",
         lineJoin: "round",
         tension: 0.35,
       })
@@ -1553,9 +1703,9 @@
       const start = physicalToCssPoint(kind.start);
       const end = physicalToCssPoint(kind.end);
       const highlighterWidth = (style.highlighterLineBase || 24) + width * (style.highlighterLineWidthFactor || 3);
-      committedLayer.add(new Konva.Line({ points: [start.x, start.y, end.x, end.y], stroke: color, opacity: alpha, strokeWidth: highlighterWidth, lineCap: "round" }));
+      addCommitted(new Konva.Line({ points: [start.x, start.y, end.x, end.y], stroke: color, opacity: alpha, strokeWidth: highlighterWidth, lineCap: "round" }));
     } else {
-      committedLayer.add(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, cornerRadius: physicalScalar(style.cornerRadius || 8), fill: color, opacity: alpha }));
+      addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, cornerRadius: physicalScalar(style.cornerRadius || 8), fill: color, opacity: alpha }));
     }
   }
 
@@ -1563,18 +1713,42 @@
     const style = renderStyle();
     const radius = physicalScalar(8);
     const cell = Math.max(6, physicalScalar(style.mosaicCell || 12));
-    const group = new Konva.Group({
-      clipFunc: (ctx) => {
-        roundedRectPath(ctx, bounds.x, bounds.y, bounds.width, bounds.height, radius);
-      },
-    });
-    for (let y = bounds.y; y < bounds.y + bounds.height; y += cell) {
-      for (let x = bounds.x; x < bounds.x + bounds.width; x += cell) {
-        const shade = mosaicShade(x, y);
-        group.add(new Konva.Rect({ x, y, width: Math.min(cell, bounds.x + bounds.width - x), height: Math.min(cell, bounds.y + bounds.height - y), fill: shade, opacity: 1 }));
+    const canvas = mosaicCanvasFor(bounds, cell, radius);
+    layer.add(new Konva.Image({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, image: canvas }));
+  }
+
+  function mosaicCanvasFor(bounds, cell, radius) {
+    const width = Math.max(1, Math.ceil(bounds.width));
+    const height = Math.max(1, Math.ceil(bounds.height));
+    const normalizedCell = Math.max(1, Math.round(cell));
+    const normalizedRadius = Math.max(0, Math.round(radius));
+    const key = `${width}:${height}:${normalizedCell}:${normalizedRadius}`;
+    const cached = mosaicCanvasCache.get(key);
+    if (cached) {
+      return cached;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { alpha: true });
+    if (!ctx) {
+      return canvas;
+    }
+    roundedRectPath(ctx, 0, 0, width, height, normalizedRadius);
+    ctx.clip();
+    for (let y = 0; y < height; y += normalizedCell) {
+      for (let x = 0; x < width; x += normalizedCell) {
+        ctx.fillStyle = mosaicShade(x, y);
+        ctx.fillRect(x, y, Math.min(normalizedCell, width - x), Math.min(normalizedCell, height - y));
       }
     }
-    layer.add(group);
+    if (width * height <= 4_000_000) {
+      mosaicCanvasCache.set(key, canvas);
+      while (mosaicCanvasCache.size > 8) {
+        mosaicCanvasCache.delete(mosaicCanvasCache.keys().next().value);
+      }
+    }
+    return canvas;
   }
 
   function roundedRectPath(ctx, x, y, width, height, radius) {
@@ -1608,7 +1782,7 @@
     const framed = !!kind.framed;
     if (framed) {
       if (filled) {
-        committedLayer.add(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, cornerRadius: physicalScalar(12), fill: color }));
+        addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, cornerRadius: physicalScalar(12), fill: color }));
       }
       const textNode = new Konva.Text({
         x: bounds.x + padding,
@@ -1620,9 +1794,9 @@
         lineHeight: 1.22,
         fill: filled ? contrastTextColor(color) : color,
       });
-      committedLayer.add(textNode);
+      addCommitted(textNode);
       if (state.editingTextId === annotation.id) {
-        committedLayer.add(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, dash: [5, 4], stroke: selectionColor(), strokeWidth: Math.max(1, physicalScalar(1)) }));
+        addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, dash: [5, 4], stroke: selectionColor(), strokeWidth: Math.max(1, physicalScalar(1)) }));
       }
     } else {
       const textY = bounds.y - fontSize * 1.08;
@@ -1635,14 +1809,14 @@
         lineHeight: 1,
         fill: filled ? contrastTextColor(color) : color,
       });
-      committedLayer.add(textNode);
+      addCommitted(textNode);
       if (filled && text) {
         textNode.moveToTop();
-        committedLayer.add(new Konva.Rect({ x: bounds.x - padding, y: textY - padding * 0.55, width: textNode.width() + padding * 2, height: fontSize * 1.28 + padding, cornerRadius: physicalScalar(12), fill: color }));
+        addCommitted(new Konva.Rect({ x: bounds.x - padding, y: textY - padding * 0.55, width: textNode.width() + padding * 2, height: fontSize * 1.28 + padding, cornerRadius: physicalScalar(12), fill: color }));
         textNode.moveToTop();
       }
       if (state.editingTextId === annotation.id && caretVisible) {
-        committedLayer.add(new Konva.Line({ points: [bounds.x + textNode.width() + physicalScalar(2), textY, bounds.x + textNode.width() + physicalScalar(2), textY + fontSize * 1.25], stroke: filled ? contrastTextColor(color) : color, strokeWidth: Math.max(1, physicalScalar(1.5)) }));
+        addCommitted(new Konva.Line({ points: [bounds.x + textNode.width() + physicalScalar(2), textY, bounds.x + textNode.width() + physicalScalar(2), textY + fontSize * 1.25], stroke: filled ? contrastTextColor(color) : color, strokeWidth: Math.max(1, physicalScalar(1.5)) }));
       }
     }
   }
@@ -1654,15 +1828,15 @@
     const padding = physicalScalar(style.tagInnerPad || 8);
     const anchor = physicalToCssPoint(kind.anchor);
     const fontSize = physicalScalar(kind.fontSize || state.fontSize || 27);
-    drawTagBody(committedLayer, bounds, anchor, color, frame, radius);
+    drawTagBody(committedTarget, bounds, anchor, color, frame, radius);
     const inner = {
       x: bounds.x + frame,
       y: bounds.y + frame,
       width: Math.max(1, bounds.width - frame * 2),
       height: Math.max(1, bounds.height - frame * 2),
     };
-    committedLayer.add(new Konva.Rect({ x: inner.x, y: inner.y, width: inner.width, height: inner.height, cornerRadius: Math.max(1, radius - frame / 2), fill: "#FFFFFF" }));
-    committedLayer.add(new Konva.Text({ x: inner.x + padding, y: inner.y + padding, width: Math.max(1, inner.width - padding * 2), text: kind.label || "", fontFamily: "Segoe UI", fontSize, lineHeight: 1.22, fill: "#000000" }));
+    addCommitted(new Konva.Rect({ x: inner.x, y: inner.y, width: inner.width, height: inner.height, cornerRadius: Math.max(1, radius - frame / 2), fill: "#FFFFFF" }));
+    addCommitted(new Konva.Text({ x: inner.x + padding, y: inner.y + padding, width: Math.max(1, inner.width - padding * 2), text: kind.label || "", fontFamily: "Segoe UI", fontSize, lineHeight: 1.22, fill: "#000000" }));
   }
 
   function tagFrameForAnnotation(annotation, style) {
@@ -1672,57 +1846,126 @@
   }
 
   function drawTagBody(layer, box, anchor, color, frame, radius) {
-    const geom = tagPointerGeometry(box, anchor, frame);
-    layer.add(
-      new Konva.Shape({
-        sceneFunc: (ctx, shape) => {
-          ctx.beginPath();
-          ctx.moveTo(geom.base1.x, geom.base1.y);
-          ctx.lineTo(geom.tip1.x, geom.tip1.y);
-          ctx.quadraticCurveTo(anchor.x, anchor.y, geom.tip2.x, geom.tip2.y);
-          ctx.lineTo(geom.base2.x, geom.base2.y);
-          ctx.closePath();
-          ctx.fillStrokeShape(shape);
-        },
-        fill: color,
-        stroke: color,
-        strokeWidth: 0,
-      })
-    );
+    const cornerConnector = tagCornerConnector(box, anchor, frame, radius);
+    if (cornerConnector) {
+      layer.add(
+        new Konva.Shape({
+          sceneFunc: (ctx, shape) => {
+            ctx.beginPath();
+            ctx.moveTo(cornerConnector.base1.x, cornerConnector.base1.y);
+            ctx.lineTo(cornerConnector.tip1.x, cornerConnector.tip1.y);
+            ctx.quadraticCurveTo(cornerConnector.anchor.x, cornerConnector.anchor.y, cornerConnector.tip2.x, cornerConnector.tip2.y);
+            ctx.lineTo(cornerConnector.base2.x, cornerConnector.base2.y);
+            ctx.closePath();
+            ctx.fillStrokeShape(shape);
+          },
+          fill: color,
+          stroke: color,
+          strokeWidth: 0,
+        })
+      );
+    } else {
+      const geom = tagPointerGeometry(box, anchor, frame, radius);
+      layer.add(
+        new Konva.Shape({
+          sceneFunc: (ctx, shape) => {
+            ctx.beginPath();
+            ctx.moveTo(geom.base1.x, geom.base1.y);
+            ctx.lineTo(geom.tip1.x, geom.tip1.y);
+            ctx.quadraticCurveTo(geom.anchor.x, geom.anchor.y, geom.tip2.x, geom.tip2.y);
+            ctx.lineTo(geom.base2.x, geom.base2.y);
+            ctx.closePath();
+            ctx.fillStrokeShape(shape);
+          },
+          fill: color,
+          stroke: color,
+          strokeWidth: 0,
+        })
+      );
+    }
     layer.add(new Konva.Rect({ x: box.x, y: box.y, width: box.width, height: box.height, cornerRadius: radius, fill: color }));
   }
 
-  function tagPointerGeometry(box, anchor, frame) {
-    const center = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-    const dx = anchor.x - center.x;
-    const dy = anchor.y - center.y;
-    let edge;
-    if (Math.abs(dx / Math.max(1, box.width)) > Math.abs(dy / Math.max(1, box.height))) {
-      edge = dx < 0 ? "left" : "right";
-    } else {
-      edge = dy < 0 ? "top" : "bottom";
+  function tagCornerConnector(box, anchor, frame, radius) {
+    const outsideX = anchor.x < box.x || anchor.x > box.x + box.width;
+    const outsideY = anchor.y < box.y || anchor.y > box.y + box.height;
+    if (!outsideX || !outsideY) {
+      return null;
     }
-    const halfBase = frame * 1.15;
-    const inset = frame * 1.9;
+    const r = Math.max(0, Math.min(radius, box.width / 2, box.height / 2));
+    const inset = Math.max(frame + Math.max(3, frame * 0.35), r * 0.65);
+    const center = Point2(anchor.x < box.x ? box.x + inset : box.x + box.width - inset, anchor.y < box.y ? box.y + inset : box.y + box.height - inset);
+    return pointerGeometryFromCenter(center, anchor, Math.max(10, frame * 1.28), Math.max(3.5, frame * 0.34), frame * 0.72);
+  }
+
+  function tagPointerGeometry(box, anchor, frame, radius) {
+    let edge;
+    if (anchor.y < box.y) {
+      edge = "top";
+    } else if (anchor.y > box.y + box.height) {
+      edge = "bottom";
+    } else if (anchor.x < box.x) {
+      edge = "left";
+    } else if (anchor.x > box.x + box.width) {
+      edge = "right";
+    } else {
+      edge = "bottom";
+    }
+    const r = Math.max(0, Math.min(radius, box.width / 2, box.height / 2));
+    const maxHorizontalHalf = Math.max(7, (box.width - r * 2) / 2 - 1);
+    const maxVerticalHalf = Math.max(7, (box.height - r * 2) / 2 - 1);
+    const horizontalHalf = Math.max(7, Math.min(frame * 1.9, maxHorizontalHalf));
+    const verticalHalf = Math.max(7, Math.min(frame * 1.9, maxVerticalHalf));
+    const overlap = Math.max(4, frame * 1.15);
     const tipRound = frame * 0.72;
     if (edge === "left") {
-      const y = Math.max(box.y + inset, Math.min(box.y + box.height - inset, anchor.y));
-      return pointerGeometryFromBase(Point2(box.x, y - halfBase), Point2(box.x, y + halfBase), anchor, tipRound);
+      const y = Math.max(box.y + r + verticalHalf, Math.min(box.y + box.height - r - verticalHalf, anchor.y));
+      return Object.assign(pointerGeometryFromBase(Point2(box.x + overlap, y + verticalHalf), Point2(box.x + overlap, y - verticalHalf), anchor, tipRound), { edge, anchor });
     }
     if (edge === "right") {
-      const y = Math.max(box.y + inset, Math.min(box.y + box.height - inset, anchor.y));
-      return pointerGeometryFromBase(Point2(box.x + box.width, y + halfBase), Point2(box.x + box.width, y - halfBase), anchor, tipRound);
+      const y = Math.max(box.y + r + verticalHalf, Math.min(box.y + box.height - r - verticalHalf, anchor.y));
+      return Object.assign(pointerGeometryFromBase(Point2(box.x + box.width - overlap, y - verticalHalf), Point2(box.x + box.width - overlap, y + verticalHalf), anchor, tipRound), { edge, anchor });
     }
     if (edge === "top") {
-      const x = Math.max(box.x + inset, Math.min(box.x + box.width - inset, anchor.x));
-      return pointerGeometryFromBase(Point2(x + halfBase, box.y), Point2(x - halfBase, box.y), anchor, tipRound);
+      const x = Math.max(box.x + r + horizontalHalf, Math.min(box.x + box.width - r - horizontalHalf, anchor.x));
+      return Object.assign(pointerGeometryFromBase(Point2(x - horizontalHalf, box.y + overlap), Point2(x + horizontalHalf, box.y + overlap), anchor, tipRound), { edge, anchor });
     }
-    const x = Math.max(box.x + inset, Math.min(box.x + box.width - inset, anchor.x));
-    return pointerGeometryFromBase(Point2(x - halfBase, box.y + box.height), Point2(x + halfBase, box.y + box.height), anchor, tipRound);
+    const x = Math.max(box.x + r + horizontalHalf, Math.min(box.x + box.width - r - horizontalHalf, anchor.x));
+    return Object.assign(pointerGeometryFromBase(Point2(x + horizontalHalf, box.y + box.height - overlap), Point2(x - horizontalHalf, box.y + box.height - overlap), anchor, tipRound), { edge, anchor });
   }
 
   function Point2(x, y) {
     return { x, y };
+  }
+
+  function pointerGeometryFromCenter(baseCenter, anchor, baseHalf, tipHalf, round) {
+    const vx = anchor.x - baseCenter.x;
+    const vy = anchor.y - baseCenter.y;
+    const len = Math.max(1, Math.hypot(vx, vy));
+    const ux = vx / len;
+    const uy = vy / len;
+    const px = -uy;
+    const py = ux;
+    const r = Math.min(round, len * 0.4);
+    const base1 = { x: baseCenter.x + px * baseHalf, y: baseCenter.y + py * baseHalf };
+    const base2 = { x: baseCenter.x - px * baseHalf, y: baseCenter.y - py * baseHalf };
+    const tipA = { x: anchor.x - ux * r + px * tipHalf, y: anchor.y - uy * r + py * tipHalf };
+    const tipB = { x: anchor.x - ux * r - px * tipHalf, y: anchor.y - uy * r - py * tipHalf };
+    const sameOrder = distanceSquared(base1, tipA) + distanceSquared(base2, tipB);
+    const swappedOrder = distanceSquared(base1, tipB) + distanceSquared(base2, tipA);
+    return {
+      base1,
+      base2,
+      tip1: sameOrder <= swappedOrder ? tipA : tipB,
+      tip2: sameOrder <= swappedOrder ? tipB : tipA,
+      anchor,
+    };
+  }
+
+  function distanceSquared(a, b) {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return dx * dx + dy * dy;
   }
 
   function pointerGeometryFromBase(base1, base2, anchor, round) {
@@ -1735,11 +1978,15 @@
     const px = -uy;
     const py = ux;
     const r = Math.min(round, len * 0.4);
+    const tipA = { x: anchor.x - ux * r + px * r * 0.45, y: anchor.y - uy * r + py * r * 0.45 };
+    const tipB = { x: anchor.x - ux * r - px * r * 0.45, y: anchor.y - uy * r - py * r * 0.45 };
+    const sameOrder = distanceSquared(base1, tipA) + distanceSquared(base2, tipB);
+    const swappedOrder = distanceSquared(base1, tipB) + distanceSquared(base2, tipA);
     return {
       base1,
       base2,
-      tip1: { x: anchor.x - ux * r + px * r * 0.45, y: anchor.y - uy * r + py * r * 0.45 },
-      tip2: { x: anchor.x - ux * r - px * r * 0.45, y: anchor.y - uy * r - py * r * 0.45 },
+      tip1: sameOrder <= swappedOrder ? tipA : tipB,
+      tip2: sameOrder <= swappedOrder ? tipB : tipA,
     };
   }
 
@@ -1751,13 +1998,17 @@
       drawHandle(physicalToCssPoint(kind.start), color);
       drawHandle(physicalToCssPoint(kind.end), color);
     } else if (kind.type === "pen" || kind.type === "penArrow") {
-      return;
+      const points = smoothFlatPoints(flattenPhysicalPoints(kind.points || []));
+      if (points.length >= 4) {
+        drawHandle({ x: points[0], y: points[1] }, color);
+        drawHandle({ x: points[points.length - 2], y: points[points.length - 1] }, color);
+      }
     } else {
       const selectionBounds = kind.type === "text" && !kind.framed ? inlineTextHitBounds(bounds, kind) : bounds;
       if (kind.type === "text") {
-        committedLayer.add(new Konva.Rect({ x: selectionBounds.x, y: selectionBounds.y, width: selectionBounds.width, height: selectionBounds.height, dash: [5, 4], stroke: color, strokeWidth: Math.max(1, physicalScalar(1)) }));
+        selectionLayer.add(new Konva.Rect({ x: selectionBounds.x, y: selectionBounds.y, width: selectionBounds.width, height: selectionBounds.height, dash: [5, 4], stroke: color, strokeWidth: Math.max(1, physicalScalar(1)) }));
       } else {
-        committedLayer.add(new Konva.Rect({ x: selectionBounds.x, y: selectionBounds.y, width: selectionBounds.width, height: selectionBounds.height, stroke: color, strokeWidth: Math.max(1, physicalScalar(1)) }));
+        selectionLayer.add(new Konva.Rect({ x: selectionBounds.x, y: selectionBounds.y, width: selectionBounds.width, height: selectionBounds.height, stroke: color, strokeWidth: Math.max(1, physicalScalar(1)) }));
       }
       drawHandle({ x: selectionBounds.x, y: selectionBounds.y }, color);
       drawHandle({ x: selectionBounds.x + selectionBounds.width, y: selectionBounds.y }, color);
@@ -1771,23 +2022,24 @@
 
   function drawHandle(point, color) {
     const size = Math.max(6, physicalScalar((renderStyle().selectionHandleSize || 8)));
-    committedLayer.add(new Konva.Rect({ x: point.x - size / 2, y: point.y - size / 2, width: size, height: size, fill: color }));
+    selectionLayer.add(new Konva.Rect({ x: point.x - size / 2, y: point.y - size / 2, width: size, height: size, fill: color }));
   }
 
   function selectionColor() {
     return "#0A84FF";
   }
 
-  function drawStepBadge(center, number, id) {
+  function drawStepBadge(center, number, id, backgroundColor) {
     if (number == null) {
       return;
     }
     const size = 22 * scale();
-    committedLayer.add(new Konva.Circle({ x: center.x, y: center.y, radius: size / 2, fill: "#0A84FF" }));
+    const fill = backgroundColor || activeColor();
+    addCommitted(new Konva.Circle({ x: center.x, y: center.y, radius: size / 2, fill }));
     if (state.editingStepNumberId === id) {
-      committedLayer.add(new Konva.Circle({ x: center.x, y: center.y, radius: size / 2 + Math.max(1, 2 * scale()), stroke: "#FFFFFF", strokeWidth: Math.max(1, 1.4 * scale()), shadowColor: "#0A84FF", shadowBlur: 6 * scale(), shadowOpacity: 0.5 }));
+      addCommitted(new Konva.Circle({ x: center.x, y: center.y, radius: size / 2 + Math.max(1, 2 * scale()), stroke: "#FFFFFF", strokeWidth: Math.max(1, 1.4 * scale()), shadowColor: fill, shadowBlur: 6 * scale(), shadowOpacity: 0.5 }));
     }
-    committedLayer.add(
+    addCommitted(
       new Konva.Text({
         x: center.x - size / 2,
         y: center.y - size * 0.36,
@@ -1797,7 +2049,7 @@
         fontFamily: "Segoe UI",
         fontStyle: "700",
         fontSize: number < 10 ? 13 * scale() : 11 * scale(),
-        fill: "#FFFFFF",
+        fill: contrastTextColor(fill),
       })
     );
   }
@@ -1889,9 +2141,44 @@
     return points[points.length - 1];
   }
 
+  function ensurePreviewDynamicGroup() {
+    if (!previewDynamicGroup || !previewDynamicGroup.getLayer()) {
+      previewDynamicGroup = new Konva.Group({ listening: false, name: "preview-dynamic" });
+      previewLayer.add(previewDynamicGroup);
+    }
+    return previewDynamicGroup;
+  }
+
+  function getPreviewNode(key, factory) {
+    let node = previewNodes.get(key);
+    if (!node || !node.getLayer()) {
+      node = factory();
+      node.listening(false);
+      node.visible(false);
+      previewLayer.add(node);
+      previewNodes.set(key, node);
+    }
+    node.visible(true);
+    return node;
+  }
+
+  function preparePreviewLayer(activeKey) {
+    for (const [key, node] of previewNodes) {
+      node.visible(key === activeKey);
+    }
+    ensurePreviewDynamicGroup().destroyChildren();
+  }
+
+  function hidePreviewLayer() {
+    for (const node of previewNodes.values()) {
+      node.visible(false);
+    }
+    ensurePreviewDynamicGroup().destroyChildren();
+  }
+
   function renderPreview() {
-    previewLayer.destroyChildren();
     if (!preview || !state || !state.captureRegion) {
+      hidePreviewLayer();
       return;
     }
     const tool = state.activeTool;
@@ -1901,37 +2188,51 @@
     const end = preview.current;
     const rect = rectFromPoints(start, end);
     if (tool === "rectangle") {
-      previewLayer.add(new Konva.Rect({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, stroke: color, strokeWidth: width }));
+      preparePreviewLayer("rectangle");
+      getPreviewNode("rectangle", () => new Konva.Rect()).setAttrs({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, stroke: color, strokeWidth: width });
     } else if (tool === "oval") {
-      previewLayer.add(new Konva.Ellipse({ x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, radiusX: rect.width / 2, radiusY: rect.height / 2, stroke: color, strokeWidth: width }));
+      preparePreviewLayer("oval");
+      getPreviewNode("oval", () => new Konva.Ellipse()).setAttrs({ x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, radiusX: rect.width / 2, radiusY: rect.height / 2, stroke: color, strokeWidth: width });
     } else if (tool === "line") {
-      previewLayer.add(new Konva.Line({ points: [start.x, start.y, end.x, end.y], stroke: color, strokeWidth: width, lineCap: "round" }));
+      preparePreviewLayer("line");
+      getPreviewNode("line", () => new Konva.Line({ lineCap: "round" })).setAttrs({ points: [start.x, start.y, end.x, end.y], stroke: color, strokeWidth: width });
     } else if (tool === "arrow") {
-      previewLayer.add(new Konva.Arrow({ points: [start.x, start.y, end.x, end.y], stroke: color, fill: color, strokeWidth: width, pointerLength: Math.max(12, width * 3), pointerWidth: Math.max(12, width * 3), lineCap: "round" }));
+      preparePreviewLayer("arrow");
+      getPreviewNode("arrow", () => new Konva.Arrow({ lineCap: "round" })).setAttrs({ points: [start.x, start.y, end.x, end.y], stroke: color, fill: color, strokeWidth: width, pointerLength: Math.max(12, width * 3), pointerWidth: Math.max(12, width * 3) });
     } else if (tool === "pen") {
+      preparePreviewLayer("dynamic");
+      const group = ensurePreviewDynamicGroup();
       const pts = flattenPoints(preview.points);
       if (state.penMode === "arrow") {
-        drawPenArrowPath(previewLayer, smoothFlatPoints(pts), color, width, 1);
+        drawPenArrowPath(group, smoothFlatPoints(pts), color, width, 1);
       } else {
-        previewLayer.add(new Konva.Line({ points: smoothFlatPoints(pts), stroke: color, strokeWidth: width, lineCap: "round", lineJoin: "round", tension: 0.35 }));
+        group.add(new Konva.Line({ points: smoothFlatPoints(pts), stroke: color, strokeWidth: width, lineCap: "round", lineJoin: "round", tension: 0.35 }));
       }
     } else if (tool === "highlighter") {
       const alpha = 0.3;
       if (state.highlighterShape === "line") {
-        previewLayer.add(new Konva.Line({ points: [start.x, start.y, end.x, end.y], stroke: color, opacity: alpha, strokeWidth: 24 + width * 3, lineCap: "round" }));
+        preparePreviewLayer("highlighter-line");
+        getPreviewNode("highlighter-line", () => new Konva.Line({ lineCap: "round" })).setAttrs({ points: [start.x, start.y, end.x, end.y], stroke: color, opacity: alpha, strokeWidth: 24 + width * 3 });
       } else {
-        previewLayer.add(new Konva.Rect({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, cornerRadius: 8 * scale(), fill: color, opacity: alpha }));
+        preparePreviewLayer("highlighter-area");
+        getPreviewNode("highlighter-area", () => new Konva.Rect()).setAttrs({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, cornerRadius: 8 * scale(), fill: color, opacity: alpha });
       }
     } else if (tool === "mosaic") {
+      hidePreviewLayer();
       return;
     } else if (tool === "text") {
       if (rect.width > 4 && rect.height > 4) {
-        previewLayer.add(new Konva.Rect({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, dash: [5, 4], stroke: "white", strokeWidth: 1 }));
+        preparePreviewLayer("text-area");
+        getPreviewNode("text-area", () => new Konva.Rect({ dash: [5, 4] })).setAttrs({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, stroke: "white", strokeWidth: 1 });
       } else {
-        previewLayer.add(new Konva.Line({ points: [start.x, start.y - 18, start.x, start.y + 6], stroke: color, strokeWidth: 1 }));
+        preparePreviewLayer("text-caret");
+        getPreviewNode("text-caret", () => new Konva.Line()).setAttrs({ points: [start.x, start.y - 18, start.x, start.y + 6], stroke: color, strokeWidth: 1 });
       }
     } else if (tool === "tag") {
+      preparePreviewLayer("dynamic");
       drawTagPreview(start, end, color);
+    } else {
+      hidePreviewLayer();
     }
   }
 
@@ -1940,13 +2241,14 @@
     const box = tagBoxFromDrag(anchor, current, s);
     const frame = Math.max(6 * s, currentWidth() >= 6 ? currentWidth() : 14 * s);
     const radius = 10 * s;
-    drawTagBody(previewLayer, box, anchor, color, frame, radius);
-    previewLayer.add(new Konva.Rect({ x: box.x + frame, y: box.y + frame, width: Math.max(1, box.width - frame * 2), height: Math.max(1, box.height - frame * 2), cornerRadius: Math.max(1, radius - frame / 2), fill: "#FFFFFF" }));
+    const group = ensurePreviewDynamicGroup();
+    drawTagBody(group, box, anchor, color, frame, radius);
+    group.add(new Konva.Rect({ x: box.x + frame, y: box.y + frame, width: Math.max(1, box.width - frame * 2), height: Math.max(1, box.height - frame * 2), cornerRadius: Math.max(1, radius - frame / 2), fill: "#FFFFFF" }));
   }
 
   function tagBoxFromDrag(anchor, current, s) {
-    const width = 220 * s;
-    const height = 110 * s;
+    const width = 146 * s;
+    const height = 55 * s;
     if (Math.hypot(current.x - anchor.x, current.y - anchor.y) <= 5 * s) {
       return { x: anchor.x + 28 * s, y: anchor.y - height / 2, width, height };
     }
@@ -2043,23 +2345,39 @@
   });
 
   window.chrome.webview.addEventListener("message", (event) => {
-    if (!event.data || event.data.type !== "state") {
+    if (!event.data) {
       return;
     }
-    state = event.data.state;
-    render();
+    if (event.data.type === "state") {
+      scheduleRender(event.data.state);
+    } else if (event.data.type === "exportRequest") {
+      handleExportRequest(event.data);
+    }
   });
+
+  function handleExportRequest(request) {
+    const requestId = request && request.requestId;
+    if (!request || request.format !== "png") {
+      host({ type: "exportFailed", requestId, reason: "unsupported-format" });
+      return;
+    }
+    if (request.backgroundRequired && (!request.background || !request.background.data)) {
+      host({ type: "exportFailed", requestId, reason: "background-unavailable" });
+      return;
+    }
+    host({ type: "exportFailed", requestId, reason: "web-export-not-enabled" });
+  }
 
   window.addEventListener("resize", () => {
     stage.width(window.innerWidth);
     stage.height(window.innerHeight);
-    render();
+    scheduleRender();
   });
 
   window.setInterval(() => {
     caretVisible = !caretVisible;
     if (state && state.editingTextId) {
-      render();
+      scheduleRender();
     }
   }, 500);
 

@@ -3,7 +3,7 @@ use screencaptn_core::{
     Annotation, AnnotationId, AnnotationKind, CaptureDocument, Color, HighlightShape, History,
     MosaicMode, Point, Rect, ResizeHandle, StrokeStyle, ToolKind,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
@@ -64,8 +64,8 @@ const TOOL_ICON_SELECTED_RADIUS: f32 = 6.0;
 const HIGHLIGHTER_RADIUS: f32 = 8.0;
 const PEN_POINT_SPACING: f32 = 5.5;
 const DEFAULT_TEXT_FONT_SIZE: f32 = 27.0;
-const TAG_DEFAULT_WIDTH: f32 = 220.0;
-const TAG_DEFAULT_HEIGHT: f32 = 110.0;
+const TAG_DEFAULT_WIDTH: f32 = 146.0;
+const TAG_DEFAULT_HEIGHT: f32 = 55.0;
 const TAG_FRAME: f32 = 14.0;
 const TAG_RADIUS: f32 = 10.0;
 const CARET_TIMER_ID: usize = 1;
@@ -82,6 +82,8 @@ const MIN_STROKE_WIDTH: f32 = 1.0;
 const MAX_STROKE_WIDTH: f32 = 24.0;
 const MIN_FONT_SIZE: f32 = 27.0;
 const MAX_FONT_SIZE: f32 = 56.0;
+const WATERMARK_OPACITY: f32 = 0.5;
+const WEB_EXPORT_ENABLED: bool = false;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppTheme {
@@ -290,6 +292,8 @@ impl OverlayState {
 struct WebUiMessage {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(rename = "requestId")]
+    request_id: Option<u64>,
     x: Option<f32>,
     y: Option<f32>,
     #[serde(rename = "rawX")]
@@ -304,10 +308,89 @@ struct WebUiMessage {
     filled: Option<bool>,
     text: Option<String>,
     id: Option<AnnotationId>,
+    format: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
     #[serde(rename = "keyCode")]
     key_code: Option<u32>,
     #[serde(rename = "charCode")]
     char_code: Option<u32>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ExportTarget {
+    Clipboard,
+    Save,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct WebColor {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+impl From<Color> for WebColor {
+    fn from(color: Color) -> Self {
+        Self {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderStyle {
+    corner_radius: f32,
+    tag_radius: f32,
+    tag_frame: f32,
+    tag_inner_pad: f32,
+    arrow_min_head: f32,
+    arrow_head_width_factor: f32,
+    arrow_head_length_factor: f32,
+    pen_tension: f32,
+    highlighter_opacity: f32,
+    highlighter_line_base: f32,
+    highlighter_line_width_factor: f32,
+    mosaic_cell: f32,
+    selection_color: WebColor,
+    selection_handle_size: f32,
+    step_badge_size: f32,
+    step_badge_font_size: f32,
+    step_badge_single_digit_x: f32,
+    step_badge_multi_digit_x: f32,
+    step_badge_text_y: f32,
+}
+
+impl RenderStyle {
+    fn for_state(state: &OverlayState) -> Self {
+        Self {
+            corner_radius: scaled(state, HIGHLIGHTER_RADIUS),
+            tag_radius: scaled(state, TAG_RADIUS),
+            tag_frame: scaled(state, TAG_FRAME),
+            tag_inner_pad: scaled(state, 8.0),
+            arrow_min_head: 12.0,
+            arrow_head_width_factor: 3.0,
+            arrow_head_length_factor: 3.0,
+            pen_tension: 0.35,
+            highlighter_opacity: state.highlighter_opacity,
+            highlighter_line_base: 24.0,
+            highlighter_line_width_factor: 3.0,
+            mosaic_cell: scaled(state, 10.8),
+            selection_color: Color::BLUE.into(),
+            selection_handle_size: scaled(state, 8.0),
+            step_badge_size: 24.0,
+            step_badge_font_size: 14.0,
+            step_badge_single_digit_x: 8.0,
+            step_badge_multi_digit_x: 5.0,
+            step_badge_text_y: 4.0,
+        }
+    }
 }
 
 unsafe fn overlay_web_message(context: *mut c_void, message: String) {
@@ -488,6 +571,10 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 false
             }
         }
+        "clearWatermark" => {
+            clear_watermark(state);
+            true
+        }
         "focusWatermarkText" => {
             state.watermark_mode = WatermarkMode::Text;
             state.editing_watermark_text = true;
@@ -528,8 +615,31 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 false
             }
         }
+        "exportReady" => {
+            handle_web_export_ready(&message);
+            false
+        }
+        "exportFailed" => {
+            handle_web_export_failed(&message);
+            false
+        }
         _ => false,
     }
+}
+
+fn handle_web_export_ready(message: &WebUiMessage) {
+    write_web_ui_debug(&format!(
+        "web-export-ready: request={:?} format={:?} size={:?}x{:?}",
+        message.request_id, message.format, message.width, message.height
+    ));
+}
+
+fn handle_web_export_failed(message: &WebUiMessage) {
+    write_web_ui_debug(&format!(
+        "web-export-failed: request={:?} reason={}",
+        message.request_id,
+        message.reason.as_deref().unwrap_or("unknown")
+    ));
 }
 
 fn write_web_ui_debug(message: &str) {
@@ -554,6 +664,53 @@ fn sync_web_ui_state(state: &OverlayState) {
     })
     .to_string();
     web_ui.post_json(&payload);
+}
+
+fn maybe_request_web_export(state: &OverlayState, target: ExportTarget) -> bool {
+    if !WEB_EXPORT_ENABLED {
+        return false;
+    }
+    request_web_export(state, target)
+}
+
+fn request_web_export(state: &OverlayState, target: ExportTarget) -> bool {
+    let Some(web_ui) = &state.web_ui else {
+        return false;
+    };
+    let Some(region) = state.document.capture_region else {
+        return false;
+    };
+    let request_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "type": "exportRequest",
+        "requestId": request_id,
+        "target": export_target_name(target),
+        "format": "png",
+        "region": rect_json(Rect::new(0.0, 0.0, region.width, region.height)),
+        "background": serde_json::Value::Null,
+        "backgroundRequired": true,
+        "annotations": web_export_annotations_json(state, region),
+        "watermark": {
+            "text": state.watermark_text,
+            "dateEnabled": state.watermark_date_enabled,
+            "mode": watermark_mode_web_name(state.watermark_mode),
+            "opacity": WATERMARK_OPACITY,
+        },
+        "renderStyle": web_render_style_json(state),
+    })
+    .to_string();
+    web_ui.post_json(&payload);
+    true
+}
+
+fn export_target_name(target: ExportTarget) -> &'static str {
+    match target {
+        ExportTarget::Clipboard => "clipboard",
+        ExportTarget::Save => "save",
+    }
 }
 
 fn web_ui_state(state: &OverlayState) -> serde_json::Value {
@@ -606,22 +763,7 @@ fn web_ui_state(state: &OverlayState) -> serde_json::Value {
 }
 
 fn web_render_style_json(state: &OverlayState) -> serde_json::Value {
-    serde_json::json!({
-        "cornerRadius": scaled(state, HIGHLIGHTER_RADIUS),
-        "tagRadius": scaled(state, TAG_RADIUS),
-        "tagFrame": scaled(state, TAG_FRAME),
-        "tagInnerPad": scaled(state, 8.0),
-        "arrowMinHead": 12.0,
-        "arrowHeadWidthFactor": 3.0,
-        "arrowHeadLengthFactor": 3.0,
-        "penTension": 0.35,
-        "highlighterOpacity": state.highlighter_opacity,
-        "highlighterLineBase": 24.0,
-        "highlighterLineWidthFactor": 3.0,
-        "mosaicCell": scaled(state, 10.8),
-        "selectionColor": color_json(Color::BLUE),
-        "selectionHandleSize": scaled(state, 8.0),
-    })
+    serde_json::to_value(RenderStyle::for_state(state)).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 fn web_annotations_json(state: &OverlayState) -> serde_json::Value {
@@ -634,10 +776,32 @@ fn web_annotations_json(state: &OverlayState) -> serde_json::Value {
     serde_json::Value::Array(annotations)
 }
 
+fn web_export_annotations_json(state: &OverlayState, region: Rect) -> serde_json::Value {
+    let annotations: Vec<serde_json::Value> = state
+        .document
+        .annotations
+        .iter()
+        .map(|annotation| {
+            web_annotation_json_with_origin(state, annotation, Point::new(region.x, region.y))
+        })
+        .collect();
+    serde_json::Value::Array(annotations)
+}
+
 fn web_annotation_json(state: &OverlayState, annotation: &Annotation) -> serde_json::Value {
-    let bounds = annotation
-        .bounds
-        .translate(-state.screen_bounds.x, -state.screen_bounds.y);
+    web_annotation_json_with_origin(
+        state,
+        annotation,
+        Point::new(state.screen_bounds.x, state.screen_bounds.y),
+    )
+}
+
+fn web_annotation_json_with_origin(
+    _state: &OverlayState,
+    annotation: &Annotation,
+    origin: Point,
+) -> serde_json::Value {
+    let bounds = annotation.bounds.translate(-origin.x, -origin.y);
     let mut value = serde_json::json!({
         "id": annotation.id,
         "bounds": rect_json(bounds),
@@ -657,13 +821,13 @@ fn web_annotation_json(state: &OverlayState, annotation: &Annotation) -> serde_j
         }),
         AnnotationKind::Line { start, end } => serde_json::json!({
             "type": "line",
-            "start": point_json(state.screen_to_overlay(*start)),
-            "end": point_json(state.screen_to_overlay(*end)),
+            "start": point_json(start.translate(-origin.x, -origin.y)),
+            "end": point_json(end.translate(-origin.x, -origin.y)),
         }),
         AnnotationKind::Arrow { start, end } => serde_json::json!({
             "type": "arrow",
-            "start": point_json(state.screen_to_overlay(*start)),
-            "end": point_json(state.screen_to_overlay(*end)),
+            "start": point_json(start.translate(-origin.x, -origin.y)),
+            "end": point_json(end.translate(-origin.x, -origin.y)),
         }),
         AnnotationKind::StepNumber { number } => serde_json::json!({
             "type": "step",
@@ -688,7 +852,7 @@ fn web_annotation_json(state: &OverlayState, annotation: &Annotation) -> serde_j
         } => serde_json::json!({
             "type": "tag",
             "label": label,
-            "anchor": point_json(state.screen_to_overlay(*anchor)),
+            "anchor": point_json(anchor.translate(-origin.x, -origin.y)),
             "fontSize": font_size,
         }),
         AnnotationKind::Mosaic { mode, brush_size } => serde_json::json!({
@@ -705,16 +869,16 @@ fn web_annotation_json(state: &OverlayState, annotation: &Annotation) -> serde_j
             "type": "highlighter",
             "shape": highlighter_shape_web_name(*shape),
             "opacity": opacity,
-            "start": point_json(state.screen_to_overlay(*start)),
-            "end": point_json(state.screen_to_overlay(*end)),
+            "start": point_json(start.translate(-origin.x, -origin.y)),
+            "end": point_json(end.translate(-origin.x, -origin.y)),
         }),
         AnnotationKind::Pen { points } => serde_json::json!({
             "type": "pen",
-            "points": points_json(state, points),
+            "points": points_json_with_origin(points, origin),
         }),
         AnnotationKind::PenArrow { points } => serde_json::json!({
             "type": "penArrow",
-            "points": points_json(state, points),
+            "points": points_json_with_origin(points, origin),
         }),
         AnnotationKind::Watermark { text, opacity } => serde_json::json!({
             "type": "watermark",
@@ -733,11 +897,11 @@ fn point_json(point: Point) -> serde_json::Value {
     })
 }
 
-fn points_json(state: &OverlayState, points: &[Point]) -> serde_json::Value {
+fn points_json_with_origin(points: &[Point], origin: Point) -> serde_json::Value {
     let points: Vec<serde_json::Value> = points
         .iter()
         .copied()
-        .map(|point| point_json(state.screen_to_overlay(point)))
+        .map(|point| point_json(point.translate(-origin.x, -origin.y)))
         .collect();
     serde_json::Value::Array(points)
 }
@@ -982,6 +1146,7 @@ enum SubmenuAction {
     FontSize(f32),
     WatermarkMode(WatermarkMode),
     WatermarkTextInput,
+    ClearWatermark,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2302,6 +2467,7 @@ fn handle_submenu_action(state: &mut OverlayState, action: SubmenuAction) {
             state.editing_watermark_text = true;
             state.editing_text_id = None;
         }
+        SubmenuAction::ClearWatermark => clear_watermark(state),
     }
     apply_submenu_to_selected_annotation(state, action);
     state.mark_static_dirty();
@@ -2316,12 +2482,22 @@ fn handle_watermark_mode_action(state: &mut OverlayState, mode: WatermarkMode) {
             if let Some(path) = unsafe { show_open_image_dialog(state.hwnd) } {
                 let bitmap =
                     load_watermark_bitmap(&path, scaled(state, 72.0).round().max(1.0) as u32)
-                        .map(|bitmap| faded_watermark_bitmap(&bitmap, 0.5));
+                        .map(|bitmap| faded_watermark_bitmap(&bitmap, WATERMARK_OPACITY));
                 state.watermark_image_path = Some(path);
                 state.watermark_image_bitmap = bitmap;
             }
         }
     }
+    state.mark_static_dirty();
+}
+
+fn clear_watermark(state: &mut OverlayState) {
+    state.watermark_mode = WatermarkMode::Text;
+    state.watermark_date_enabled = false;
+    state.watermark_text.clear();
+    state.watermark_image_path = None;
+    state.watermark_image_bitmap = None;
+    state.editing_watermark_text = false;
     state.mark_static_dirty();
 }
 
@@ -2365,6 +2541,22 @@ fn apply_submenu_to_selected_annotation(state: &mut OverlayState, action: Submen
         SubmenuAction::TextFilled(next_filled) => {
             if let AnnotationKind::Text { filled, .. } = &mut annotation.kind {
                 *filled = next_filled;
+            }
+        }
+        SubmenuAction::PenMode(mode) => {
+            let replacement = match (&annotation.kind, mode) {
+                (AnnotationKind::Pen { points }, PenMode::Arrow) => {
+                    Some(AnnotationKind::PenArrow {
+                        points: points.clone(),
+                    })
+                }
+                (AnnotationKind::PenArrow { points }, PenMode::Free) => Some(AnnotationKind::Pen {
+                    points: points.clone(),
+                }),
+                _ => None,
+            };
+            if let Some(kind) = replacement {
+                annotation.kind = kind;
             }
         }
         SubmenuAction::HighlighterShape(_) => {}
@@ -2847,12 +3039,23 @@ fn animated_region_phase() -> f32 {
 }
 
 fn animated_region_border_color(t: f32) -> Color {
-    let colors = annotation_colors();
+    let colors = region_preview_colors();
     let wrapped = t.rem_euclid(1.0) * colors.len() as f32;
     let index = wrapped.floor() as usize % colors.len();
     let next = (index + 1) % colors.len();
     let local = wrapped - wrapped.floor();
     lerp_color(colors[index], colors[next], local)
+}
+
+fn region_preview_colors() -> [Color; 6] {
+    [
+        Color::rgb(0xff, 0x7f, 0x83),
+        Color::rgb(0xff, 0x63, 0x00),
+        Color::rgb(0xff, 0x3b, 0x30),
+        Color::rgb(0xff, 0xaa, 0xac),
+        Color::rgb(0xff, 0x63, 0x00),
+        Color::rgb(0xff, 0x7f, 0x83),
+    ]
 }
 
 fn lerp_color(a: Color, b: Color, t: f32) -> Color {
@@ -3016,8 +3219,8 @@ fn toolbar_action_width(state: &OverlayState, action: ToolbarAction) -> f32 {
 
 fn annotation_colors() -> [Color; 5] {
     [
-        Color::rgb(0x0a, 0x84, 0xff),
         Color::rgb(0xff, 0x3b, 0x30),
+        Color::rgb(0x0a, 0x84, 0xff),
         Color::rgb(0xff, 0xd6, 0x0a),
         Color::rgb(0x00, 0xc8, 0x53),
         Color::rgb(0xbf, 0x5a, 0xf2),
@@ -3672,6 +3875,15 @@ unsafe fn draw_tool_submenu(hdc: HDC, state: &mut OverlayState) {
                 state.watermark_image_path.is_some(),
                 SubmenuAction::WatermarkMode(WatermarkMode::Image),
             );
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "cancel",
+                false,
+                SubmenuAction::ClearWatermark,
+            );
             draw_submenu_divider(hdc, state, &mut x_cursor, palette);
             let input = Rect::new(
                 x_cursor,
@@ -3741,7 +3953,7 @@ fn submenu_width(state: &OverlayState, tool: ToolKind) -> f32 {
         ToolKind::Pen | ToolKind::Highlighter => 340.0,
         ToolKind::Text => 348.0,
         ToolKind::Tag => 286.0,
-        ToolKind::Watermark => 390.0,
+        ToolKind::Watermark => 420.0,
         _ => 0.0,
     };
     scaled(state, base)
@@ -4115,6 +4327,12 @@ unsafe fn draw_submenu_icon_button(
             include_str!("../assets/toolbar/image.svg"),
             palette.icon,
         ),
+        "cancel" => draw_submenu_static_svg(
+            hdc,
+            icon_rect,
+            include_str!("../assets/toolbar/cancel.svg"),
+            palette.icon,
+        ),
         _ => {}
     }
     state.submenu_buttons.push(SubmenuButton { rect, action });
@@ -4324,37 +4542,27 @@ unsafe fn draw_blur_region(hdc: HDC, rect: Rect, radius: f32) {
     if !rect.is_visible() {
         return;
     }
+    let surface_width = rect.width.ceil().max(1.0) as u32;
+    let surface_height = rect.height.ceil().max(1.0) as u32;
+    let mut bgra = vec![0u8; (surface_width * surface_height * 4) as usize];
     let cell = (14.0_f32.max(rect.width.min(rect.height) / 21.0).min(24.0) * 0.6).max(6.0);
     let cols = (rect.width / cell).ceil().max(1.0) as i32;
     let rows = (rect.height / cell).ceil().max(1.0) as i32;
-    let samples = 2;
-    let sample_count = (samples * samples) as f32;
     for row in 0..rows {
         for col in 0..cols {
             let x = rect.x + col as f32 * cell;
             let y = rect.y + row as f32 * cell;
-            let tile = Rect::new(
-                x,
-                y,
+            let local = Rect::new(
+                (x - rect.x).max(0.0),
+                (y - rect.y).max(0.0),
                 (rect.right() - x).min(cell).max(0.0),
                 (rect.bottom() - y).min(cell).max(0.0),
             );
-            if !tile.is_visible() {
+            if !local.is_visible() {
                 continue;
             }
-            let mut covered = 0.0;
-            for sy in 0..samples {
-                for sx in 0..samples {
-                    let px = tile.x - rect.x + tile.width * (sx as f32 + 0.5) / samples as f32;
-                    let py = tile.y - rect.y + tile.height * (sy as f32 + 0.5) / samples as f32;
-                    covered += rounded_rect_coverage(px, py, rect.width, rect.height, radius);
-                }
-            }
-            if covered <= 0.0 {
-                continue;
-            }
-            let sample_x = (tile.x + tile.width / 2.0).round() as i32;
-            let sample_y = (tile.y + tile.height / 2.0).round() as i32;
+            let sample_x = (x + local.width / 2.0).round() as i32;
+            let sample_y = (y + local.height / 2.0).round() as i32;
             let pixel = GetPixel(hdc, sample_x, sample_y).0;
             let sampled = Color::rgb(
                 (pixel & 0xff) as u8,
@@ -4362,8 +4570,68 @@ unsafe fn draw_blur_region(hdc: HDC, rect: Rect, radius: f32) {
                 ((pixel >> 16) & 0xff) as u8,
             );
             let color = mosaic_sample_color(sampled, row, col);
-            let alpha = (255.0 * covered / sample_count).round() as u8;
-            alpha_fill_rect(hdc, tile, color, alpha);
+            fill_mosaic_tile_bgra(
+                &mut bgra,
+                surface_width,
+                surface_height,
+                local,
+                rect.width,
+                rect.height,
+                radius,
+                color,
+            );
+        }
+    }
+    let _ = alpha_blend_bgra(hdc, rect, surface_width, surface_height, &bgra);
+}
+
+fn fill_mosaic_tile_bgra(
+    bgra: &mut [u8],
+    surface_width: u32,
+    surface_height: u32,
+    tile: Rect,
+    region_width: f32,
+    region_height: f32,
+    radius: f32,
+    color: Color,
+) {
+    let left = tile.x.floor().max(0.0) as u32;
+    let top = tile.y.floor().max(0.0) as u32;
+    let right = (tile.right().ceil().max(0.0) as u32).min(surface_width);
+    let bottom = (tile.bottom().ceil().max(0.0) as u32).min(surface_height);
+    let full_b = color.b;
+    let full_g = color.g;
+    let full_r = color.r;
+    for y in top..bottom {
+        let fy = y as f32 + 0.5;
+        for x in left..right {
+            let fx = x as f32 + 0.5;
+            let in_rounded_corner = radius > 0.0
+                && ((fx < radius && fy < radius)
+                    || (fx > region_width - radius && fy < radius)
+                    || (fx < radius && fy > region_height - radius)
+                    || (fx > region_width - radius && fy > region_height - radius));
+            let alpha = if in_rounded_corner {
+                let coverage = rounded_rect_coverage(fx, fy, region_width, region_height, radius);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                (255.0 * coverage).round().clamp(0.0, 255.0) as u8
+            } else {
+                255
+            };
+            let offset = ((y * surface_width + x) * 4) as usize;
+            if alpha == 255 {
+                bgra[offset] = full_b;
+                bgra[offset + 1] = full_g;
+                bgra[offset + 2] = full_r;
+                bgra[offset + 3] = 255;
+            } else {
+                bgra[offset] = ((color.b as u16 * alpha as u16) / 255) as u8;
+                bgra[offset + 1] = ((color.g as u16 * alpha as u16) / 255) as u8;
+                bgra[offset + 2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+                bgra[offset + 3] = alpha;
+            }
         }
     }
 }
@@ -4710,7 +4978,7 @@ unsafe fn draw_label_sized_color(
     let _ = DeleteObject(font);
 }
 
-unsafe fn draw_label_sized_color_rotated(
+unsafe fn draw_watermark_label_rotated(
     hdc: HDC,
     x: f32,
     y: f32,
@@ -4719,15 +4987,54 @@ unsafe fn draw_label_sized_color_rotated(
     color: Color,
     degrees: f32,
 ) {
-    SetBkMode(hdc, TRANSPARENT);
-    SetTextColor(hdc, crate::util::colorref(color));
+    if label.is_empty() || color.a == 0 {
+        return;
+    }
+    let text_width = approximate_text_width(label, font_size).max(font_size);
+    let text_height = (font_size * 1.55).max(1.0);
+    let angle = degrees.to_radians();
+    let pad = (font_size * 2.0).ceil().max(8.0);
+    let width = (text_width * angle.cos().abs() + text_height * angle.sin().abs() + pad * 2.0)
+        .ceil()
+        .max(1.0) as u32;
+    let height = (text_width * angle.sin().abs() + text_height * angle.cos().abs() + pad * 2.0)
+        .ceil()
+        .max(1.0) as u32;
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: width * height * 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let Ok(bitmap) = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
+        return;
+    };
+    if bits.is_null() {
+        let _ = DeleteObject(bitmap);
+        return;
+    }
+    let pixels = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (width * height * 4) as usize);
+    pixels.fill(0);
+
+    let mem_dc = CreateCompatibleDC(hdc);
+    let old_bitmap = SelectObject(mem_dc, bitmap);
+    SetBkMode(mem_dc, TRANSPARENT);
+    SetTextColor(mem_dc, windows::Win32::Foundation::COLORREF(0x00ff_ffff));
     let escapement = (degrees * 10.0).round() as i32;
     let font = CreateFontW(
         -(font_size.round().max(1.0) as i32),
         0,
         escapement,
         escapement,
-        400,
+        700,
         0,
         0,
         0,
@@ -4738,13 +5045,51 @@ unsafe fn draw_label_sized_color_rotated(
         0,
         w!("Segoe UI"),
     );
-    let old_font = SelectObject(hdc, font);
+    let old_font = SelectObject(mem_dc, font);
     let wide: Vec<u16> = label.encode_utf16().collect();
-    let _ = TextOutW(hdc, x.round() as i32, y.round() as i32, &wide);
-    let _ = SelectObject(hdc, old_font);
+    let _ = TextOutW(mem_dc, pad.round() as i32, pad.round() as i32, &wide);
+    let _ = SelectObject(mem_dc, old_font);
     let _ = DeleteObject(font);
-}
 
+    for pixel in pixels.chunks_exact_mut(4) {
+        let coverage = pixel[0].max(pixel[1]).max(pixel[2]);
+        if coverage == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+            pixel[3] = 0;
+            continue;
+        }
+        let alpha = ((coverage as u16 * color.a as u16) / 255) as u8;
+        pixel[0] = ((color.b as u16 * alpha as u16) / 255) as u8;
+        pixel[1] = ((color.g as u16 * alpha as u16) / 255) as u8;
+        pixel[2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+        pixel[3] = alpha;
+    }
+
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let _ = AlphaBlend(
+        hdc,
+        (x - pad).round() as i32,
+        (y - pad).round() as i32,
+        width as i32,
+        height as i32,
+        mem_dc,
+        0,
+        0,
+        width as i32,
+        height as i32,
+        blend,
+    );
+    let _ = SelectObject(mem_dc, old_bitmap);
+    let _ = DeleteObject(bitmap);
+    let _ = DeleteDC(mem_dc);
+}
 unsafe fn draw_text_annotation(
     hdc: HDC,
     bounds: Rect,
@@ -4955,8 +5300,7 @@ unsafe fn draw_tag_annotation(
 ) {
     let frame = tag_frame_for_width(frame_width);
     let radius = TAG_RADIUS;
-    draw_tag_pointer(hdc, bounds, anchor, frame_color);
-    fill_rounded_rect_antialias(hdc, bounds, radius, frame_color);
+    draw_tag_outer_shape(hdc, bounds, anchor, frame_color, frame, radius);
     let inner = tag_inner_rect(bounds, frame);
     fill_rounded_rect_antialias(hdc, inner, (radius - 3.0).max(2.0), Color::WHITE);
     draw_wrapped_text(hdc, inner, label, font_size, Color::BLACK);
@@ -4974,83 +5318,282 @@ fn tag_frame_for_width(width: f32) -> f32 {
     }
 }
 
-unsafe fn draw_tag_pointer(hdc: HDC, bounds: Rect, anchor: Point, color: Color) {
-    let side = if anchor.x < bounds.x {
+unsafe fn draw_tag_outer_shape(
+    hdc: HDC,
+    bounds: Rect,
+    anchor: Point,
+    color: Color,
+    frame: f32,
+    radius: f32,
+) {
+    if let Some(geom) = tag_corner_connector(bounds, anchor, frame, radius) {
+        draw_tag_pointer_shape(hdc, geom, color, frame.max(radius * 0.35));
+    } else {
+        let geom = tag_pointer_geometry(bounds, anchor, frame, radius);
+        draw_tag_pointer_shape(hdc, geom, color, frame.max(radius * 0.35));
+    }
+    fill_rounded_rect_antialias(hdc, bounds, radius, color);
+}
+
+fn tag_corner_connector(
+    bounds: Rect,
+    anchor: Point,
+    frame: f32,
+    radius: f32,
+) -> Option<TagPointerGeometry> {
+    let outside_x = anchor.x < bounds.x || anchor.x > bounds.right();
+    let outside_y = anchor.y < bounds.y || anchor.y > bounds.bottom();
+    if !outside_x || !outside_y {
+        return None;
+    }
+    let r = radius
+        .min(bounds.width / 2.0)
+        .min(bounds.height / 2.0)
+        .max(0.0);
+    let inset = (frame + (frame * 0.35).max(3.0)).max(r * 0.65);
+    let center = Point::new(
+        if anchor.x < bounds.x {
+            bounds.x + inset
+        } else {
+            bounds.right() - inset
+        },
+        if anchor.y < bounds.y {
+            bounds.y + inset
+        } else {
+            bounds.bottom() - inset
+        },
+    );
+    Some(tag_pointer_from_center(
+        center,
+        anchor,
+        (frame * 1.28).max(10.0),
+        (frame * 0.34).max(3.5),
+        frame * 0.72,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct TagPointerGeometry {
+    base1: Point,
+    base2: Point,
+    tip1: Point,
+    tip2: Point,
+    anchor: Point,
+}
+
+unsafe fn draw_tag_pointer_shape(hdc: HDC, geom: TagPointerGeometry, color: Color, pad: f32) {
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.move_to(geom.base1.x, geom.base1.y);
+    builder.line_to(geom.tip1.x, geom.tip1.y);
+    builder.quad_to(geom.anchor.x, geom.anchor.y, geom.tip2.x, geom.tip2.y);
+    builder.line_to(geom.base2.x, geom.base2.y);
+    builder.close();
+    if let Some(path) = builder.finish() {
+        let min_x = geom
+            .base1
+            .x
+            .min(geom.base2.x)
+            .min(geom.tip1.x)
+            .min(geom.tip2.x)
+            .min(geom.anchor.x);
+        let min_y = geom
+            .base1
+            .y
+            .min(geom.base2.y)
+            .min(geom.tip1.y)
+            .min(geom.tip2.y)
+            .min(geom.anchor.y);
+        let max_x = geom
+            .base1
+            .x
+            .max(geom.base2.x)
+            .max(geom.tip1.x)
+            .max(geom.tip2.x)
+            .max(geom.anchor.x);
+        let max_y = geom
+            .base1
+            .y
+            .max(geom.base2.y)
+            .max(geom.tip1.y)
+            .max(geom.tip2.y)
+            .max(geom.anchor.y);
+        let surface = Rect::new(
+            min_x - pad,
+            min_y - pad,
+            (max_x - min_x + pad * 2.0).max(1.0),
+            (max_y - min_y + pad * 2.0).max(1.0),
+        );
+        draw_filled_tiny_path(hdc, surface, path, color);
+    }
+}
+
+fn tag_pointer_geometry(
+    bounds: Rect,
+    anchor: Point,
+    frame: f32,
+    radius: f32,
+) -> TagPointerGeometry {
+    let edge = if anchor.y < bounds.y {
+        2
+    } else if anchor.y > bounds.bottom() {
+        3
+    } else if anchor.x < bounds.x {
         0
     } else if anchor.x > bounds.right() {
         1
-    } else if anchor.y < bounds.y {
-        2
     } else {
         3
     };
-    let half = (bounds.height * 0.12).clamp(18.0, 42.0);
-    let (p1, p2) = match side {
+    let r = radius
+        .min(bounds.width / 2.0)
+        .min(bounds.height / 2.0)
+        .max(0.0);
+    let horizontal_half = (frame * 1.9).clamp(7.0, ((bounds.width - r * 2.0) / 2.0 - 1.0).max(7.0));
+    let vertical_half = (frame * 1.9).clamp(7.0, ((bounds.height - r * 2.0) / 2.0 - 1.0).max(7.0));
+    let overlap = (frame * 1.15).max(4.0);
+    let round = frame * 0.72;
+    match edge {
         0 => {
-            let y = anchor.y.clamp(bounds.y + half, bounds.bottom() - half);
-            (
-                Point::new(bounds.x + 1.0, y - half),
-                Point::new(bounds.x + 1.0, y + half),
+            let y = anchor.y.clamp(
+                bounds.y + r + vertical_half,
+                bounds.bottom() - r - vertical_half,
+            );
+            tag_pointer_from_base(
+                Point::new(bounds.x + overlap, y + vertical_half),
+                Point::new(bounds.x + overlap, y - vertical_half),
+                anchor,
+                round,
             )
         }
         1 => {
-            let y = anchor.y.clamp(bounds.y + half, bounds.bottom() - half);
-            (
-                Point::new(bounds.right() - 1.0, y - half),
-                Point::new(bounds.right() - 1.0, y + half),
+            let y = anchor.y.clamp(
+                bounds.y + r + vertical_half,
+                bounds.bottom() - r - vertical_half,
+            );
+            tag_pointer_from_base(
+                Point::new(bounds.right() - overlap, y - vertical_half),
+                Point::new(bounds.right() - overlap, y + vertical_half),
+                anchor,
+                round,
             )
         }
         2 => {
-            let x = anchor.x.clamp(bounds.x + half, bounds.right() - half);
-            (
-                Point::new(x - half, bounds.y + 1.0),
-                Point::new(x + half, bounds.y + 1.0),
+            let x = anchor.x.clamp(
+                bounds.x + r + horizontal_half,
+                bounds.right() - r - horizontal_half,
+            );
+            tag_pointer_from_base(
+                Point::new(x - horizontal_half, bounds.y + overlap),
+                Point::new(x + horizontal_half, bounds.y + overlap),
+                anchor,
+                round,
             )
         }
         _ => {
-            let x = anchor.x.clamp(bounds.x + half, bounds.right() - half);
-            (
-                Point::new(x - half, bounds.bottom() - 1.0),
-                Point::new(x + half, bounds.bottom() - 1.0),
+            let x = anchor.x.clamp(
+                bounds.x + r + horizontal_half,
+                bounds.right() - r - horizontal_half,
+            );
+            tag_pointer_from_base(
+                Point::new(x + horizontal_half, bounds.bottom() - overlap),
+                Point::new(x - horizontal_half, bounds.bottom() - overlap),
+                anchor,
+                round,
             )
         }
+    }
+}
+
+fn tag_pointer_from_center(
+    base_center: Point,
+    anchor: Point,
+    base_half: f32,
+    tip_half: f32,
+    round: f32,
+) -> TagPointerGeometry {
+    let vx = anchor.x - base_center.x;
+    let vy = anchor.y - base_center.y;
+    let len = (vx * vx + vy * vy).sqrt().max(1.0);
+    let ux = vx / len;
+    let uy = vy / len;
+    let px = -uy;
+    let py = ux;
+    let r = round.min(len * 0.4);
+    let base1 = Point::new(
+        base_center.x + px * base_half,
+        base_center.y + py * base_half,
+    );
+    let base2 = Point::new(
+        base_center.x - px * base_half,
+        base_center.y - py * base_half,
+    );
+    let tip_a = Point::new(
+        anchor.x - ux * r + px * tip_half,
+        anchor.y - uy * r + py * tip_half,
+    );
+    let tip_b = Point::new(
+        anchor.x - ux * r - px * tip_half,
+        anchor.y - uy * r - py * tip_half,
+    );
+    let same_order = distance_squared(base1, tip_a) + distance_squared(base2, tip_b);
+    let swapped_order = distance_squared(base1, tip_b) + distance_squared(base2, tip_a);
+    let (tip1, tip2) = if same_order <= swapped_order {
+        (tip_a, tip_b)
+    } else {
+        (tip_b, tip_a)
     };
-    draw_rounded_tip_triangle(hdc, anchor, p1, p2, color);
-}
-
-unsafe fn draw_rounded_tip_triangle(hdc: HDC, anchor: Point, p1: Point, p2: Point, color: Color) {
-    let corner = 12.0;
-    let a1 = point_toward(anchor, p1, corner);
-    let a2 = point_toward(anchor, p2, corner);
-    let mut builder = resvg::tiny_skia::PathBuilder::new();
-    builder.move_to(a1.x, a1.y);
-    builder.quad_to(anchor.x, anchor.y, a2.x, a2.y);
-    builder.line_to(p2.x, p2.y);
-    builder.line_to(p1.x, p1.y);
-    builder.close();
-    if let Some(path) = builder.finish() {
-        let left = anchor.x.min(p1.x).min(p2.x) - corner;
-        let top = anchor.y.min(p1.y).min(p2.y) - corner;
-        let right = anchor.x.max(p1.x).max(p2.x) + corner;
-        let bottom = anchor.y.max(p1.y).max(p2.y) + corner;
-        draw_filled_tiny_path(
-            hdc,
-            Rect::new(left, top, right - left, bottom - top),
-            path,
-            color,
-        );
+    TagPointerGeometry {
+        base1,
+        base2,
+        tip1,
+        tip2,
+        anchor,
     }
 }
 
-fn point_toward(from: Point, to: Point, distance_from_start: f32) -> Point {
-    let dx = to.x - from.x;
-    let dy = to.y - from.y;
-    let length = (dx * dx + dy * dy).sqrt();
-    if length <= 0.1 {
-        return from;
+fn tag_pointer_from_base(
+    base1: Point,
+    base2: Point,
+    anchor: Point,
+    round: f32,
+) -> TagPointerGeometry {
+    let mid = Point::new((base1.x + base2.x) / 2.0, (base1.y + base2.y) / 2.0);
+    let vx = anchor.x - mid.x;
+    let vy = anchor.y - mid.y;
+    let len = (vx * vx + vy * vy).sqrt().max(1.0);
+    let ux = vx / len;
+    let uy = vy / len;
+    let px = -uy;
+    let py = ux;
+    let r = round.min(len * 0.4);
+    let tip_a = Point::new(
+        anchor.x - ux * r + px * r * 0.45,
+        anchor.y - uy * r + py * r * 0.45,
+    );
+    let tip_b = Point::new(
+        anchor.x - ux * r - px * r * 0.45,
+        anchor.y - uy * r - py * r * 0.45,
+    );
+    let same_order = distance_squared(base1, tip_a) + distance_squared(base2, tip_b);
+    let swapped_order = distance_squared(base1, tip_b) + distance_squared(base2, tip_a);
+    let (tip1, tip2) = if same_order <= swapped_order {
+        (tip_a, tip_b)
+    } else {
+        (tip_b, tip_a)
+    };
+    TagPointerGeometry {
+        base1,
+        base2,
+        tip1,
+        tip2,
+        anchor,
     }
-    let t = (distance_from_start / length).clamp(0.0, 1.0);
-    Point::new(from.x + dx * t, from.y + dy * t)
+}
+
+fn distance_squared(a: Point, b: Point) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx * dx + dy * dy
 }
 
 unsafe fn draw_wrapped_text(hdc: HDC, rect: Rect, text: &str, font_size: f32, color: Color) {
@@ -5144,7 +5687,7 @@ unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
         state.current_stroke.color.r,
         state.current_stroke.color.g,
         state.current_stroke.color.b,
-        51,
+        (255.0 * WATERMARK_OPACITY).round() as u8,
     );
     let step_x = scaled(state, 220.0);
     let step_y = scaled(state, 130.0);
@@ -5165,17 +5708,17 @@ unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
                 text_y += scaled(state, 54.0);
             }
             if !text.is_empty() {
-                draw_label_sized_color_rotated(hdc, x, text_y, text, font_size, color, 20.0);
+                draw_watermark_label_rotated(hdc, x, text_y, text, font_size, color, 20.0);
             }
             if let Some(date) = &date {
                 let date_font = font_size * 0.6;
                 let text_width = if text.is_empty() {
-                    approximate_text_width(date, date_font)
+                    approximate_watermark_text_width(date, date_font)
                 } else {
-                    approximate_text_width(text, font_size)
+                    approximate_watermark_text_width(text, font_size)
                 };
-                let date_width = approximate_text_width(date, date_font);
-                draw_label_sized_color_rotated(
+                let date_width = approximate_watermark_text_width(date, date_font);
+                draw_watermark_label_rotated(
                     hdc,
                     x + (text_width - date_width) / 2.0,
                     text_y + font_size * 1.1,
@@ -5194,6 +5737,10 @@ unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
 
 fn approximate_text_width(text: &str, font_size: f32) -> f32 {
     text.chars().count() as f32 * font_size * 0.56
+}
+
+fn approximate_watermark_text_width(text: &str, font_size: f32) -> f32 {
+    text.chars().count() as f32 * font_size * 0.62
 }
 
 fn watermark_caret_visible() -> bool {
@@ -5613,6 +6160,7 @@ unsafe fn draw_annotation_in_space(
     annotation: &Annotation,
     space: AnnotationRenderSpace,
 ) {
+    let style = RenderStyle::for_state(state);
     let bounds = space.rect(annotation.bounds);
     match &annotation.kind {
         AnnotationKind::Rectangle => {
@@ -5636,7 +6184,7 @@ unsafe fn draw_annotation_in_space(
             annotation.stroke,
         ),
         AnnotationKind::StepNumber { number } => {
-            draw_step_number(hdc, bounds, *number);
+            draw_step_number(hdc, bounds, *number, annotation.stroke.color, style);
         }
         AnnotationKind::Text {
             text,
@@ -5709,7 +6257,7 @@ unsafe fn draw_annotation_in_space(
                 hdc,
                 &shaft_points,
                 annotation.stroke,
-                resvg::tiny_skia::LineCap::Butt,
+                resvg::tiny_skia::LineCap::Round,
             );
             draw_arrow_tip_for_points(hdc, &render_points, annotation.stroke);
         }
@@ -5717,20 +6265,24 @@ unsafe fn draw_annotation_in_space(
     if let Some(number) = annotation.step_number {
         draw_step_badge(
             hdc,
-            auto_step_badge_center(annotation, bounds, space),
+            auto_step_badge_center(annotation, bounds, space, style),
             number,
+            annotation.stroke.color,
+            style,
         );
     }
 }
 
-unsafe fn draw_step_number(hdc: HDC, bounds: Rect, number: u32) {
+unsafe fn draw_step_number(hdc: HDC, bounds: Rect, number: u32, color: Color, style: RenderStyle) {
     draw_step_badge(
         hdc,
         Point::new(
             bounds.center().x,
-            bounds.y - scaled_step_badge_size() / 2.0 - 4.0,
+            bounds.y - style.step_badge_size / 2.0 - 4.0,
         ),
         number,
+        color,
+        style,
     );
 }
 
@@ -5738,8 +6290,9 @@ fn auto_step_badge_center(
     annotation: &Annotation,
     bounds: Rect,
     space: AnnotationRenderSpace,
+    style: RenderStyle,
 ) -> Point {
-    let size = scaled_step_badge_size();
+    let size = style.step_badge_size;
     match &annotation.kind {
         AnnotationKind::Line { start, end }
         | AnnotationKind::Arrow { start, end }
@@ -5800,20 +6353,29 @@ fn polyline_midpoint(points: &[Point]) -> Option<Point> {
     points.last().copied()
 }
 
-fn scaled_step_badge_size() -> f32 {
-    24.0
-}
-
-unsafe fn draw_step_badge(hdc: HDC, center: Point, number: u32) {
-    let size = scaled_step_badge_size();
+unsafe fn draw_step_badge(hdc: HDC, center: Point, number: u32, color: Color, style: RenderStyle) {
+    let size = style.step_badge_size;
     let marker = Rect::new(center.x - size / 2.0, center.y - size / 2.0, size, size);
-    fill_oval_antialias(hdc, marker, Color::BLUE);
+    fill_oval_antialias(hdc, marker, color);
     let label = number.to_string();
-    let text_x = marker.x + if number < 10 { 8.0 } else { 5.0 };
-    draw_label_sized_color(hdc, text_x, marker.y + 4.0, &label, 14.0, Color::WHITE);
+    let text_x = marker.x
+        + if number < 10 {
+            style.step_badge_single_digit_x
+        } else {
+            style.step_badge_multi_digit_x
+        };
+    draw_label_sized_color(
+        hdc,
+        text_x,
+        marker.y + style.step_badge_text_y,
+        &label,
+        style.step_badge_font_size,
+        contrast_text_color(color),
+    );
 }
 
 unsafe fn copy_capture_to_clipboard(state: &OverlayState) -> Result<()> {
+    let _ = maybe_request_web_export(state, ExportTarget::Clipboard);
     let Some(bitmap) = render_capture_bitmap(state) else {
         return Ok(());
     };
@@ -5826,6 +6388,7 @@ unsafe fn copy_capture_to_clipboard(state: &OverlayState) -> Result<()> {
 }
 
 unsafe fn save_capture_to_file(state: &OverlayState) -> Result<()> {
+    let _ = maybe_request_web_export(state, ExportTarget::Save);
     let Some(bitmap) = render_capture_bitmap(state) else {
         return Ok(());
     };
