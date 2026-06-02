@@ -59,6 +59,12 @@
     enabled: false,
     counters: new Map(),
   };
+  const dirty = {
+    ui: true,
+    committed: true,
+    selection: true,
+    preview: true,
+  };
 
   const tools = [
     { action: "grip", width: 36, icon: "grip" },
@@ -97,11 +103,15 @@
   }
 
   function viewportScale() {
-    if (!state || !state.screen || !state.screen.width || !state.screen.height) {
+    return viewportScaleFor(state);
+  }
+
+  function viewportScaleFor(value) {
+    if (!value || !value.screen || !value.screen.width || !value.screen.height) {
       return 1;
     }
-    const sx = window.innerWidth / state.screen.width;
-    const sy = window.innerHeight / state.screen.height;
+    const sx = window.innerWidth / value.screen.width;
+    const sy = window.innerHeight / value.screen.height;
     return Math.min(sx, sy);
   }
 
@@ -512,9 +522,28 @@
     }
   }
 
-  function scheduleRender(nextState) {
+  function markDirty(parts) {
+    if (!parts) {
+      dirty.ui = true;
+      dirty.committed = true;
+      dirty.selection = true;
+      dirty.preview = true;
+      return;
+    }
+    dirty.ui = dirty.ui || !!parts.ui;
+    dirty.committed = dirty.committed || !!parts.committed;
+    dirty.selection = dirty.selection || !!parts.selection;
+    dirty.preview = dirty.preview || !!parts.preview;
+  }
+
+  function scheduleRender(nextState, parts) {
     if (nextState) {
       pendingState = nextState;
+    }
+    if (parts) {
+      markDirty(parts);
+    } else if (!nextState) {
+      markDirty();
     }
     if (renderScheduled) {
       return;
@@ -523,11 +552,81 @@
     requestAnimationFrame(() => {
       renderScheduled = false;
       if (pendingState) {
-        state = pendingState;
+        const next = pendingState;
         pendingState = null;
+        markDirty(dirtyForStateChange(state, next));
+        state = next;
       }
-      measure("full-render", render);
+      measure("dirty-render", renderDirty);
     });
+  }
+
+  function dirtyForStateChange(previous, next) {
+    if (!previous || !next) {
+      return { ui: true, committed: true, selection: true, preview: true };
+    }
+    const viewportChanged = viewportScaleFor(previous) !== viewportScaleFor(next) || previous.uiScale !== next.uiScale;
+    return {
+      ui: viewportChanged || uiRenderSignature(previous) !== uiRenderSignature(next),
+      committed: viewportChanged || committedRenderSignature(previous) !== committedRenderSignature(next),
+      selection: viewportChanged || selectionRenderSignature(previous) !== selectionRenderSignature(next),
+      preview: false,
+    };
+  }
+
+  function uiRenderSignature(value) {
+    const selected = selectedAnnotationFromState(value);
+    return JSON.stringify({
+      activeTool: value.activeTool,
+      activeSubmenu: value.activeSubmenu,
+      theme: value.theme,
+      uiScale: value.uiScale,
+      toolbar: value.toolbar,
+      currentStroke: value.currentStroke,
+      fontSize: value.fontSize,
+      penMode: value.penMode,
+      highlighterShape: value.highlighterShape,
+      textFilled: value.textFilled,
+      numberingEnabled: value.numberingEnabled,
+      watermarkMode: value.watermarkMode,
+      watermarkText: value.watermarkText,
+      watermarkDateEnabled: value.watermarkDateEnabled,
+      selectedAnnotationId: value.selectedAnnotationId,
+      selectedStroke: selected && selected.stroke,
+      selectedKind: selected && selected.kind,
+      renderStyle: value.renderStyle,
+      viewportScale: viewportScaleFor(value),
+    });
+  }
+
+  function committedRenderSignature(value) {
+    return JSON.stringify({
+      annotations: value.annotations,
+      renderStyle: value.renderStyle,
+      editingTextId: value.editingTextId,
+      editingStepNumberId: value.editingStepNumberId,
+      caretVisible,
+      viewportScale: viewportScaleFor(value),
+      uiScale: value.uiScale,
+    });
+  }
+
+  function selectionRenderSignature(value) {
+    const selected = selectedAnnotationFromState(value);
+    return JSON.stringify({
+      selectedAnnotationId: value.selectedAnnotationId,
+      selected,
+      renderStyle: value.renderStyle,
+      viewportScale: viewportScaleFor(value),
+      uiScale: value.uiScale,
+    });
+  }
+
+  function selectedAnnotationFromState(value) {
+    if (!value || !Array.isArray(value.annotations) || value.selectedAnnotationId == null) {
+      return null;
+    }
+    return value.annotations.find((annotation) => annotation.id === value.selectedAnnotationId) || null;
   }
 
   function schedulePreviewRender() {
@@ -569,27 +668,51 @@
   }
 
   function render() {
-    sliderHotzones = [];
-    uiLayer.destroyChildren();
-    renderCommittedAnnotations();
-    renderPreview();
+    markDirty();
+    renderDirty();
+  }
+
+  function renderDirty() {
     const rect = toolbarRect();
     if (!rect) {
       watermarkInput.style.display = "none";
       clearAnnotationNodeCache();
       selectionLayer.destroyChildren();
+      uiLayer.destroyChildren();
+      previewLayer.destroyChildren();
+      dirty.ui = false;
+      dirty.committed = false;
+      dirty.selection = false;
+      dirty.preview = false;
       committedLayer.batchDraw();
       selectionLayer.batchDraw();
       uiLayer.batchDraw();
       previewLayer.batchDraw();
       return;
     }
-    drawToolbar(rect);
-    drawSubmenu(rect);
-    committedLayer.batchDraw();
-    selectionLayer.batchDraw();
-    uiLayer.batchDraw();
-    previewLayer.batchDraw();
+    if (dirty.committed) {
+      renderCommittedAnnotations();
+      committedLayer.batchDraw();
+    }
+    if (dirty.selection) {
+      renderSelection();
+      selectionLayer.batchDraw();
+    }
+    if (dirty.preview) {
+      renderPreview();
+      previewLayer.batchDraw();
+    }
+    if (dirty.ui) {
+      sliderHotzones = [];
+      uiLayer.destroyChildren();
+      drawToolbar(rect);
+      drawSubmenu(rect);
+      uiLayer.batchDraw();
+    }
+    dirty.ui = false;
+    dirty.committed = false;
+    dirty.selection = false;
+    dirty.preview = false;
   }
 
   function drawToolbar(rect) {
@@ -1503,8 +1626,11 @@
         annotationNodeCache.delete(id);
       }
     }
+  }
+
+  function renderSelection() {
     selectionLayer.destroyChildren();
-    const selected = state.annotations.find((annotation) => annotation.id === state.selectedAnnotationId);
+    const selected = selectedAnnotation();
     if (selected) {
       drawSelection(selected);
     }
@@ -1526,7 +1652,7 @@
       renderStyle: renderStyle(),
       editingTextId: state && state.editingTextId,
       editingStepNumberId: state && state.editingStepNumberId,
-      caretVisible,
+      caretVisible: annotation.id === (state && state.editingTextId) || annotation.id === (state && state.editingStepNumberId) ? caretVisible : false,
     });
   }
 
@@ -2377,7 +2503,7 @@
   window.setInterval(() => {
     caretVisible = !caretVisible;
     if (state && state.editingTextId) {
-      scheduleRender();
+      scheduleRender(null, { committed: true, selection: true });
     }
   }, 500);
 
