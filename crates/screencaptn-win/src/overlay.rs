@@ -4,9 +4,10 @@ use screencaptn_core::{
     MosaicMode, Point, Rect, ResizeHandle, StrokeStyle, ToolKind,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::c_void;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -655,7 +656,7 @@ fn handle_web_export_ready(message: &WebUiMessage) {
 #[derive(Clone, Debug, Default)]
 struct WebSyncBaseline {
     state_patch_signature: String,
-    annotations: Vec<(AnnotationId, String)>,
+    annotations: Vec<(AnnotationId, u64)>,
 }
 
 fn handle_web_export_failed(message: &WebUiMessage) {
@@ -710,31 +711,7 @@ fn sync_web_render_diff(state: &mut OverlayState) {
 
     let previous = state.web_sync_baseline.clone().unwrap_or_default();
     let next = capture_web_sync_baseline(state);
-    let previous_annotations: BTreeMap<AnnotationId, String> =
-        previous.annotations.iter().cloned().collect();
-    let next_annotations: BTreeMap<AnnotationId, String> =
-        next.annotations.iter().cloned().collect();
-
-    let removed: Vec<AnnotationId> = previous_annotations
-        .keys()
-        .copied()
-        .filter(|id| !next_annotations.contains_key(id))
-        .collect();
-    let added: Vec<serde_json::Value> = next_annotations
-        .keys()
-        .copied()
-        .filter(|id| !previous_annotations.contains_key(id))
-        .filter_map(|id| web_annotation_json_by_id(state, id))
-        .collect();
-    let updated: Vec<serde_json::Value> = next_annotations
-        .iter()
-        .filter(|(id, signature)| {
-            previous_annotations
-                .get(id)
-                .is_some_and(|previous_signature| previous_signature != *signature)
-        })
-        .filter_map(|(id, _)| web_annotation_json_by_id(state, *id))
-        .collect();
+    let (removed, added, updated) = web_annotation_diff_payloads(state, &previous, &next);
     let state_patch_changed = previous.state_patch_signature != next.state_patch_signature;
 
     if !state_patch_changed && added.is_empty() && updated.is_empty() && removed.is_empty() {
@@ -763,18 +740,196 @@ fn capture_web_sync_baseline(state: &OverlayState) -> WebSyncBaseline {
     }
 }
 
-fn web_annotation_signatures(state: &OverlayState) -> Vec<(AnnotationId, String)> {
-    state
+fn web_annotation_signatures(state: &OverlayState) -> Vec<(AnnotationId, u64)> {
+    let mut signatures: Vec<(AnnotationId, u64)> = state
         .document
         .annotations
         .iter()
-        .map(|annotation| {
-            (
-                annotation.id,
-                web_annotation_json(state, annotation).to_string(),
-            )
-        })
-        .collect()
+        .map(|annotation| (annotation.id, web_annotation_signature(state, annotation)))
+        .collect();
+    signatures.sort_unstable_by_key(|(id, _)| *id);
+    signatures
+}
+
+fn web_annotation_diff_payloads(
+    state: &OverlayState,
+    previous: &WebSyncBaseline,
+    next: &WebSyncBaseline,
+) -> (
+    Vec<AnnotationId>,
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+) {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut previous_index = 0;
+    let mut next_index = 0;
+
+    while previous_index < previous.annotations.len() || next_index < next.annotations.len() {
+        match (
+            previous.annotations.get(previous_index),
+            next.annotations.get(next_index),
+        ) {
+            (Some((previous_id, previous_signature)), Some((next_id, next_signature)))
+                if previous_id == next_id =>
+            {
+                if previous_signature != next_signature {
+                    if let Some(annotation) = web_annotation_json_by_id(state, *next_id) {
+                        updated.push(annotation);
+                    }
+                }
+                previous_index += 1;
+                next_index += 1;
+            }
+            (Some((previous_id, _)), Some((next_id, _))) if previous_id < next_id => {
+                removed.push(*previous_id);
+                previous_index += 1;
+            }
+            (Some(_), Some((next_id, _))) => {
+                if let Some(annotation) = web_annotation_json_by_id(state, *next_id) {
+                    added.push(annotation);
+                }
+                next_index += 1;
+            }
+            (Some((previous_id, _)), None) => {
+                removed.push(*previous_id);
+                previous_index += 1;
+            }
+            (None, Some((next_id, _))) => {
+                if let Some(annotation) = web_annotation_json_by_id(state, *next_id) {
+                    added.push(annotation);
+                }
+                next_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    (removed, added, updated)
+}
+
+fn web_annotation_signature(state: &OverlayState, annotation: &Annotation) -> u64 {
+    let origin = Point::new(state.screen_bounds.x, state.screen_bounds.y);
+    let mut hasher = DefaultHasher::new();
+    annotation.id.hash(&mut hasher);
+    hash_rect(
+        annotation.bounds.translate(-origin.x, -origin.y),
+        &mut hasher,
+    );
+    hash_stroke(annotation.stroke, &mut hasher);
+    annotation.step_number.hash(&mut hasher);
+    hash_annotation_kind(&annotation.kind, origin, &mut hasher);
+    hasher.finish()
+}
+
+fn hash_annotation_kind(kind: &AnnotationKind, origin: Point, hasher: &mut DefaultHasher) {
+    match kind {
+        AnnotationKind::Rectangle => "rectangle".hash(hasher),
+        AnnotationKind::Oval => "oval".hash(hasher),
+        AnnotationKind::Line { start, end } => {
+            "line".hash(hasher);
+            hash_point(start.translate(-origin.x, -origin.y), hasher);
+            hash_point(end.translate(-origin.x, -origin.y), hasher);
+        }
+        AnnotationKind::Arrow { start, end } => {
+            "arrow".hash(hasher);
+            hash_point(start.translate(-origin.x, -origin.y), hasher);
+            hash_point(end.translate(-origin.x, -origin.y), hasher);
+        }
+        AnnotationKind::StepNumber { number } => {
+            "step".hash(hasher);
+            number.hash(hasher);
+        }
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            filled,
+        } => {
+            "text".hash(hasher);
+            text.hash(hasher);
+            hash_f32(*font_size, hasher);
+            framed.hash(hasher);
+            filled.hash(hasher);
+        }
+        AnnotationKind::Tag {
+            label,
+            anchor,
+            font_size,
+        } => {
+            "tag".hash(hasher);
+            label.hash(hasher);
+            hash_point(anchor.translate(-origin.x, -origin.y), hasher);
+            hash_f32(*font_size, hasher);
+        }
+        AnnotationKind::Mosaic { mode, brush_size } => {
+            "mosaic".hash(hasher);
+            mosaic_mode_web_name(*mode).hash(hasher);
+            hash_f32(*brush_size, hasher);
+        }
+        AnnotationKind::Highlighter {
+            shape,
+            opacity,
+            start,
+            end,
+        } => {
+            "highlighter".hash(hasher);
+            highlighter_shape_web_name(*shape).hash(hasher);
+            hash_f32(*opacity, hasher);
+            hash_point(start.translate(-origin.x, -origin.y), hasher);
+            hash_point(end.translate(-origin.x, -origin.y), hasher);
+        }
+        AnnotationKind::Pen { points } => {
+            "pen".hash(hasher);
+            hash_points(points, origin, hasher);
+        }
+        AnnotationKind::PenArrow { points } => {
+            "penArrow".hash(hasher);
+            hash_points(points, origin, hasher);
+        }
+        AnnotationKind::Watermark { text, opacity } => {
+            "watermark".hash(hasher);
+            text.hash(hasher);
+            hash_f32(*opacity, hasher);
+        }
+    }
+}
+
+fn hash_points(points: &[Point], origin: Point, hasher: &mut DefaultHasher) {
+    points.len().hash(hasher);
+    for point in points {
+        hash_point(point.translate(-origin.x, -origin.y), hasher);
+    }
+}
+
+fn hash_stroke(stroke: StrokeStyle, hasher: &mut DefaultHasher) {
+    hash_f32(stroke.width, hasher);
+    hash_color(stroke.color, hasher);
+    hash_f32(stroke.opacity, hasher);
+}
+
+fn hash_rect(rect: Rect, hasher: &mut DefaultHasher) {
+    hash_f32(rect.x, hasher);
+    hash_f32(rect.y, hasher);
+    hash_f32(rect.width, hasher);
+    hash_f32(rect.height, hasher);
+}
+
+fn hash_point(point: Point, hasher: &mut DefaultHasher) {
+    hash_f32(point.x, hasher);
+    hash_f32(point.y, hasher);
+}
+
+fn hash_color(color: Color, hasher: &mut DefaultHasher) {
+    color.r.hash(hasher);
+    color.g.hash(hasher);
+    color.b.hash(hasher);
+    color.a.hash(hasher);
+}
+
+fn hash_f32(value: f32, hasher: &mut DefaultHasher) {
+    value.to_bits().hash(hasher);
 }
 
 fn web_annotation_json_by_id(state: &OverlayState, id: AnnotationId) -> Option<serde_json::Value> {
