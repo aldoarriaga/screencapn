@@ -4,6 +4,7 @@ use screencaptn_core::{
     MosaicMode, Point, Rect, ResizeHandle, StrokeStyle, ToolKind,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
@@ -146,7 +147,7 @@ pub fn open_capture_overlay(theme: AppTheme) -> Result<()> {
                 write_web_ui_debug(&format!("webui-create-error: {error:?}"));
             }
         }
-        sync_web_ui_state(&state);
+        sync_web_full_snapshot(&mut state);
         Box::leak(state);
 
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -178,6 +179,7 @@ struct OverlayState {
     numbering_enabled: bool,
     numbering_toggle_progress: f32,
     current_stroke: StrokeStyle,
+    tool_stroke_widths: [f32; 11],
     normal_stroke_color: Color,
     highlighter_opacity: f32,
     mosaic_brush_size: f32,
@@ -199,13 +201,18 @@ struct OverlayState {
     watermark_mode: WatermarkMode,
     watermark_date_enabled: bool,
     watermark_text: String,
+    watermark_color: Color,
     watermark_image_path: Option<PathBuf>,
     watermark_image_bitmap: Option<WatermarkBitmap>,
+    watermark_image_data_url: Option<String>,
     editing_watermark_text: bool,
     ui_scale: f32,
     theme: AppTheme,
     web_ui: Option<crate::web_ui::WebUi>,
     web_pointer_raw_mode: bool,
+    web_revision: u64,
+    web_sync_baseline: Option<WebSyncBaseline>,
+    force_web_full_snapshot: bool,
     render_cache: Option<RenderCache>,
     static_layer_dirty: bool,
 }
@@ -233,6 +240,7 @@ impl OverlayState {
             numbering_toggle_progress: 0.0,
             normal_stroke_color: current_stroke.color,
             current_stroke,
+            tool_stroke_widths: [current_stroke.width; 11],
             highlighter_opacity: 0.30,
             mosaic_brush_size: 16.0,
             font_size: DEFAULT_TEXT_FONT_SIZE,
@@ -253,13 +261,18 @@ impl OverlayState {
             watermark_mode: WatermarkMode::Text,
             watermark_date_enabled: false,
             watermark_text: String::new(),
+            watermark_color: current_stroke.color,
             watermark_image_path: None,
             watermark_image_bitmap: None,
+            watermark_image_data_url: None,
             editing_watermark_text: false,
             ui_scale,
             theme,
             web_ui: None,
             web_pointer_raw_mode: false,
+            web_revision: 0,
+            web_sync_baseline: None,
+            force_web_full_snapshot: true,
             render_cache: None,
             static_layer_dirty: true,
         }
@@ -315,6 +328,8 @@ struct WebUiMessage {
     key_code: Option<u32>,
     #[serde(rename = "charCode")]
     char_code: Option<u32>,
+    #[serde(rename = "shiftKey")]
+    shift_key: Option<bool>,
     reason: Option<String>,
 }
 
@@ -402,7 +417,7 @@ unsafe fn overlay_web_message(context: *mut c_void, message: String) {
     if should_sync {
         state.mark_static_dirty();
         let _ = InvalidateRect(state.hwnd, None, false);
-        sync_web_ui_state(state);
+        sync_web_after_change(state);
     }
 }
 
@@ -412,7 +427,10 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
     };
 
     match message.kind.as_str() {
-        "ready" => true,
+        "ready" => {
+            state.force_web_full_snapshot = true;
+            true
+        }
         "pointerDown" => {
             if let Some(point) = web_pointer_down_point(state, &message) {
                 handle_mouse_down(state, point);
@@ -601,7 +619,7 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 let was_text_editing = state.editing_text_id.is_some()
                     || state.editing_watermark_text
                     || state.editing_step_number_id.is_some();
-                handle_key_down(state, key);
+                handle_key_down(state, key, message.shift_key.unwrap_or(false));
                 !(!was_text_editing && (key == 0x1B || key == VK_RETURN.0 as u32))
             } else {
                 false
@@ -634,6 +652,12 @@ fn handle_web_export_ready(message: &WebUiMessage) {
     ));
 }
 
+#[derive(Clone, Debug, Default)]
+struct WebSyncBaseline {
+    state_patch_signature: String,
+    annotations: Vec<(AnnotationId, String)>,
+}
+
 fn handle_web_export_failed(message: &WebUiMessage) {
     write_web_ui_debug(&format!(
         "web-export-failed: request={:?} reason={}",
@@ -653,17 +677,113 @@ fn web_ui_owns_pointer_input(state: &OverlayState) -> bool {
     state.web_ui.is_some() && state.document.capture_region.is_some()
 }
 
-fn sync_web_ui_state(state: &OverlayState) {
+fn sync_web_full_snapshot(state: &mut OverlayState) {
     let Some(web_ui) = &state.web_ui else {
         return;
     };
     web_ui.set_visible(state.document.capture_region.is_some());
+    state.web_revision = state.web_revision.saturating_add(1);
     let payload = serde_json::json!({
         "type": "state",
+        "revision": state.web_revision,
         "state": web_ui_state(state),
     })
     .to_string();
     web_ui.post_json(&payload);
+    state.web_sync_baseline = Some(capture_web_sync_baseline(state));
+    state.force_web_full_snapshot = false;
+}
+
+fn sync_web_after_change(state: &mut OverlayState) {
+    if state.force_web_full_snapshot || state.web_sync_baseline.is_none() {
+        sync_web_full_snapshot(state);
+    } else {
+        sync_web_render_diff(state);
+    }
+}
+
+fn sync_web_render_diff(state: &mut OverlayState) {
+    let Some(web_ui) = &state.web_ui else {
+        return;
+    };
+    web_ui.set_visible(state.document.capture_region.is_some());
+
+    let previous = state.web_sync_baseline.clone().unwrap_or_default();
+    let next = capture_web_sync_baseline(state);
+    let previous_annotations: BTreeMap<AnnotationId, String> =
+        previous.annotations.iter().cloned().collect();
+    let next_annotations: BTreeMap<AnnotationId, String> =
+        next.annotations.iter().cloned().collect();
+
+    let removed: Vec<AnnotationId> = previous_annotations
+        .keys()
+        .copied()
+        .filter(|id| !next_annotations.contains_key(id))
+        .collect();
+    let added: Vec<serde_json::Value> = next_annotations
+        .keys()
+        .copied()
+        .filter(|id| !previous_annotations.contains_key(id))
+        .filter_map(|id| web_annotation_json_by_id(state, id))
+        .collect();
+    let updated: Vec<serde_json::Value> = next_annotations
+        .iter()
+        .filter(|(id, signature)| {
+            previous_annotations
+                .get(id)
+                .is_some_and(|previous_signature| previous_signature != *signature)
+        })
+        .filter_map(|(id, _)| web_annotation_json_by_id(state, *id))
+        .collect();
+    let state_patch_changed = previous.state_patch_signature != next.state_patch_signature;
+
+    if !state_patch_changed && added.is_empty() && updated.is_empty() && removed.is_empty() {
+        state.web_sync_baseline = Some(next);
+        return;
+    }
+
+    state.web_revision = state.web_revision.saturating_add(1);
+    let payload = serde_json::json!({
+        "type": "renderDiff",
+        "revision": state.web_revision,
+        "state": if state_patch_changed { web_ui_state_patch(state) } else { serde_json::Value::Null },
+        "added": added,
+        "updated": updated,
+        "removed": removed,
+    })
+    .to_string();
+    web_ui.post_json(&payload);
+    state.web_sync_baseline = Some(next);
+}
+
+fn capture_web_sync_baseline(state: &OverlayState) -> WebSyncBaseline {
+    WebSyncBaseline {
+        state_patch_signature: web_ui_state_patch(state).to_string(),
+        annotations: web_annotation_signatures(state),
+    }
+}
+
+fn web_annotation_signatures(state: &OverlayState) -> Vec<(AnnotationId, String)> {
+    state
+        .document
+        .annotations
+        .iter()
+        .map(|annotation| {
+            (
+                annotation.id,
+                web_annotation_json(state, annotation).to_string(),
+            )
+        })
+        .collect()
+}
+
+fn web_annotation_json_by_id(state: &OverlayState, id: AnnotationId) -> Option<serde_json::Value> {
+    state
+        .document
+        .annotations
+        .iter()
+        .find(|annotation| annotation.id == id)
+        .map(|annotation| web_annotation_json(state, annotation))
 }
 
 fn maybe_request_web_export(state: &OverlayState, target: ExportTarget) -> bool {
@@ -714,6 +834,14 @@ fn export_target_name(target: ExportTarget) -> &'static str {
 }
 
 fn web_ui_state(state: &OverlayState) -> serde_json::Value {
+    let mut value = web_ui_state_patch(state);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("annotations".to_string(), web_annotations_json(state));
+    }
+    value
+}
+
+fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
     let region = state.region_overlay();
     let toolbar = region.map(|region| {
         let origin = state
@@ -753,15 +881,30 @@ fn web_ui_state(state: &OverlayState) -> serde_json::Value {
         "watermarkMode": watermark_mode_web_name(state.watermark_mode),
         "watermarkDateEnabled": state.watermark_date_enabled,
         "watermarkText": state.watermark_text,
+        "watermarkColor": color_json(state.watermark_color),
+        "watermarkImageUrl": state.watermark_image_path.as_ref().map(watermark_file_url),
+        "watermarkImageDataUrl": state.watermark_image_data_url,
         "editingWatermarkText": state.editing_watermark_text,
         "selectedAnnotationId": state.document.selected_annotation_id,
         "editingTextId": state.editing_text_id,
         "editingStepNumberId": state.editing_step_number_id,
-        "annotations": web_annotations_json(state),
         "renderStyle": web_render_style_json(state),
     })
 }
 
+fn watermark_file_url(path: &PathBuf) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::from("file:///");
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'.' | b'_' | b'-' => {
+                encoded.push(*byte as char)
+            }
+            byte => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
 fn web_render_style_json(state: &OverlayState) -> serde_json::Value {
     serde_json::to_value(RenderStyle::for_state(state)).unwrap_or_else(|_| serde_json::json!({}))
 }
@@ -1261,7 +1404,7 @@ unsafe extern "system" fn overlay_wnd_proc(
             handle_mouse_down(state, point);
             SetCapture(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
-            sync_web_ui_state(state);
+            sync_web_after_change(state);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -1272,7 +1415,7 @@ unsafe extern "system" fn overlay_wnd_proc(
             state.cursor_position = point;
             if handle_mouse_move(state, point) {
                 let _ = InvalidateRect(hwnd, None, false);
-                sync_web_ui_state(state);
+                sync_web_after_change(state);
             }
             LRESULT(0)
         }
@@ -1301,24 +1444,24 @@ unsafe extern "system" fn overlay_wnd_proc(
             state.mark_static_dirty();
             let _ = ReleaseCapture();
             let _ = InvalidateRect(hwnd, None, false);
-            sync_web_ui_state(state);
+            sync_web_after_change(state);
             LRESULT(0)
         }
         WM_KEYDOWN => {
             let key = wparam.0 as u32;
             let was_text_editing = state.editing_text_id.is_some() || state.editing_watermark_text;
-            handle_key_down(state, key);
+            handle_key_down(state, key, shift_key_down());
             if was_text_editing || (key != 0x1B && key != VK_RETURN.0 as u32) {
                 state.mark_static_dirty();
                 let _ = InvalidateRect(hwnd, None, false);
-                sync_web_ui_state(state);
+                sync_web_after_change(state);
             }
             LRESULT(0)
         }
         WM_CHAR => {
             handle_char(state, wparam.0 as u32);
             let _ = InvalidateRect(hwnd, None, false);
-            sync_web_ui_state(state);
+            sync_web_after_change(state);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -1464,7 +1607,54 @@ fn select_annotation_at(state: &mut OverlayState, screen_point: Point) -> Option
         .find(|annotation| annotation_hit_test(annotation, screen_point))
         .map(|annotation| annotation.id);
     state.document.selected_annotation_id = hit;
+    if let Some(id) = hit {
+        sync_selected_annotation_controls(state, id);
+    }
     hit
+}
+
+fn sync_selected_annotation_controls(state: &mut OverlayState, id: AnnotationId) {
+    let Some(annotation) = state.document.annotation(id).cloned() else {
+        return;
+    };
+    let tool = tool_for_annotation(&annotation);
+    state.active_tool = tool;
+    state.active_submenu = Some(tool);
+    state.current_stroke = annotation.stroke;
+    remember_tool_stroke_width(state, tool, annotation.stroke.width);
+    match &annotation.kind {
+        AnnotationKind::Pen { .. } => state.pen_mode = PenMode::Free,
+        AnnotationKind::PenArrow { .. } => state.pen_mode = PenMode::Arrow,
+        AnnotationKind::Highlighter { shape, .. } => state.highlighter_shape = *shape,
+        AnnotationKind::Text {
+            font_size, filled, ..
+        } => {
+            state.font_size = *font_size;
+            state.text_filled = *filled;
+        }
+        AnnotationKind::Tag { font_size, .. } => state.font_size = *font_size,
+        AnnotationKind::Watermark { .. } => {
+            state.watermark_color = annotation.stroke.color;
+            state.editing_watermark_text = true;
+        }
+        _ => {}
+    }
+}
+
+fn tool_for_annotation(annotation: &Annotation) -> ToolKind {
+    match &annotation.kind {
+        AnnotationKind::Rectangle => ToolKind::Rectangle,
+        AnnotationKind::Oval => ToolKind::Oval,
+        AnnotationKind::Line { .. } => ToolKind::Line,
+        AnnotationKind::Arrow { .. } => ToolKind::Arrow,
+        AnnotationKind::StepNumber { .. } => ToolKind::StepNumber,
+        AnnotationKind::Text { .. } => ToolKind::Text,
+        AnnotationKind::Tag { .. } => ToolKind::Tag,
+        AnnotationKind::Mosaic { .. } => ToolKind::Mosaic,
+        AnnotationKind::Highlighter { .. } => ToolKind::Highlighter,
+        AnnotationKind::Pen { .. } | AnnotationKind::PenArrow { .. } => ToolKind::Pen,
+        AnnotationKind::Watermark { .. } => ToolKind::Watermark,
+    }
 }
 
 fn annotation_hit_test(annotation: &Annotation, screen_point: Point) -> bool {
@@ -2184,7 +2374,11 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
     }
 }
 
-fn handle_key_down(state: &mut OverlayState, key: u32) {
+fn shift_key_down() -> bool {
+    unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
+}
+
+fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 };
     if state.editing_watermark_text && !ctrl_down {
         match key {
@@ -2201,7 +2395,13 @@ fn handle_key_down(state: &mut OverlayState, key: u32) {
     if state.editing_text_id.is_some() && !ctrl_down {
         match key {
             0x1B => state.editing_text_id = None,
-            key if key == VK_RETURN.0 as u32 => state.editing_text_id = None,
+            key if key == VK_RETURN.0 as u32 => {
+                if shift_down && editing_text_accepts_line_break(state) {
+                    edit_selected_text(state, |text| text.push('\n'));
+                } else {
+                    state.editing_text_id = None;
+                }
+            }
             0x08 => {
                 edit_selected_text(state, |text| {
                     text.pop();
@@ -2241,6 +2441,7 @@ fn handle_key_down(state: &mut OverlayState, key: u32) {
         0x5A if ctrl_down => {
             if let Some(previous) = state.history.undo(&state.document) {
                 state.document = previous;
+                state.force_web_full_snapshot = true;
                 state.mark_static_dirty();
             }
         }
@@ -2288,6 +2489,16 @@ fn handle_char(state: &mut OverlayState, char_code: u32) {
     }
     edit_selected_text(state, |text| text.push(ch));
     state.mark_static_dirty();
+}
+
+fn editing_text_accepts_line_break(state: &OverlayState) -> bool {
+    let Some(id) = state.editing_text_id else {
+        return false;
+    };
+    state
+        .document
+        .annotation(id)
+        .is_some_and(|annotation| matches!(annotation.kind, AnnotationKind::Text { .. }))
 }
 
 fn edit_selected_step_number(state: &mut OverlayState, edit: impl FnOnce(u32) -> u32) {
@@ -2352,8 +2563,12 @@ fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
                 state.normal_stroke_color = state.current_stroke.color;
             }
             state.active_tool = tool;
+            set_active_tool_stroke_width(state, tool);
             if tool == ToolKind::Highlighter {
                 state.current_stroke.color = annotation_colors()[2];
+            }
+            if tool == ToolKind::Watermark {
+                state.editing_watermark_text = true;
             }
             state.active_submenu = configurable_submenu_tool(tool);
         }
@@ -2362,6 +2577,7 @@ fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
             state.active_submenu = None;
             if let Some(previous) = state.history.undo(&state.document) {
                 state.document = previous;
+                state.force_web_full_snapshot = true;
                 state.mark_static_dirty();
             }
         }
@@ -2392,6 +2608,47 @@ fn step_numbering_toggle_animation(state: &mut OverlayState) -> bool {
     }
     state.numbering_toggle_progress += delta.signum() * step;
     true
+}
+
+fn tool_width_index(tool: ToolKind) -> usize {
+    match tool {
+        ToolKind::StepNumber => 0,
+        ToolKind::Rectangle => 1,
+        ToolKind::Oval => 2,
+        ToolKind::Line => 3,
+        ToolKind::Arrow => 4,
+        ToolKind::Pen => 5,
+        ToolKind::Text => 6,
+        ToolKind::Tag => 7,
+        ToolKind::Mosaic => 8,
+        ToolKind::Highlighter => 9,
+        ToolKind::Watermark => 10,
+    }
+}
+
+fn tool_has_stroke_width(tool: ToolKind) -> bool {
+    matches!(
+        tool,
+        ToolKind::Rectangle
+            | ToolKind::Oval
+            | ToolKind::Line
+            | ToolKind::Arrow
+            | ToolKind::Pen
+            | ToolKind::Highlighter
+            | ToolKind::Tag
+    )
+}
+
+fn set_active_tool_stroke_width(state: &mut OverlayState, tool: ToolKind) {
+    if tool_has_stroke_width(tool) {
+        state.current_stroke.width = state.tool_stroke_widths[tool_width_index(tool)];
+    }
+}
+
+fn remember_tool_stroke_width(state: &mut OverlayState, tool: ToolKind, width: f32) {
+    if tool_has_stroke_width(tool) {
+        state.tool_stroke_widths[tool_width_index(tool)] = width;
+    }
 }
 
 fn configurable_submenu_tool(tool: ToolKind) -> Option<ToolKind> {
@@ -2450,12 +2707,25 @@ fn start_step_number_editing(state: &mut OverlayState, id: AnnotationId) {
 }
 
 fn handle_submenu_action(state: &mut OverlayState, action: SubmenuAction) {
+    let apply_to_selected = !matches!(
+        action,
+        SubmenuAction::Color(_) if state.active_submenu == Some(ToolKind::Watermark)
+    );
     match action {
-        SubmenuAction::StrokeWidth(width) => state.current_stroke.width = width,
+        SubmenuAction::StrokeWidth(width) => {
+            state.current_stroke.width = width;
+            if let Some(tool) = state.active_submenu {
+                remember_tool_stroke_width(state, tool, width);
+            }
+        }
         SubmenuAction::Color(color) => {
-            state.current_stroke.color = color;
-            if state.active_tool != ToolKind::Highlighter {
-                state.normal_stroke_color = color;
+            if state.active_submenu == Some(ToolKind::Watermark) {
+                state.watermark_color = color;
+            } else {
+                state.current_stroke.color = color;
+                if state.active_tool != ToolKind::Highlighter {
+                    state.normal_stroke_color = color;
+                }
             }
         }
         SubmenuAction::PenMode(mode) => state.pen_mode = mode,
@@ -2469,7 +2739,9 @@ fn handle_submenu_action(state: &mut OverlayState, action: SubmenuAction) {
         }
         SubmenuAction::ClearWatermark => clear_watermark(state),
     }
-    apply_submenu_to_selected_annotation(state, action);
+    if apply_to_selected {
+        apply_submenu_to_selected_annotation(state, action);
+    }
     state.mark_static_dirty();
 }
 
@@ -2483,6 +2755,8 @@ fn handle_watermark_mode_action(state: &mut OverlayState, mode: WatermarkMode) {
                 let bitmap =
                     load_watermark_bitmap(&path, scaled(state, 72.0).round().max(1.0) as u32)
                         .map(|bitmap| faded_watermark_bitmap(&bitmap, WATERMARK_OPACITY));
+                state.watermark_image_data_url =
+                    bitmap.as_ref().and_then(watermark_bitmap_data_url);
                 state.watermark_image_path = Some(path);
                 state.watermark_image_bitmap = bitmap;
             }
@@ -2497,6 +2771,7 @@ fn clear_watermark(state: &mut OverlayState) {
     state.watermark_text.clear();
     state.watermark_image_path = None;
     state.watermark_image_bitmap = None;
+    state.watermark_image_data_url = None;
     state.editing_watermark_text = false;
     state.mark_static_dirty();
 }
@@ -2526,7 +2801,11 @@ fn apply_submenu_to_selected_annotation(state: &mut OverlayState, action: Submen
             | AnnotationKind::Arrow { .. }
             | AnnotationKind::Pen { .. }
             | AnnotationKind::PenArrow { .. }
-            | AnnotationKind::Tag { .. } => annotation.stroke.width = width,
+            | AnnotationKind::Tag { .. }
+            | AnnotationKind::Highlighter {
+                shape: HighlightShape::Rectangle,
+                ..
+            } => annotation.stroke.width = width,
             _ => {}
         },
         SubmenuAction::Color(color) => {
@@ -2792,11 +3071,12 @@ unsafe fn paint_static_capture_surface(hdc: HDC, state: &OverlayState) {
     };
     draw_dim_outside_region(hdc, state.screen_bounds, region);
     draw_handles(hdc, region);
-    draw_watermark_pattern(hdc, state, region);
     if web_ui_owns_pointer_input(state) {
         draw_native_backed_annotations(hdc, state);
     } else {
         draw_annotations(hdc, state);
+        draw_watermark_pattern(hdc, state, region);
+        draw_watermark_annotations(hdc, state);
     }
 }
 
@@ -2807,13 +3087,14 @@ unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
         draw_dim_outside_region(hdc, state.screen_bounds, region);
         draw_region_gradient_border(hdc, state, region);
         draw_handles(hdc, region);
-        draw_watermark_pattern(hdc, state, region);
         if web_ui_owns_pointer_input(state) {
             draw_native_backed_annotations(hdc, state);
         } else {
             draw_annotations(hdc, state);
             draw_selected_annotation(hdc, state);
             draw_drag_preview(hdc, state);
+            draw_watermark_pattern(hdc, state, region);
+            draw_watermark_annotations(hdc, state);
             draw_toolbar(hdc, state, region);
             draw_tool_submenu(hdc, state);
         }
@@ -5254,16 +5535,6 @@ unsafe fn inverted_pixel_color(hdc: HDC, x: f32, y: f32) -> Color {
     Color::rgb(255 - r, 255 - g, 255 - b)
 }
 
-fn tag_inner_rect(bounds: Rect, frame: f32) -> Rect {
-    let inset = (frame * 0.42).clamp(6.0, 14.0);
-    Rect::new(
-        bounds.x + inset,
-        bounds.y + inset,
-        (bounds.width - inset * 2.0).max(1.0),
-        (bounds.height - inset * 2.0).max(1.0),
-    )
-}
-
 fn resize_tag_for_text(annotation: &mut Annotation, font_size: f32) {
     let AnnotationKind::Tag { label, .. } = &annotation.kind else {
         return;
@@ -5271,8 +5542,7 @@ fn resize_tag_for_text(annotation: &mut Annotation, font_size: f32) {
     if label.is_empty() {
         return;
     }
-    let frame = tag_frame_for_annotation(annotation);
-    let inner_width = (annotation.bounds.width - frame * 2.0 - 16.0).max(font_size);
+    let inner_width = (annotation.bounds.width - 16.0).max(font_size);
     let chars_per_line = (inner_width / (font_size * 0.55)).floor().max(1.0);
     let line_count = label
         .lines()
@@ -5283,7 +5553,7 @@ fn resize_tag_for_text(annotation: &mut Annotation, font_size: f32) {
         })
         .sum::<f32>()
         .max(1.0);
-    let desired_height = frame * 2.0 + 16.0 + line_count * font_size * 1.45;
+    let desired_height = 16.0 + line_count * font_size * 1.45;
     if desired_height > annotation.bounds.height {
         annotation.bounds.height = desired_height;
     }
@@ -5299,15 +5569,19 @@ unsafe fn draw_tag_annotation(
     frame_width: f32,
 ) {
     let frame = tag_frame_for_width(frame_width);
+    let pointer_frame = TAG_FRAME;
     let radius = TAG_RADIUS;
-    draw_tag_outer_shape(hdc, bounds, anchor, frame_color, frame, radius);
-    let inner = tag_inner_rect(bounds, frame);
-    fill_rounded_rect_antialias(hdc, inner, (radius - 3.0).max(2.0), Color::WHITE);
-    draw_wrapped_text(hdc, inner, label, font_size, Color::BLACK);
-}
-
-fn tag_frame_for_annotation(annotation: &Annotation) -> f32 {
-    tag_frame_for_width(annotation.stroke.width)
+    draw_tag_outer_shape(
+        hdc,
+        bounds,
+        anchor,
+        frame_color,
+        frame,
+        pointer_frame,
+        radius,
+    );
+    fill_rounded_rect_antialias(hdc, bounds, radius.max(2.0), Color::WHITE);
+    draw_wrapped_text(hdc, bounds, label, font_size, Color::BLACK);
 }
 
 fn tag_frame_for_width(width: f32) -> f32 {
@@ -5324,15 +5598,26 @@ unsafe fn draw_tag_outer_shape(
     anchor: Point,
     color: Color,
     frame: f32,
+    pointer_frame: f32,
     radius: f32,
 ) {
-    if let Some(geom) = tag_corner_connector(bounds, anchor, frame, radius) {
-        draw_tag_pointer_shape(hdc, geom, color, frame.max(radius * 0.35));
+    let pointer_box = expand_rect(bounds, pointer_frame);
+    if let Some(geom) = tag_corner_connector(pointer_box, anchor, pointer_frame, radius) {
+        draw_tag_pointer_shape(hdc, geom, color, pointer_frame.max(radius * 0.35));
     } else {
-        let geom = tag_pointer_geometry(bounds, anchor, frame, radius);
-        draw_tag_pointer_shape(hdc, geom, color, frame.max(radius * 0.35));
+        let geom = tag_pointer_geometry(pointer_box, anchor, pointer_frame, radius);
+        draw_tag_pointer_shape(hdc, geom, color, pointer_frame.max(radius * 0.35));
     }
-    fill_rounded_rect_antialias(hdc, bounds, radius, color);
+    fill_rounded_rect_antialias(hdc, expand_rect(bounds, frame), radius + frame, color);
+}
+
+fn expand_rect(rect: Rect, amount: f32) -> Rect {
+    Rect::new(
+        rect.x - amount,
+        rect.y - amount,
+        rect.width + amount * 2.0,
+        rect.height + amount * 2.0,
+    )
 }
 
 fn tag_corner_connector(
@@ -5366,8 +5651,8 @@ fn tag_corner_connector(
     Some(tag_pointer_from_center(
         center,
         anchor,
-        (frame * 1.28).max(10.0),
-        (frame * 0.34).max(3.5),
+        (frame * 0.77).max(6.0),
+        (frame * 0.20).max(2.1),
         frame * 0.72,
     ))
 }
@@ -5448,9 +5733,10 @@ fn tag_pointer_geometry(
         .min(bounds.width / 2.0)
         .min(bounds.height / 2.0)
         .max(0.0);
-    let horizontal_half = (frame * 1.9).clamp(7.0, ((bounds.width - r * 2.0) / 2.0 - 1.0).max(7.0));
-    let vertical_half = (frame * 1.9).clamp(7.0, ((bounds.height - r * 2.0) / 2.0 - 1.0).max(7.0));
-    let overlap = (frame * 1.15).max(4.0);
+    let horizontal_half =
+        (frame * 0.77).clamp(6.0, ((bounds.width - r * 2.0) / 2.0 - 1.0).max(6.0));
+    let vertical_half = (frame * 0.77).clamp(6.0, ((bounds.height - r * 2.0) / 2.0 - 1.0).max(6.0));
+    let overlap = (frame * 0.70).max(4.0);
     let round = frame * 0.72;
     match edge {
         0 => {
@@ -5633,16 +5919,32 @@ unsafe fn draw_wrapped_text(hdc: HDC, rect: Rect, text: &str, font_size: f32, co
 
 unsafe fn draw_annotations(hdc: HDC, state: &OverlayState) {
     for annotation in &state.document.annotations {
-        draw_annotation(hdc, state, annotation);
+        if !is_watermark_annotation(annotation) {
+            draw_annotation(hdc, state, annotation);
+        }
+    }
+}
+
+unsafe fn draw_watermark_annotations(hdc: HDC, state: &OverlayState) {
+    for annotation in &state.document.annotations {
+        if is_watermark_annotation(annotation) {
+            draw_annotation(hdc, state, annotation);
+        }
     }
 }
 
 unsafe fn draw_native_backed_annotations(hdc: HDC, state: &OverlayState) {
     for annotation in &state.document.annotations {
-        if matches!(annotation.kind, AnnotationKind::Mosaic { .. }) {
+        if matches!(annotation.kind, AnnotationKind::Mosaic { .. })
+            && !is_watermark_annotation(annotation)
+        {
             draw_annotation(hdc, state, annotation);
         }
     }
+}
+
+fn is_watermark_annotation(annotation: &Annotation) -> bool {
+    matches!(annotation.kind, AnnotationKind::Watermark { .. })
 }
 
 #[derive(Clone, Copy)]
@@ -5684,14 +5986,15 @@ unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
         return;
     }
     let color = Color::rgba(
-        state.current_stroke.color.r,
-        state.current_stroke.color.g,
-        state.current_stroke.color.b,
+        state.watermark_color.r,
+        state.watermark_color.g,
+        state.watermark_color.b,
         (255.0 * WATERMARK_OPACITY).round() as u8,
     );
-    let step_x = scaled(state, 220.0);
-    let step_y = scaled(state, 130.0);
-    let font_size = scaled(state, 14.0);
+    let font_size = scaled(state, state.font_size).max(scaled(state, 34.0));
+    let spread = font_size / scaled(state, 27.0).max(1.0);
+    let step_x = scaled(state, 320.0).max(scaled(state, 240.0) * spread);
+    let step_y = scaled(state, 200.0).max(scaled(state, 150.0) * spread);
     let mut row = 0;
     let mut y = region.y + scaled(state, 24.0);
     while y < region.bottom() {
@@ -5708,10 +6011,10 @@ unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
                 text_y += scaled(state, 54.0);
             }
             if !text.is_empty() {
-                draw_watermark_label_rotated(hdc, x, text_y, text, font_size, color, 20.0);
+                draw_watermark_label_rotated(hdc, x, text_y, text, font_size, color, -20.0);
             }
             if let Some(date) = &date {
-                let date_font = font_size * 0.6;
+                let date_font = font_size * 0.72;
                 let text_width = if text.is_empty() {
                     approximate_watermark_text_width(date, date_font)
                 } else {
@@ -5721,11 +6024,11 @@ unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
                 draw_watermark_label_rotated(
                     hdc,
                     x + (text_width - date_width) / 2.0,
-                    text_y + font_size * 1.1,
+                    text_y + font_size * 1.02,
                     date,
                     date_font,
                     color,
-                    20.0,
+                    -20.0,
                 );
             }
             x += step_x;
@@ -5756,6 +6059,49 @@ struct WatermarkBitmap {
     bgra: Vec<u8>,
 }
 
+fn watermark_bitmap_data_url(bitmap: &WatermarkBitmap) -> Option<String> {
+    let mut rgba = Vec::with_capacity((bitmap.width * bitmap.height * 4) as usize);
+    for px in bitmap.bgra.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, bitmap.width, bitmap.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&rgba).ok()?;
+    }
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64_encode(&png_bytes)
+    ))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let b1 = bytes.get(i + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(i + 2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < bytes.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
 fn load_watermark_bitmap(path: &PathBuf, target_size: u32) -> Option<WatermarkBitmap> {
     match path
         .extension()
@@ -6430,12 +6776,13 @@ unsafe fn render_capture_bitmap(state: &OverlayState) -> Option<HBITMAP> {
         SRCCOPY,
     );
 
+    draw_export_annotations(mem_dc, state, region);
     draw_watermark_pattern(
         mem_dc,
         state,
         Rect::new(0.0, 0.0, region.width, region.height),
     );
-    draw_export_annotations(mem_dc, state, region);
+    draw_export_watermark_annotations(mem_dc, state, region);
 
     let _ = DeleteDC(source_dc);
     let _ = DeleteDC(mem_dc);
@@ -6591,6 +6938,17 @@ fn wide_null_double(value: &str) -> Vec<u16> {
 unsafe fn draw_export_annotations(hdc: HDC, state: &OverlayState, region: Rect) {
     let space = AnnotationRenderSpace::export(region);
     for annotation in &state.document.annotations {
-        draw_annotation_in_space(hdc, state, annotation, space);
+        if !is_watermark_annotation(annotation) {
+            draw_annotation_in_space(hdc, state, annotation, space);
+        }
+    }
+}
+
+unsafe fn draw_export_watermark_annotations(hdc: HDC, state: &OverlayState, region: Rect) {
+    let space = AnnotationRenderSpace::export(region);
+    for annotation in &state.document.annotations {
+        if is_watermark_annotation(annotation) {
+            draw_annotation_in_space(hdc, state, annotation, space);
+        }
     }
 }

@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 #[derive(Clone, Debug)]
 pub struct History<T>
 where
-    T: Clone,
+    T: Clone + PartialEq,
 {
     undo_stack: VecDeque<T>,
     redo_stack: Vec<T>,
@@ -12,7 +12,7 @@ where
 
 impl<T> History<T>
 where
-    T: Clone,
+    T: Clone + PartialEq,
 {
     pub fn new(limit: usize) -> Self {
         Self {
@@ -27,8 +27,15 @@ where
             self.redo_stack.clear();
             return;
         }
-        self.undo_stack.push_back(state.clone());
         self.redo_stack.clear();
+        if self
+            .undo_stack
+            .back()
+            .is_some_and(|previous| previous == state)
+        {
+            return;
+        }
+        self.undo_stack.push_back(state.clone());
         while self.undo_stack.len() > self.limit {
             self.undo_stack.pop_front();
         }
@@ -47,5 +54,34 @@ where
             self.undo_stack.pop_front();
         }
         Some(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_skips_duplicate_top_state() {
+        let mut history = History::new(10);
+        history.checkpoint(&1);
+        history.checkpoint(&1);
+
+        assert_eq!(history.undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_checkpoint_still_clears_redo_branch() {
+        let mut history = History::new(10);
+        history.checkpoint(&1);
+        let current = 2;
+        let previous = history.undo(&current).expect("undo state");
+        assert_eq!(previous, 1);
+        assert_eq!(history.redo_stack.len(), 1);
+
+        history.checkpoint(&1);
+
+        assert!(history.redo_stack.is_empty());
+        assert_eq!(history.undo_stack.len(), 1);
     }
 }

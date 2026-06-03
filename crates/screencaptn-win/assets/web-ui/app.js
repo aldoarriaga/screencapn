@@ -18,13 +18,16 @@
   const committedLayer = new Konva.Layer({ listening: false });
   const selectionLayer = new Konva.Layer({ listening: false });
   const previewLayer = new Konva.Layer({ listening: false });
+  const watermarkLayer = new Konva.Layer({ listening: false });
   const uiLayer = new Konva.Layer();
   stage.add(committedLayer);
   stage.add(selectionLayer);
   stage.add(previewLayer);
+  stage.add(watermarkLayer);
   stage.add(uiLayer);
 
   const iconCache = new Map();
+  const watermarkImageCache = new Map();
   let state = null;
   let preview = null;
   let toolbarDrag = null;
@@ -55,6 +58,7 @@
   const annotationNodeCache = new Map();
   const mosaicCanvasCache = new Map();
   let committedTarget = committedLayer;
+  let pendingCommittedDiff = null;
   const perf = {
     enabled: false,
     counters: new Map(),
@@ -179,6 +183,9 @@
   }
 
   function activeColor() {
+    if (state && state.activeSubmenu === "watermark") {
+      return hexColor(state.watermarkColor);
+    }
     const selected = selectedAnnotation();
     if (selected && selected.stroke && selected.stroke.color) {
       return hexColor(selected.stroke.color);
@@ -590,6 +597,9 @@
       numberingEnabled: value.numberingEnabled,
       watermarkMode: value.watermarkMode,
       watermarkText: value.watermarkText,
+      watermarkColor: value.watermarkColor,
+      watermarkImageUrl: value.watermarkImageUrl,
+      watermarkImageDataUrl: value.watermarkImageDataUrl,
       watermarkDateEnabled: value.watermarkDateEnabled,
       selectedAnnotationId: value.selectedAnnotationId,
       selectedStroke: selected && selected.stroke,
@@ -602,10 +612,15 @@
   function committedRenderSignature(value) {
     return JSON.stringify({
       annotations: value.annotations,
+      watermarkText: value.watermarkText,
+      watermarkColor: value.watermarkColor,
+      watermarkImageUrl: value.watermarkImageUrl,
+      watermarkImageDataUrl: value.watermarkImageDataUrl,
+      watermarkDateEnabled: value.watermarkDateEnabled,
+      watermarkMode: value.watermarkMode,
       renderStyle: value.renderStyle,
       editingTextId: value.editingTextId,
       editingStepNumberId: value.editingStepNumberId,
-      caretVisible,
       viewportScale: viewportScaleFor(value),
       uiScale: value.uiScale,
     });
@@ -680,6 +695,7 @@
       selectionLayer.destroyChildren();
       uiLayer.destroyChildren();
       previewLayer.destroyChildren();
+      watermarkLayer.destroyChildren();
       dirty.ui = false;
       dirty.committed = false;
       dirty.selection = false;
@@ -687,12 +703,20 @@
       committedLayer.batchDraw();
       selectionLayer.batchDraw();
       uiLayer.batchDraw();
+      watermarkLayer.batchDraw();
       previewLayer.batchDraw();
       return;
     }
     if (dirty.committed) {
-      renderCommittedAnnotations();
+      if (pendingCommittedDiff) {
+        renderCommittedDiff(pendingCommittedDiff);
+        pendingCommittedDiff = null;
+      } else {
+        renderCommittedAnnotations();
+      }
+      renderWatermarkAnnotations();
       committedLayer.batchDraw();
+      watermarkLayer.batchDraw();
     }
     if (dirty.selection) {
       renderSelection();
@@ -1194,9 +1218,9 @@
         command("clearWatermark");
       }, p, s);
       x = drawDivider(group, x, p, s);
+      x = drawSlider(group, x, 0, "font", 27, 56, currentFontSize(), p, s);
       positionWatermarkInput(layout.x + x, layout.y + 3 * s, 122 * s, 18 * s);
       x += 132 * s;
-      x = drawDivider(group, x, p, s);
       x = drawColors(group, x, p, s);
     } else {
       watermarkInput.style.display = "none";
@@ -1213,7 +1237,7 @@
       highlighter: 304,
       text: 326,
       tag: 374,
-      watermark: 380,
+      watermark: 440,
       mosaic: 250,
       step: 72,
     };
@@ -1361,12 +1385,18 @@
     if (document.activeElement !== watermarkInput) {
       watermarkInput.value = state.watermarkText || "";
     }
+    if (state.editingWatermarkText && document.activeElement !== watermarkInput) {
+      requestAnimationFrame(() => {
+        watermarkInput.focus();
+        watermarkInput.setSelectionRange(watermarkInput.value.length, watermarkInput.value.length);
+      });
+    }
   }
 
   watermarkInput.addEventListener("focus", () => command("focusWatermarkText"));
   watermarkInput.addEventListener("input", () => command("setWatermarkText", { text: watermarkInput.value }));
   watermarkInput.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" || event.key === "Enter") {
+    if (event.key === "Escape" || (event.key === "Enter" && !event.shiftKey)) {
       watermarkInput.blur();
       command("blurWatermarkText");
       event.preventDefault();
@@ -1597,28 +1627,11 @@
       selectionLayer.destroyChildren();
       return;
     }
+    const orderedAnnotations = nonWatermarkAnnotations(state.annotations);
     const seen = new Set();
-    state.annotations.forEach((annotation, index) => {
+    orderedAnnotations.forEach((annotation) => {
       seen.add(annotation.id);
-      const signature = annotationRenderSignature(annotation);
-      let cached = annotationNodeCache.get(annotation.id);
-      if (!cached || cached.signature !== signature) {
-        if (cached) {
-          cached.group.destroy();
-        }
-        const group = new Konva.Group({ listening: false, name: `annotation-${annotation.id}` });
-        const previousTarget = committedTarget;
-        committedTarget = group;
-        drawCommittedAnnotation(annotation);
-        if (annotation.stepNumber != null) {
-          drawStepBadge(autoStepBadgeCenter(annotation), annotation.stepNumber, annotation.id, strokeColor(annotation));
-        }
-        committedTarget = previousTarget;
-        committedLayer.add(group);
-        cached = { signature, group };
-        annotationNodeCache.set(annotation.id, cached);
-      }
-      cached.group.zIndex(index);
+      upsertCommittedAnnotation(annotation);
     });
     for (const [id, cached] of annotationNodeCache) {
       if (!seen.has(id)) {
@@ -1626,8 +1639,225 @@
         annotationNodeCache.delete(id);
       }
     }
+    syncCommittedZOrder(orderedAnnotations);
   }
 
+  function renderCommittedDiff(diff) {
+    if (!state || !state.captureRegion || !Array.isArray(state.annotations)) {
+      clearAnnotationNodeCache();
+      selectionLayer.destroyChildren();
+      return;
+    }
+    for (const id of diff.removed) {
+      const cached = annotationNodeCache.get(id);
+      if (cached) {
+        cached.group.destroy();
+        annotationNodeCache.delete(id);
+      }
+    }
+    const annotationsById = new Map(state.annotations.map((annotation) => [annotation.id, annotation]));
+    for (const id of diff.changed) {
+      const annotation = annotationsById.get(id);
+      if (annotation && !isWatermarkAnnotation(annotation)) {
+        upsertCommittedAnnotation(annotation);
+      } else if (annotation) {
+        const cached = annotationNodeCache.get(id);
+        if (cached) {
+          cached.group.destroy();
+          annotationNodeCache.delete(id);
+        }
+      }
+    }
+    syncCommittedZOrder(nonWatermarkAnnotations(state.annotations));
+  }
+
+  function upsertCommittedAnnotation(annotation) {
+    const signature = annotationRenderSignature(annotation);
+    let cached = annotationNodeCache.get(annotation.id);
+    if (!cached || cached.signature !== signature) {
+      if (cached) {
+        cached.group.destroy();
+      }
+      const group = new Konva.Group({ listening: false, name: `annotation-${annotation.id}` });
+      const previousTarget = committedTarget;
+      committedTarget = group;
+      drawCommittedAnnotation(annotation);
+      if (annotation.stepNumber != null) {
+        drawStepBadge(autoStepBadgeCenter(annotation), annotation.stepNumber, annotation.id, strokeColor(annotation));
+      }
+      committedTarget = previousTarget;
+      committedLayer.add(group);
+      cached = { signature, group };
+      annotationNodeCache.set(annotation.id, cached);
+    }
+    return cached;
+  }
+
+  function syncCommittedZOrder(orderedAnnotations) {
+    orderedAnnotations.forEach((annotation, index) => {
+      const cached = annotationNodeCache.get(annotation.id);
+      if (cached) {
+        cached.group.zIndex(index);
+      }
+    });
+  }
+
+  function renderWatermarkAnnotations() {
+    watermarkLayer.destroyChildren();
+    if (!state || !state.captureRegion || !Array.isArray(state.annotations)) {
+      return;
+    }
+    drawWatermarkPattern();
+    for (const annotation of watermarkAnnotations(state.annotations)) {
+      const previousTarget = committedTarget;
+      committedTarget = watermarkLayer;
+      drawCommittedAnnotation(annotation);
+      committedTarget = previousTarget;
+    }
+  }
+
+  function drawWatermarkPattern() {
+    const text = (state.watermarkText || "").trim();
+    const date = state.watermarkDateEnabled ? new Date().toLocaleDateString() : "";
+    const image = watermarkImageForUrl(state.watermarkImageDataUrl || state.watermarkImageUrl);
+    const hasTextWatermark = !!(text || date);
+    if (!hasTextWatermark && !image) {
+      return;
+    }
+    const region = physicalToCssRect(state.captureRegion);
+    const color = hexColor(state.watermarkColor);
+    const opacity = 0.5;
+    const fontSize = Math.max(physicalScalar(state.fontSize || 27), physicalScalar(34));
+    const spread = fontSize / Math.max(1, physicalScalar(27));
+    const stepX = Math.max(physicalScalar(320), physicalScalar(240) * spread);
+    const stepY = Math.max(physicalScalar(200), physicalScalar(150) * spread);
+    const maxTiles = 72;
+    for (const tile of watermarkCombTiles(region, stepX, stepY, maxTiles)) {
+      const useImage = image && (!hasTextWatermark || tile.index % 2 === 0);
+      const useText = hasTextWatermark && (!image || tile.index % 2 === 1);
+      if (useImage) {
+        drawWatermarkLogo(image, tile.x, tile.y, fontSize, opacity);
+      }
+      if (useText) {
+        drawWatermarkTextBlock(text, date, tile.x, tile.y, fontSize, color, opacity);
+      }
+    }
+  }
+
+  function drawWatermarkLogo(image, x, y, fontSize, opacity) {
+    const imageSize = safeWatermarkImageSize(image, fontSize);
+    watermarkLayer.add(new Konva.Image({
+      x: x - imageSize.width / 2,
+      y: y - imageSize.height / 2,
+      image,
+      width: imageSize.width,
+      height: imageSize.height,
+      opacity,
+      rotation: -20,
+      listening: false,
+    }));
+  }
+
+  function drawWatermarkTextBlock(text, date, x, y, fontSize, color, opacity) {
+    if (text) {
+      const textWidth = approximateWatermarkTextWidth(text, fontSize);
+      watermarkLayer.add(new Konva.Text({ x: x - textWidth / 2, y, text, fontFamily: "Segoe UI", fontSize, fontStyle: "700", fill: color, opacity, rotation: -20, listening: false }));
+    }
+    if (date) {
+      const dateFont = fontSize * 0.72;
+      const textWidth = approximateWatermarkTextWidth(text || date, text ? fontSize : dateFont);
+      const dateWidth = approximateWatermarkTextWidth(date, dateFont);
+      watermarkLayer.add(new Konva.Text({ x: x - dateWidth / 2, y: y + (text ? fontSize * 1.02 : 0), text: date, fontFamily: "Segoe UI", fontSize: dateFont, fill: color, opacity, rotation: -20, listening: false }));
+    }
+  }
+
+  function watermarkCombTiles(region, stepX, stepY, maxTiles) {
+    const estimatedCols = Math.max(1, Math.ceil(region.width / Math.max(1, stepX)) + 1);
+    const estimatedRows = Math.max(1, Math.ceil(region.height / Math.max(1, stepY)) + 2);
+    let cols = estimatedCols;
+    let rows = estimatedRows;
+    if (cols * rows > maxTiles) {
+      const aspect = Math.max(0.25, Math.min(4, region.width / Math.max(1, region.height)));
+      cols = Math.max(1, Math.ceil(Math.sqrt(maxTiles * aspect)));
+      rows = Math.max(1, Math.floor(maxTiles / cols));
+      while (cols * rows > maxTiles && rows > 1) {
+        rows -= 1;
+      }
+      while (cols * rows > maxTiles && cols > 1) {
+        cols -= 1;
+      }
+    }
+    const marginX = Math.min(physicalScalar(24), region.width / 10);
+    const marginY = Math.min(physicalScalar(24), region.height / 10);
+    const usableWidth = Math.max(1, region.width - marginX * 2);
+    const usableHeight = Math.max(1, region.height - marginY * 2);
+    const toothWidth = usableWidth / Math.max(1, cols);
+    const toothHeight = usableHeight / Math.max(1, rows);
+    const tiles = [];
+    for (let col = 0; col < cols; col += 1) {
+      const x = region.x + marginX + toothWidth * (col + 0.5);
+      const phase = ((col * 0.61803398875) % 1) * toothHeight;
+      for (let row = 0; row < rows; row += 1) {
+        let y = region.y + marginY + toothHeight * (row + 0.5) + phase;
+        if (y > region.y + region.height - marginY) {
+          y -= usableHeight;
+        }
+        tiles.push({ x, y, row, col, index: tiles.length });
+      }
+    }
+    tiles.sort((a, b) => a.y - b.y || a.x - b.x);
+    tiles.forEach((tile, index) => {
+      tile.index = index;
+    });
+    return tiles;
+  }
+  function safeWatermarkImageSize(image, fontSize) {
+    const naturalWidth = Math.max(1, image.naturalWidth || image.width || 96);
+    const naturalHeight = Math.max(1, image.naturalHeight || image.height || 96);
+    const maxSide = Math.max(physicalScalar(96), fontSize * 3.2);
+    const scaleDown = Math.min(1, maxSide / Math.max(naturalWidth, naturalHeight));
+    return {
+      width: Math.max(1, naturalWidth * scaleDown),
+      height: Math.max(1, naturalHeight * scaleDown),
+    };
+  }
+  function watermarkImageForUrl(url) {
+    if (!url) {
+      return null;
+    }
+    let cached = watermarkImageCache.get(url);
+    if (!cached) {
+      const image = new Image();
+      cached = { image, loaded: false };
+      watermarkImageCache.set(url, cached);
+      image.onload = () => {
+        cached.loaded = true;
+        if (state) {
+          scheduleRender(state, { committed: true });
+        }
+      };
+      image.onerror = () => {
+        cached.failed = true;
+      };
+      image.src = url;
+    }
+    return cached.loaded ? cached.image : null;
+  }
+  function approximateWatermarkTextWidth(text, fontSize) {
+    return (text || "").length * fontSize * 0.62;
+  }
+
+  function isWatermarkAnnotation(annotation) {
+    return !!(annotation && annotation.kind && annotation.kind.type === "watermark");
+  }
+
+  function nonWatermarkAnnotations(annotations) {
+    return (annotations || []).filter((annotation) => !isWatermarkAnnotation(annotation));
+  }
+
+  function watermarkAnnotations(annotations) {
+    return (annotations || []).filter(isWatermarkAnnotation);
+  }
   function renderSelection() {
     selectionLayer.destroyChildren();
     const selected = selectedAnnotation();
@@ -1642,6 +1872,7 @@
     }
     annotationNodeCache.clear();
     committedLayer.destroyChildren();
+    watermarkLayer.destroyChildren();
   }
 
   function annotationRenderSignature(annotation) {
@@ -1652,8 +1883,7 @@
       renderStyle: renderStyle(),
       editingTextId: state && state.editingTextId,
       editingStepNumberId: state && state.editingStepNumberId,
-      caretVisible: annotation.id === (state && state.editingTextId) || annotation.id === (state && state.editingStepNumberId) ? caretVisible : false,
-    });
+          });
   }
 
   function addCommitted(node) {
@@ -1697,6 +1927,8 @@
       return;
     } else if (kind.type === "text") {
       drawCommittedText(annotation, kind, bounds, color);
+    } else if (kind.type === "watermark") {
+      drawCommittedWatermark(annotation, kind, bounds, color);
     } else if (kind.type === "tag") {
       drawCommittedTag(annotation, kind, bounds, color);
     } else if (kind.type === "step") {
@@ -1828,7 +2060,7 @@
     if (kind.shape === "line") {
       const start = physicalToCssPoint(kind.start);
       const end = physicalToCssPoint(kind.end);
-      const highlighterWidth = (style.highlighterLineBase || 24) + width * (style.highlighterLineWidthFactor || 3);
+      const highlighterWidth = highlighterLineRenderWidth(width, style);
       addCommitted(new Konva.Line({ points: [start.x, start.y, end.x, end.y], stroke: color, opacity: alpha, strokeWidth: highlighterWidth, lineCap: "round" }));
     } else {
       addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, cornerRadius: physicalScalar(style.cornerRadius || 8), fill: color, opacity: alpha }));
@@ -1923,6 +2155,8 @@
       addCommitted(textNode);
       if (state.editingTextId === annotation.id) {
         addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, dash: [5, 4], stroke: selectionColor(), strokeWidth: Math.max(1, physicalScalar(1)) }));
+        const caret = framedTextCaret(bounds, textNode, text, fontSize, padding);
+        drawTextCaret(caret.x, caret.y, caret.height);
       }
     } else {
       const textY = bounds.y - fontSize * 1.08;
@@ -1941,38 +2175,85 @@
         addCommitted(new Konva.Rect({ x: bounds.x - padding, y: textY - padding * 0.55, width: textNode.width() + padding * 2, height: fontSize * 1.28 + padding, cornerRadius: physicalScalar(12), fill: color }));
         textNode.moveToTop();
       }
-      if (state.editingTextId === annotation.id && caretVisible) {
-        addCommitted(new Konva.Line({ points: [bounds.x + textNode.width() + physicalScalar(2), textY, bounds.x + textNode.width() + physicalScalar(2), textY + fontSize * 1.25], stroke: filled ? contrastTextColor(color) : color, strokeWidth: Math.max(1, physicalScalar(1.5)) }));
+      if (state.editingTextId === annotation.id) {
+        drawTextCaret(bounds.x + textNode.width() + physicalScalar(2), textY, fontSize * 1.25);
       }
     }
   }
 
+  function framedTextCaret(bounds, textNode, text, fontSize, padding) {
+    const lines = String(text || "").split("\n");
+    const last = lines[lines.length - 1] || "";
+    const approxChar = fontSize * 0.56;
+    const lineHeight = fontSize * 1.22;
+    return {
+      x: Math.min(bounds.x + bounds.width - padding, bounds.x + padding + last.length * approxChar + physicalScalar(2)),
+      y: bounds.y + padding + (lines.length - 1) * lineHeight,
+      height: lineHeight,
+    };
+  }
+
+  function drawTextCaret(x, y, height) {
+    const outer = Math.max(2, physicalScalar(3));
+    const inner = Math.max(1, physicalScalar(1));
+    addCommitted(new Konva.Line({ points: [x, y, x, y + height], stroke: "#000000", strokeWidth: outer, opacity: 0.95, lineCap: "round" }));
+    addCommitted(new Konva.Line({ points: [x, y, x, y + height], stroke: "#FFFFFF", strokeWidth: inner, opacity: 1, lineCap: "round" }));
+  }
+  function invertedColorAt(_x, _y, background) {
+    return invertHexColor(background || "#FFFFFF");
+  }
+
+  function invertHexColor(hex) {
+    const value = String(hex || "#FFFFFF").replace("#", "");
+    const r = 255 - parseInt(value.slice(0, 2) || "FF", 16);
+    const g = 255 - parseInt(value.slice(2, 4) || "FF", 16);
+    const b = 255 - parseInt(value.slice(4, 6) || "FF", 16);
+    return `#${[r, g, b].map((n) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, "0")).join("")}`.toUpperCase();
+  }
+
+  function drawCommittedWatermark(annotation, kind, bounds, color) {
+    const fontSize = physicalScalar(kind.fontSize || state.fontSize || 27);
+    const opacity = kind.opacity == null ? strokeOpacity(annotation) : kind.opacity;
+    addCommitted(new Konva.Text({
+      x: bounds.x,
+      y: bounds.y,
+      text: kind.text || "",
+      fontFamily: "Segoe UI",
+      fontSize,
+      lineHeight: 1.22,
+      fill: color,
+      opacity,
+    }));
+  }
+
   function drawCommittedTag(annotation, kind, bounds, color) {
     const style = renderStyle();
+    const baseFrame = tagBaseFrame(style);
     const frame = tagFrameForAnnotation(annotation, style);
     const radius = physicalScalar(style.tagRadius || 10);
     const padding = physicalScalar(style.tagInnerPad || 8);
     const anchor = physicalToCssPoint(kind.anchor);
     const fontSize = physicalScalar(kind.fontSize || state.fontSize || 27);
-    drawTagBody(committedTarget, bounds, anchor, color, frame, radius);
-    const inner = {
-      x: bounds.x + frame,
-      y: bounds.y + frame,
-      width: Math.max(1, bounds.width - frame * 2),
-      height: Math.max(1, bounds.height - frame * 2),
-    };
-    addCommitted(new Konva.Rect({ x: inner.x, y: inner.y, width: inner.width, height: inner.height, cornerRadius: Math.max(1, radius - frame / 2), fill: "#FFFFFF" }));
+    drawTagBody(committedTarget, bounds, anchor, color, frame, radius, baseFrame);
+    const inner = bounds;
+    addCommitted(new Konva.Rect({ x: inner.x, y: inner.y, width: inner.width, height: inner.height, cornerRadius: Math.max(1, radius), fill: "#FFFFFF" }));
     addCommitted(new Konva.Text({ x: inner.x + padding, y: inner.y + padding, width: Math.max(1, inner.width - padding * 2), text: kind.label || "", fontFamily: "Segoe UI", fontSize, lineHeight: 1.22, fill: "#000000" }));
   }
 
+  function tagBaseFrame(style) {
+    return physicalScalar(style.tagFrame || 14);
+  }
+
   function tagFrameForAnnotation(annotation, style) {
-    const base = physicalScalar(style.tagFrame || 14);
+    const base = tagBaseFrame(style);
     const width = annotation && annotation.stroke ? annotation.stroke.width || 0 : 0;
     return width >= 6 ? Math.max(6, Math.min(28, width)) : base;
   }
 
-  function drawTagBody(layer, box, anchor, color, frame, radius) {
-    const cornerConnector = tagCornerConnector(box, anchor, frame, radius);
+  function drawTagBody(layer, box, anchor, color, frame, radius, pointerFrame) {
+    const fixedPointerFrame = pointerFrame == null ? frame : pointerFrame;
+    const pointerBox = expandRect(box, fixedPointerFrame);
+    const cornerConnector = tagCornerConnector(pointerBox, anchor, fixedPointerFrame, radius);
     if (cornerConnector) {
       layer.add(
         new Konva.Shape({
@@ -1991,7 +2272,7 @@
         })
       );
     } else {
-      const geom = tagPointerGeometry(box, anchor, frame, radius);
+      const geom = tagPointerGeometry(pointerBox, anchor, fixedPointerFrame, radius);
       layer.add(
         new Konva.Shape({
           sceneFunc: (ctx, shape) => {
@@ -2009,7 +2290,12 @@
         })
       );
     }
-    layer.add(new Konva.Rect({ x: box.x, y: box.y, width: box.width, height: box.height, cornerRadius: radius, fill: color }));
+    const fillBox = expandRect(box, frame);
+    layer.add(new Konva.Rect({ x: fillBox.x, y: fillBox.y, width: fillBox.width, height: fillBox.height, cornerRadius: radius + frame, fill: color }));
+  }
+
+  function expandRect(rect, amount) {
+    return { x: rect.x - amount, y: rect.y - amount, width: rect.width + amount * 2, height: rect.height + amount * 2 };
   }
 
   function tagCornerConnector(box, anchor, frame, radius) {
@@ -2021,7 +2307,7 @@
     const r = Math.max(0, Math.min(radius, box.width / 2, box.height / 2));
     const inset = Math.max(frame + Math.max(3, frame * 0.35), r * 0.65);
     const center = Point2(anchor.x < box.x ? box.x + inset : box.x + box.width - inset, anchor.y < box.y ? box.y + inset : box.y + box.height - inset);
-    return pointerGeometryFromCenter(center, anchor, Math.max(10, frame * 1.28), Math.max(3.5, frame * 0.34), frame * 0.72);
+    return pointerGeometryFromCenter(center, anchor, Math.max(6, frame * 0.77), Math.max(2.1, frame * 0.2), frame * 0.72);
   }
 
   function tagPointerGeometry(box, anchor, frame, radius) {
@@ -2040,9 +2326,10 @@
     const r = Math.max(0, Math.min(radius, box.width / 2, box.height / 2));
     const maxHorizontalHalf = Math.max(7, (box.width - r * 2) / 2 - 1);
     const maxVerticalHalf = Math.max(7, (box.height - r * 2) / 2 - 1);
-    const horizontalHalf = Math.max(7, Math.min(frame * 1.9, maxHorizontalHalf));
-    const verticalHalf = Math.max(7, Math.min(frame * 1.9, maxVerticalHalf));
-    const overlap = Math.max(4, frame * 1.15);
+    const sideHalf = Math.max(6, frame * 0.77);
+    const horizontalHalf = Math.max(4, Math.min(sideHalf, maxHorizontalHalf));
+    const verticalHalf = Math.max(4, Math.min(sideHalf, maxVerticalHalf));
+    const overlap = Math.max(4, frame * 0.7);
     const tipRound = frame * 0.72;
     if (edge === "left") {
       const y = Math.max(box.y + r + verticalHalf, Math.min(box.y + box.height - r - verticalHalf, anchor.y));
@@ -2338,7 +2625,7 @@
       const alpha = 0.3;
       if (state.highlighterShape === "line") {
         preparePreviewLayer("highlighter-line");
-        getPreviewNode("highlighter-line", () => new Konva.Line({ lineCap: "round" })).setAttrs({ points: [start.x, start.y, end.x, end.y], stroke: color, opacity: alpha, strokeWidth: 24 + width * 3 });
+        getPreviewNode("highlighter-line", () => new Konva.Line({ lineCap: "round" })).setAttrs({ points: [start.x, start.y, end.x, end.y], stroke: color, opacity: alpha, strokeWidth: highlighterLineRenderWidth(width, renderStyle()) });
       } else {
         preparePreviewLayer("highlighter-area");
         getPreviewNode("highlighter-area", () => new Konva.Rect()).setAttrs({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, cornerRadius: 8 * scale(), fill: color, opacity: alpha });
@@ -2352,7 +2639,8 @@
         getPreviewNode("text-area", () => new Konva.Rect({ dash: [5, 4] })).setAttrs({ x: rect.x, y: rect.y, width: rect.width, height: rect.height, stroke: "white", strokeWidth: 1 });
       } else {
         preparePreviewLayer("text-caret");
-        getPreviewNode("text-caret", () => new Konva.Line()).setAttrs({ points: [start.x, start.y - 18, start.x, start.y + 6], stroke: color, strokeWidth: 1 });
+        const caret = getPreviewNode("text-caret", () => new Konva.Line());
+        caret.setAttrs({ points: [start.x, start.y - 18, start.x, start.y + 6], stroke: "#FFFFFF", shadowColor: "#000000", shadowBlur: 0, shadowOffset: { x: 1, y: 0 }, shadowOpacity: 1, strokeWidth: Math.max(1, physicalScalar(1.5)) });
       }
     } else if (tool === "tag") {
       preparePreviewLayer("dynamic");
@@ -2365,11 +2653,16 @@
   function drawTagPreview(anchor, current, color) {
     const s = scale();
     const box = tagBoxFromDrag(anchor, current, s);
-    const frame = Math.max(6 * s, currentWidth() >= 6 ? currentWidth() : 14 * s);
+    const baseFrame = tagBaseFrame(renderStyle());
+    const frame = Math.max(6 * s, currentWidth() >= 6 ? currentWidth() : baseFrame);
     const radius = 10 * s;
     const group = ensurePreviewDynamicGroup();
-    drawTagBody(group, box, anchor, color, frame, radius);
-    group.add(new Konva.Rect({ x: box.x + frame, y: box.y + frame, width: Math.max(1, box.width - frame * 2), height: Math.max(1, box.height - frame * 2), cornerRadius: Math.max(1, radius - frame / 2), fill: "#FFFFFF" }));
+    drawTagBody(group, box, anchor, color, frame, radius, baseFrame);
+    group.add(new Konva.Rect({ x: box.x, y: box.y, width: box.width, height: box.height, cornerRadius: Math.max(1, radius), fill: "#FFFFFF" }));
+  }
+
+  function highlighterLineRenderWidth(width, style) {
+    return (style.highlighterLineBase || 24) + Math.max(1, width || 1) * (style.highlighterLineWidthFactor || 3);
   }
 
   function tagBoxFromDrag(anchor, current, s) {
@@ -2432,7 +2725,7 @@
     if (event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
       return;
     }
-    command("keyDown", { keyCode: event.keyCode || event.which || 0 });
+    command("keyDown", { keyCode: event.keyCode || event.which || 0, shiftKey: !!event.shiftKey });
     if (["Escape", "Enter", "Backspace", "Delete"].includes(event.key) || event.ctrlKey) {
       event.preventDefault();
     }
@@ -2470,12 +2763,81 @@
     }
   });
 
+  function applyRenderDiff(diff) {
+    const baseState = pendingState || state;
+    if (!baseState || !diff) {
+      return;
+    }
+    const currentAnnotations = Array.isArray(baseState.annotations) ? baseState.annotations : [];
+    const annotationOrder = currentAnnotations.map((annotation) => annotation.id);
+    const annotationsById = new Map(currentAnnotations.map((annotation) => [annotation.id, annotation]));
+    const removed = Array.isArray(diff.removed) ? new Set(diff.removed) : new Set();
+    const added = Array.isArray(diff.added) ? diff.added : [];
+    const updated = Array.isArray(diff.updated) ? diff.updated : [];
+
+    for (const id of removed) {
+      annotationsById.delete(id);
+    }
+    for (const annotation of updated) {
+      if (!annotation || annotation.id == null) {
+        continue;
+      }
+      if (!annotationsById.has(annotation.id) && !annotationOrder.includes(annotation.id)) {
+        annotationOrder.push(annotation.id);
+      }
+      annotationsById.set(annotation.id, annotation);
+    }
+    for (const annotation of added) {
+      if (!annotation || annotation.id == null) {
+        continue;
+      }
+      if (!annotationsById.has(annotation.id) && !annotationOrder.includes(annotation.id)) {
+        annotationOrder.push(annotation.id);
+      }
+      annotationsById.set(annotation.id, annotation);
+    }
+
+    const nextAnnotations = annotationOrder
+      .filter((id) => !removed.has(id) && annotationsById.has(id))
+      .map((id) => annotationsById.get(id));
+    const patch = diff.state && typeof diff.state === "object" ? diff.state : {};
+    const hasPatch = Object.keys(patch).length > 0;
+    const watermarkChanged = ["watermarkText", "watermarkColor", "watermarkImageUrl", "watermarkImageDataUrl", "watermarkDateEnabled", "watermarkMode"].some((key) => Object.prototype.hasOwnProperty.call(patch, key));
+    const committedChanged = added.length > 0 || updated.length > 0 || removed.size > 0 || watermarkChanged;
+    const nextState = Object.assign({}, baseState, patch, { annotations: nextAnnotations });
+    if (committedChanged) {
+      queueCommittedDiff(removed, added, updated);
+    }
+    scheduleRender(nextState, {
+      ui: hasPatch,
+      committed: committedChanged,
+      selection: hasPatch || committedChanged,
+      preview: false,
+    });
+  }
+
+  function queueCommittedDiff(removed, added, updated) {
+    if (!pendingCommittedDiff) {
+      pendingCommittedDiff = { removed: new Set(), changed: new Set() };
+    }
+    for (const id of removed) {
+      pendingCommittedDiff.removed.add(id);
+      pendingCommittedDiff.changed.delete(id);
+    }
+    for (const annotation of added.concat(updated)) {
+      if (annotation && annotation.id != null) {
+        pendingCommittedDiff.changed.add(annotation.id);
+      }
+    }
+  }
   window.chrome.webview.addEventListener("message", (event) => {
     if (!event.data) {
       return;
     }
     if (event.data.type === "state") {
       scheduleRender(event.data.state);
+    } else if (event.data.type === "renderDiff") {
+      applyRenderDiff(event.data);
     } else if (event.data.type === "exportRequest") {
       handleExportRequest(event.data);
     }
@@ -2503,7 +2865,7 @@
   window.setInterval(() => {
     caretVisible = !caretVisible;
     if (state && state.editingTextId) {
-      scheduleRender(null, { committed: true, selection: true });
+      scheduleRender(null, { selection: true });
     }
   }, 500);
 
