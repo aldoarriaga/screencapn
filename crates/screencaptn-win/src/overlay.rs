@@ -24,17 +24,22 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS, DT_LEFT, DT_WORDBREAK, HBITMAP, HDC, HGDIOBJ, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, SRCCOPY, TRANSPARENT,
 };
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_OVERWRITEPROMPT,
-    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    GetSaveFileNameW, OFN_EXPLORER, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_RETURN, VK_SHIFT,
+};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{
+    FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+    SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor,
@@ -7033,29 +7038,44 @@ unsafe fn show_save_png_dialog(owner: HWND) -> Option<PathBuf> {
 }
 
 unsafe fn show_open_image_dialog(owner: HWND) -> Option<PathBuf> {
-    let mut file_buffer = vec![0_u16; 1024];
-    let filter = wide_null_double(
-        "Images (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.svg)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.svg\0All Files (*.*)\0*.*\0",
-    );
-    let title = wide_null("Choose watermark image");
-    let mut dialog = OPENFILENAMEW {
-        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: owner,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: PWSTR(file_buffer.as_mut_ptr()),
-        nMaxFile: file_buffer.len() as u32,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST,
-        ..Default::default()
-    };
-    if !GetOpenFileNameW(&mut dialog).as_bool() {
-        return None;
+    let _ = ReleaseCapture();
+    match show_open_image_dialog_modern(owner) {
+        Ok(path) => path,
+        Err(error) => {
+            write_web_ui_debug(&format!("watermark-image-dialog-failed: {error:?}"));
+            None
+        }
     }
-    let len = file_buffer
-        .iter()
-        .position(|ch| *ch == 0)
-        .unwrap_or(file_buffer.len());
-    Some(PathBuf::from(String::from_utf16_lossy(&file_buffer[..len])))
+}
+
+unsafe fn show_open_image_dialog_modern(owner: HWND) -> Result<Option<PathBuf>> {
+    let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+    let filters = [
+        COMDLG_FILTERSPEC {
+            pszName: w!("Images (*.png;*.svg)"),
+            pszSpec: w!("*.png;*.svg"),
+        },
+        COMDLG_FILTERSPEC {
+            pszName: w!("All Files (*.*)"),
+            pszSpec: w!("*.*"),
+        },
+    ];
+    dialog.SetFileTypes(&filters)?;
+    dialog.SetFileTypeIndex(1)?;
+    dialog.SetTitle(w!("Choose watermark image"))?;
+    let options = dialog.GetOptions()?;
+    dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST)?;
+    if dialog.Show(owner).is_err() {
+        return Ok(None);
+    }
+    let item = dialog.GetResult()?;
+    let path_ptr = item.GetDisplayName(SIGDN_FILESYSPATH)?;
+    if path_ptr.is_null() {
+        return Ok(None);
+    }
+    let path = path_ptr.to_string().ok().map(PathBuf::from);
+    CoTaskMemFree(Some(path_ptr.as_ptr().cast()));
+    Ok(path)
 }
 
 fn default_png_save_path_wide() -> Vec<u16> {
