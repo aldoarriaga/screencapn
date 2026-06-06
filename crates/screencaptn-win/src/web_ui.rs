@@ -1,3 +1,5 @@
+use crate::diagnostics;
+
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::mpsc;
@@ -15,6 +17,7 @@ pub struct WebUi {
     controller: ICoreWebView2Controller,
     webview: ICoreWebView2,
     _message_token: EventRegistrationToken,
+    _process_failed_token: EventRegistrationToken,
 }
 
 impl WebUi {
@@ -48,6 +51,15 @@ impl WebUi {
             let _ = settings.SetIsStatusBarEnabled(false);
         }
 
+        let mut process_failed_token = EventRegistrationToken::default();
+        webview.add_ProcessFailed(
+            &ProcessFailedEventHandler::create(Box::new(move |_sender, args| {
+                diagnostics::log_event("webview", &format_webview_process_failed(args));
+                Ok(())
+            })),
+            &mut process_failed_token,
+        )?;
+
         let mut message_token = EventRegistrationToken::default();
         let context = context as isize;
         webview.add_WebMessageReceived(
@@ -72,6 +84,7 @@ impl WebUi {
             controller,
             webview,
             _message_token: message_token,
+            _process_failed_token: process_failed_token,
         })
     }
 
@@ -99,6 +112,24 @@ impl Drop for WebUi {
     }
 }
 
+fn format_webview_process_failed(args: Option<ICoreWebView2ProcessFailedEventArgs>) -> String {
+    let Some(args) = args else {
+        return "process-failed args=<none>".to_string();
+    };
+    unsafe {
+        let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(0);
+        let _ = args.ProcessFailedKind(&mut kind);
+        let mut message = format!("process-failed kind={}", kind.0);
+        if let Ok(args2) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+            let mut reason = COREWEBVIEW2_PROCESS_FAILED_REASON(0);
+            let mut exit_code = 0;
+            let _ = args2.Reason(&mut reason);
+            let _ = args2.ExitCode(&mut exit_code);
+            message.push_str(&format!(" reason={} exit_code={}", reason.0, exit_code));
+        }
+        message
+    }
+}
 unsafe fn create_environment() -> webview2_com::Result<ICoreWebView2Environment> {
     let (tx, rx) = mpsc::channel();
     CreateCoreWebView2EnvironmentCompletedHandler::wait_for_async_operation(
@@ -160,7 +191,7 @@ fn web_ui_html() -> String {
     )
     .replace(
         "/*__APP__*/",
-        &script_safe(include_str!("../assets/web-ui/app.js")),
+        &script_safe(include_str!("../assets/web-ui/app.bundle.js")),
     )
     .replace("__ICONS_JSON__", &icons_json())
 }

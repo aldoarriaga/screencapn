@@ -7,6 +7,26 @@
     }
   };
 
+  const diagnostic = (level, message, details) => {
+    host({ type: "diagnostic", level, message: String(message || ""), details: details || null });
+  };
+
+  window.addEventListener("error", (event) => {
+    diagnostic("error", event.message, {
+      filename: event.filename,
+      lineno: event.lineno,
+      colno: event.colno,
+      stack: event.error && event.error.stack ? String(event.error.stack) : null,
+    });
+  });
+
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason = event.reason;
+    diagnostic("error", reason && reason.message ? reason.message : reason, {
+      stack: reason && reason.stack ? String(reason.stack) : null,
+    });
+  });
+
   const ICONS = window.SCREEN_CAPTN_ICONS || {};
   const container = document.getElementById("stage");
   const watermarkInput = document.getElementById("watermark-input");
@@ -27,11 +47,13 @@
   stage.add(uiLayer);
 
   const iconCache = new Map();
-  const watermarkImageCache = new Map();
+  const watermarkMeasureContext = document.createElement("canvas").getContext("2d");
   let state = null;
   let preview = null;
   let toolbarDrag = null;
   let toggleTween = null;
+  let toolbarWasVisible = false;
+  let toolbarAppearTweens = [];
   let themeDrawer = {
     open: false,
     clicking: false,
@@ -46,8 +68,10 @@
   };
   let lastNumberingEnabled = false;
   let caretVisible = true;
+  let caretForceVisibleUntil = 0;
   let hoveredSlider = null;
   let sliderHotzones = [];
+  let colorSwatchHotzones = [];
   let renderScheduled = false;
   let previewRenderScheduled = false;
   let pendingState = null;
@@ -59,6 +83,8 @@
   const mosaicCanvasCache = new Map();
   let committedTarget = committedLayer;
   let pendingCommittedDiff = null;
+  let textEditorSession = null;
+  let textDraftTimer = null;
   const perf = {
     enabled: false,
     counters: new Map(),
@@ -100,6 +126,12 @@
     inDuration: 0.08,
     settleDuration: 0.1,
     outDuration: 0.12,
+  };
+  const TOOLBAR_APPEAR = {
+    offset: 56,
+    overshoot: -0.4,
+    riseDuration: 0.98,
+    settleDuration: 0.12,
   };
 
   function scale() {
@@ -180,6 +212,15 @@
     }
     const part = (n) => Math.max(0, Math.min(255, n || 0)).toString(16).padStart(2, "0");
     return `#${part(color.r)}${part(color.g)}${part(color.b)}`.toUpperCase();
+  }
+
+  function hexToWebColor(hex) {
+    const value = String(hex || "#FF3B30").replace("#", "");
+    const part = (start, fallback) => {
+      const parsed = parseInt(value.slice(start, start + 2), 16);
+      return Number.isFinite(parsed) ? parsed : fallback;
+    };
+    return { r: part(0, 255), g: part(2, 59), b: part(4, 48), a: 255 };
   }
 
   function activeColor() {
@@ -290,6 +331,17 @@
     return { x: event.clientX - rect.left, y: event.clientY - rect.top };
   }
 
+  function stagePointFromKonvaEvent(evt) {
+    const nativeEvent = evt && evt.evt;
+    const touch =
+      nativeEvent && nativeEvent.touches && nativeEvent.touches.length
+        ? nativeEvent.touches[0]
+        : nativeEvent && nativeEvent.changedTouches && nativeEvent.changedTouches.length
+          ? nativeEvent.changedTouches[0]
+          : null;
+    return touch ? eventStagePoint(touch) : nativeEvent ? eventStagePoint(nativeEvent) : pointerPosition();
+  }
+
   function sliderAtStagePoint(point) {
     if (!point) {
       return null;
@@ -298,6 +350,19 @@
       const zone = sliderHotzones[i];
       if (pointInRect(point, zone.rect, 0)) {
         return zone.slider;
+      }
+    }
+    return null;
+  }
+
+  function colorAtSwatchPoint(point) {
+    if (!point) {
+      return null;
+    }
+    for (let i = colorSwatchHotzones.length - 1; i >= 0; i -= 1) {
+      const zone = colorSwatchHotzones[i];
+      if (pointInRect(point, zone.rect, 0)) {
+        return zone.color;
       }
     }
     return null;
@@ -507,6 +572,11 @@
     host(Object.assign({ type }, extra || {}));
   }
 
+  function showCaretNow() {
+    caretVisible = true;
+    caretForceVisibleUntil = Date.now() + 650;
+  }
+
   function measure(name, fn) {
     if (!perf.enabled || !window.performance) {
       return fn();
@@ -541,6 +611,59 @@
     dirty.committed = dirty.committed || !!parts.committed;
     dirty.selection = dirty.selection || !!parts.selection;
     dirty.preview = dirty.preview || !!parts.preview;
+  }
+
+  function stopToolbarAppearTweens() {
+    for (const tween of toolbarAppearTweens) {
+      if (tween) {
+        tween.destroy();
+      }
+    }
+    toolbarAppearTweens = [];
+  }
+
+  function shouldAnimateToolbarAppearance(rect) {
+    if (!rect) {
+      toolbarWasVisible = false;
+      stopToolbarAppearTweens();
+      return false;
+    }
+    if (toolbarWasVisible) {
+      return false;
+    }
+    toolbarWasVisible = true;
+    return true;
+  }
+
+  function toolbarAppearEase(t) {
+    const clamped = Math.max(0, Math.min(1, t));
+    return clamped * clamped * (3 - 2 * clamped);
+  }
+
+  function animateToolbarSurface(group) {
+    const s = scale();
+    const baseY = group.y();
+    group.opacity(0);
+    group.y(baseY + TOOLBAR_APPEAR.offset * s);
+    const rise = new Konva.Tween({
+      node: group,
+      duration: TOOLBAR_APPEAR.riseDuration,
+      easing: toolbarAppearEase,
+      opacity: 1,
+      y: baseY + TOOLBAR_APPEAR.overshoot * s,
+      onFinish: () => {
+        const settle = new Konva.Tween({
+          node: group,
+          duration: TOOLBAR_APPEAR.settleDuration,
+          easing: toolbarAppearEase,
+          y: baseY,
+        });
+        toolbarAppearTweens.push(settle);
+        settle.play();
+      },
+    });
+    toolbarAppearTweens.push(rise);
+    rise.play();
   }
 
   function scheduleRender(nextState, parts) {
@@ -620,6 +743,7 @@
       watermarkMode: value.watermarkMode,
       renderStyle: value.renderStyle,
       editingTextId: value.editingTextId,
+      editingTextCaret: value.editingTextCaret,
       editingStepNumberId: value.editingStepNumberId,
       viewportScale: viewportScaleFor(value),
       uiScale: value.uiScale,
@@ -682,6 +806,427 @@
     command("pointerMove", cssToPhysicalPoint(point));
   }
 
+  function lexicalApi() {
+    return window.SCREEN_CAPTN_LEXICAL || null;
+  }
+
+  function activeTextAnnotation() {
+    if (!state || state.editingTextId == null || !Array.isArray(state.annotations)) {
+      return null;
+    }
+    return state.annotations.find((annotation) => annotation.id === state.editingTextId) || null;
+  }
+
+  function ensureLexicalEditorRoot() {
+    let root = document.getElementById("lexical-text-editor");
+    if (!root) {
+      root = document.createElement("div");
+      root.id = "lexical-text-editor";
+      root.className = "lexical-text-editor";
+      root.spellcheck = false;
+      root.setAttribute("contenteditable", "true");
+      root.setAttribute("role", "textbox");
+      root.setAttribute("aria-multiline", "true");
+      document.body.appendChild(root);
+    }
+    return root;
+  }
+
+  function annotationTextValue(annotation) {
+    const kind = annotation && annotation.kind ? annotation.kind : {};
+    if (kind.type === "text") {
+      return kind.text || "";
+    }
+    if (kind.type === "tag") {
+      return kind.label || "";
+    }
+    return "";
+  }
+
+  function replaceAnnotationText(annotation, text) {
+    const kind = annotation && annotation.kind ? annotation.kind : {};
+    if (kind.type === "text") {
+      return autoGrowFramedTextAnnotation({ ...annotation, kind: { ...kind, text } }, text);
+    }
+    if (kind.type === "tag") {
+      return { ...annotation, kind: { ...kind, label: text } };
+    }
+    return annotation;
+  }
+
+  function autoGrowFramedTextAnnotation(annotation, text) {
+    const kind = annotation && annotation.kind ? annotation.kind : {};
+    if (kind.type !== "text" || !kind.framed || !annotation.bounds) {
+      return annotation;
+    }
+    const scaleValue = Math.max(0.0001, viewportScale());
+    const bounds = physicalToCssRect(annotation.bounds);
+    const fontSize = physicalScalar(kind.fontSize || state.fontSize || 27);
+    const padding = physicalScalar(8);
+    const maxWidth = Math.max(1, bounds.width - padding * 2);
+    const lineHeight = fontSize * 1.22;
+    const visualLines = textVisualLines(text, fontSize, maxWidth);
+    const requiredCssHeight = padding * 2 + Math.max(fontSize, visualLines.length * lineHeight);
+    const requiredPhysicalHeight = Math.ceil(requiredCssHeight / scaleValue);
+    if (requiredPhysicalHeight <= annotation.bounds.height + 0.5) {
+      return annotation;
+    }
+    return {
+      ...annotation,
+      bounds: {
+        ...annotation.bounds,
+        height: requiredPhysicalHeight,
+      },
+    };
+  }
+
+  function updateLocalAnnotation(id, update) {
+    if (!state || !Array.isArray(state.annotations)) {
+      return;
+    }
+    let changed = null;
+    const annotations = state.annotations.map((annotation) => {
+      if (annotation.id !== id) {
+        return annotation;
+      }
+      changed = update(annotation);
+      return changed || annotation;
+    });
+    if (!changed) {
+      return;
+    }
+    state = { ...state, annotations };
+    pendingState = state;
+    queueCommittedDiff(new Set(), [], [changed]);
+    scheduleRender(state, { committed: true, selection: true, ui: true });
+  }
+
+  function updateLocalAnnotationText(id, text) {
+    if (!state || !Array.isArray(state.annotations)) {
+      return;
+    }
+    updateLocalAnnotation(id, (annotation) => replaceAnnotationText(annotation, text));
+  }
+
+  function selectedTextAnnotation() {
+    const annotation = selectedAnnotation();
+    return annotation && annotation.kind && annotation.kind.type === "text" ? annotation : null;
+  }
+
+  function applyLocalTextFilled(filled) {
+    const annotation = selectedTextAnnotation();
+    if (!annotation) {
+      return;
+    }
+    updateLocalAnnotation(annotation.id, (current) => ({
+      ...current,
+      kind: { ...current.kind, filled },
+    }));
+  }
+
+  function applyLocalColor(color) {
+    if (!colors.includes(color)) {
+      return;
+    }
+    const annotation = selectedAnnotation();
+    if (!annotation) {
+      return;
+    }
+    updateLocalAnnotation(annotation.id, (current) => ({
+      ...current,
+      stroke: { ...current.stroke, color: hexToWebColor(color) },
+    }));
+  }
+
+  function sendTextDraft(id, text) {
+    window.clearTimeout(textDraftTimer);
+    textDraftTimer = window.setTimeout(() => {
+      command("setTextDraft", { id, text });
+    }, 80);
+  }
+
+  function flushTextDraft() {
+    if (!textEditorSession || textEditorSession.lastText == null) {
+      return;
+    }
+    window.clearTimeout(textDraftTimer);
+    command("setTextDraft", { id: textEditorSession.id, text: textEditorSession.lastText });
+  }
+
+  function uiInteractionRect() {
+    const toolbar = toolbarRect();
+    if (!toolbar || !state || !state.activeSubmenu) {
+      return toolbar;
+    }
+    const submenu = state.captureRegion ? submenuLayout(toolbar, state.activeSubmenu, scale()) : null;
+    if (!submenu) {
+      return toolbar;
+    }
+    const left = Math.min(toolbar.x, submenu.x);
+    const top = Math.min(toolbar.y, submenu.y);
+    const right = Math.max(toolbar.x + toolbar.width, submenu.x + submenu.width);
+    const bottom = Math.max(toolbar.y + toolbar.height, submenu.y + submenu.height);
+    return { x: left, y: top, width: right - left, height: bottom - top };
+  }
+
+  function pointInUiControls(point) {
+    const rect = uiInteractionRect();
+    return !!rect && pointInRect(point, rect, 4 * scale());
+  }
+
+  function syncEditorPointerEvents(point) {
+    if (!textEditorSession || !textEditorSession.root) {
+      return;
+    }
+    textEditorSession.root.style.pointerEvents = point && pointInUiControls(point) ? "none" : "auto";
+  }
+
+  function setLexicalText(editor, text, caretIndex) {
+    const api = lexicalApi();
+    if (!api) {
+      return;
+    }
+    const {
+      $createLineBreakNode,
+      $createParagraphNode,
+      $createTextNode,
+      $getRoot,
+    } = api;
+    editor.update(() => {
+      const root = $getRoot();
+      root.clear();
+      const paragraph = $createParagraphNode();
+      const parts = String(text || "").split("\n");
+      parts.forEach((part, index) => {
+        if (part) {
+          paragraph.append($createTextNode(part));
+        }
+        if (index < parts.length - 1) {
+          paragraph.append($createLineBreakNode());
+        }
+      });
+      root.append(paragraph);
+      selectLexicalTextOffset(paragraph, caretIndex == null ? String(text || "").length : caretIndex);
+    });
+  }
+
+  function selectLexicalTextOffset(paragraph, caretIndex) {
+    const api = lexicalApi();
+    if (!api || !paragraph || !paragraph.getChildren) {
+      paragraph && paragraph.selectEnd && paragraph.selectEnd();
+      return;
+    }
+    const { $isLineBreakNode, $isTextNode } = api;
+    let remaining = Math.max(0, caretIndex || 0);
+    let lastText = null;
+    for (const child of paragraph.getChildren()) {
+      if ($isTextNode(child)) {
+        const length = child.getTextContentSize();
+        if (remaining <= length) {
+          child.select(remaining, remaining);
+          return;
+        }
+        remaining -= length;
+        lastText = child;
+      } else if ($isLineBreakNode(child)) {
+        if (remaining <= 0) {
+          if (lastText) {
+            const length = lastText.getTextContentSize();
+            lastText.select(length, length);
+          } else {
+            paragraph.selectStart();
+          }
+          return;
+        }
+        remaining -= 1;
+      }
+    }
+    if (lastText) {
+      const length = lastText.getTextContentSize();
+      lastText.select(length, length);
+    } else {
+      paragraph.selectEnd();
+    }
+  }
+
+  function styleLexicalOverlay(root, annotation) {
+    const metrics = editingTextMetrics(annotation);
+    if (!metrics) {
+      root.style.display = "none";
+      return;
+    }
+    const kind = annotation.kind || {};
+    const framed = kind.type === "text" && !!kind.framed;
+    const color = strokeColor(annotation);
+    const filled = kind.type === "text" && !!kind.filled;
+    const textColor = filled ? contrastTextColor(color) : color;
+    root.style.display = "block";
+    root.style.left = `${metrics.originX}px`;
+    root.style.top = `${metrics.originY}px`;
+    if (Number.isFinite(metrics.maxWidth)) {
+      root.style.width = `${Math.max(1, metrics.maxWidth)}px`;
+      root.style.minWidth = "2px";
+      root.style.maxWidth = `${Math.max(1, metrics.maxWidth)}px`;
+    } else {
+      const lines = String(annotationTextValue(annotation) || "").split(/\r?\n/);
+      const width = Math.max(
+        metrics.fontSize * 0.45,
+        lines.reduce((max, line) => Math.max(max, measureTextWidth(line, metrics.fontSize, false)), 0)
+      );
+      root.style.width = `${Math.ceil(width + 2)}px`;
+      root.style.minWidth = "2px";
+      root.style.maxWidth = "none";
+    }
+    root.style.minHeight = `${metrics.lineHeight}px`;
+    root.style.fontFamily = "Segoe UI, Arial, sans-serif";
+    root.style.fontSize = `${metrics.fontSize}px`;
+    root.style.lineHeight = String(metrics.lineHeight / metrics.fontSize);
+    root.style.color = textColor;
+    root.style.padding = "0";
+    root.style.whiteSpace = framed || kind.type === "tag" ? "pre-wrap" : "pre";
+    root.style.overflowWrap = framed || kind.type === "tag" ? "break-word" : "normal";
+    root.style.transform = "none";
+    root.style.transformOrigin = "left top";
+  }
+
+  function syncTextEditorOverlay() {
+    const annotation = activeTextAnnotation();
+    if (!annotation || !lexicalApi()) {
+      destroyTextEditor(false);
+      return;
+    }
+    if (!textEditorSession || textEditorSession.id !== annotation.id) {
+      openTextEditor(annotation, state.editingTextCaret || 0);
+      return;
+    }
+    styleLexicalOverlay(textEditorSession.root, annotation);
+  }
+
+  function openTextEditor(annotation, caretIndex) {
+    destroyTextEditor(false);
+    const api = lexicalApi();
+    if (!api) {
+      return;
+    }
+    const root = ensureLexicalEditorRoot();
+    const editor = api.createEditor({
+      namespace: "ScreenCaptnTextEditor",
+      onError(error) {
+        diagnostic("error", error && error.message ? error.message : error, { source: "lexical" });
+      },
+    });
+    const originalText = annotationTextValue(annotation);
+    textEditorSession = {
+      id: annotation.id,
+      root,
+      editor,
+      originalText,
+      lastText: originalText,
+      unregister: [],
+      committing: false,
+    };
+    styleLexicalOverlay(root, annotation);
+    editor.setRootElement(root);
+    textEditorSession.unregister.push(api.registerPlainText(editor));
+    textEditorSession.unregister.push(api.registerHistory(editor, api.createEmptyHistoryState(), 250));
+    textEditorSession.unregister.push(
+      editor.registerCommand(
+        api.KEY_ENTER_COMMAND,
+        (event) => {
+          if (event && event.shiftKey) {
+            event.preventDefault();
+            return editor.dispatchCommand(api.INSERT_LINE_BREAK_COMMAND, false);
+          }
+          if (event) {
+            event.preventDefault();
+          }
+          commitTextEditor(true);
+          return true;
+        },
+        api.COMMAND_PRIORITY_HIGH
+      )
+    );
+    textEditorSession.unregister.push(
+      editor.registerUpdateListener(({ editorState }) => {
+        if (!textEditorSession || textEditorSession.committing) {
+          return;
+        }
+        editorState.read(() => {
+          const text = api.$getRoot().getTextContent();
+          textEditorSession.lastText = text;
+          updateLocalAnnotationText(annotation.id, text);
+          sendTextDraft(annotation.id, text);
+        });
+      })
+    );
+    root.onkeydown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelTextEditor();
+      }
+    };
+    root.onblur = () => {
+      window.setTimeout(() => {
+        if (textEditorSession && document.activeElement !== textEditorSession.root) {
+          commitTextEditor(false);
+        }
+      }, 0);
+    };
+    setLexicalText(editor, originalText, caretIndex);
+    requestAnimationFrame(() => {
+      if (!textEditorSession || textEditorSession.id !== annotation.id) {
+        return;
+      }
+      root.focus({ preventScroll: true });
+    });
+  }
+
+  function commitTextEditor(copyAfterCommit) {
+    if (!textEditorSession) {
+      return;
+    }
+    const session = textEditorSession;
+    session.committing = true;
+    flushTextDraft();
+    command("commitText", { id: session.id, text: session.lastText || "" });
+    destroyTextEditor(false);
+    if (copyAfterCommit) {
+      window.setTimeout(() => command("copy"), 0);
+    }
+  }
+
+  function cancelTextEditor() {
+    if (!textEditorSession) {
+      return;
+    }
+    const session = textEditorSession;
+    updateLocalAnnotationText(session.id, session.originalText);
+    command("cancelText", { id: session.id, text: session.originalText });
+    destroyTextEditor(false);
+  }
+
+  function destroyTextEditor(sendCommit) {
+    if (!textEditorSession) {
+      return;
+    }
+    const session = textEditorSession;
+    if (sendCommit) {
+      command("commitText", { id: session.id, text: session.lastText || "" });
+    }
+    window.clearTimeout(textDraftTimer);
+    for (const unregister of session.unregister || []) {
+      try {
+        unregister();
+      } catch (_) {}
+    }
+    session.editor.setRootElement(null);
+    session.root.onkeydown = null;
+    session.root.onblur = null;
+    session.root.style.display = "none";
+    session.root.textContent = "";
+    textEditorSession = null;
+  }
+
   function render() {
     markDirty();
     renderDirty();
@@ -690,6 +1235,7 @@
   function renderDirty() {
     const rect = toolbarRect();
     if (!rect) {
+      shouldAnimateToolbarAppearance(null);
       watermarkInput.style.display = "none";
       clearAnnotationNodeCache();
       selectionLayer.destroyChildren();
@@ -727,24 +1273,31 @@
       previewLayer.batchDraw();
     }
     if (dirty.ui) {
+      const animateToolbar = shouldAnimateToolbarAppearance(rect);
       sliderHotzones = [];
+      colorSwatchHotzones = [];
+      stopToolbarAppearTweens();
       uiLayer.destroyChildren();
-      drawToolbar(rect);
-      drawSubmenu(rect);
+      drawToolbar(rect, animateToolbar);
+      drawSubmenu(rect, animateToolbar);
       uiLayer.batchDraw();
     }
+    syncTextEditorOverlay();
     dirty.ui = false;
     dirty.committed = false;
     dirty.selection = false;
     dirty.preview = false;
   }
 
-  function drawToolbar(rect) {
+  function drawToolbar(rect, animate) {
     const s = scale();
     const p = palette();
     const radius = 10 * s;
     const group = new Konva.Group({ x: rect.x, y: rect.y, name: "ui" });
     uiLayer.add(group);
+    if (animate) {
+      animateToolbarSurface(group);
+    }
 
     drawThemeDrawer(group, rect, s);
     group.add(
@@ -1154,7 +1707,7 @@
     }
   }
 
-  function drawSubmenu(toolbar) {
+  function drawSubmenu(toolbar, animate) {
     const tool = state.activeSubmenu;
     if (!tool || !state.captureRegion) {
       watermarkInput.style.display = "none";
@@ -1165,6 +1718,9 @@
     const layout = submenuLayout(toolbar, tool, s);
     const group = new Konva.Group({ x: layout.x, y: layout.y, name: "ui" });
     uiLayer.add(group);
+    if (animate) {
+      animateToolbarSurface(group);
+    }
     const radius = 8 * s;
     group.add(new Konva.Rect({ x: 0, y: 0, width: layout.width, height: layout.height, cornerRadius: radius, fill: "rgba(0,0,0,0.14)", shadowColor: "rgba(0,0,0,0.28)", shadowBlur: 14 * s, shadowOffsetY: 5 * s, shadowOpacity: 0.45, listening: false }));
     group.add(new Konva.Rect({ x: 0, y: 0, width: layout.width, height: layout.height, cornerRadius: radius, fill: p.submenuBg, name: "ui" }));
@@ -1196,8 +1752,14 @@
     } else if (tool === "text") {
       const selectedText = selectedAnnotation();
       const textFilled = selectedText && selectedText.kind && selectedText.kind.type === "text" ? !!selectedText.kind.filled : !!state.textFilled;
-      x = drawOptionIcon(group, x, "lineText", !textFilled, () => command("setTextFilled", { filled: false }), p, s);
-      x = drawOptionIcon(group, x, "solidText", textFilled, () => command("setTextFilled", { filled: true }), p, s);
+      x = drawOptionIcon(group, x, "lineText", !textFilled, () => {
+        applyLocalTextFilled(false);
+        command("setTextFilled", { filled: false });
+      }, p, s);
+      x = drawOptionIcon(group, x, "solidText", textFilled, () => {
+        applyLocalTextFilled(true);
+        command("setTextFilled", { filled: true });
+      }, p, s);
       x = drawDivider(group, x, p, s);
       x = drawSlider(group, x, 0, "font", 27, 56, currentFontSize(), p, s);
       x = drawDivider(group, x, p, s);
@@ -1210,7 +1772,6 @@
       x = drawColors(group, x, p, s);
     } else if (tool === "watermark") {
       x = drawOptionIcon(group, x, "calendar", !!state.watermarkDateEnabled, () => command("setWatermarkMode", { mode: "date" }), p, s);
-      x = drawOptionIcon(group, x, "lineText", state.watermarkMode === "text", () => command("focusWatermarkText"), p, s);
       x = drawOptionIcon(group, x, "image", state.watermarkMode === "image", () => command("setWatermarkMode", { mode: "image" }), p, s);
       x = drawOptionIcon(group, x, "cancel", false, () => {
         watermarkInput.value = "";
@@ -1225,6 +1786,21 @@
     } else {
       watermarkInput.style.display = "none";
     }
+    group.on("mousedown touchstart", (evt) => {
+      const point = stagePointFromKonvaEvent(evt);
+      const color = colorAtSwatchPoint(point);
+      evt.cancelBubble = true;
+      if (evt.evt && evt.evt.preventDefault) {
+        evt.evt.preventDefault();
+      }
+      if (!color) {
+        return;
+      }
+      if (state.activeSubmenu !== "watermark") {
+        applyLocalColor(color);
+      }
+      command("setColor", { color, ...cssToPhysicalPoint(point) });
+    });
   }
 
   function submenuLayout(toolbar, tool, s) {
@@ -1273,7 +1849,13 @@
     group.add(item);
     item.add(new Konva.Rect({ x: 0, y: 0, width: box, height: box, cornerRadius: 4 * s, fill: selected ? p.selected : "rgba(0,0,0,0)", name: "ui" }));
     drawIcon(item, icon, 4 * s, 4 * s, 16 * s, p.icon, selected ? 1 : 0.92);
-    item.on("click tap", onClick);
+    item.on("mousedown touchstart", (evt) => {
+      evt.cancelBubble = true;
+      if (evt.evt && evt.evt.preventDefault) {
+        evt.evt.preventDefault();
+      }
+      onClick();
+    });
     item.on("mouseenter", () => (container.style.cursor = "pointer"));
     item.on("mouseleave", updateDefaultCursor);
     return x + 28 * s;
@@ -1285,10 +1867,12 @@
       const box = 16 * s;
       const hit = new Konva.Group({ x, y: 4 * s, name: "ui" });
       group.add(hit);
-      hit.add(new Konva.Rect({ x: 0, y: 0, width: box, height: box, cornerRadius: 3 * s, fill: color, stroke: selected ? p.swatchBorder : null, strokeWidth: selected ? 3 : 0, name: "ui" }));
-      hit.on("click tap", () => command("setColor", { color }));
-      hit.on("mouseenter", () => (container.style.cursor = "pointer"));
-      hit.on("mouseleave", updateDefaultCursor);
+      const swatch = new Konva.Rect({ x: 0, y: 0, width: box, height: box, cornerRadius: 3 * s, fill: color, stroke: selected ? p.swatchBorder : null, strokeWidth: selected ? 3 : 0, name: "ui" });
+      hit.add(swatch);
+      const swatchOrigin = swatch.getAbsolutePosition();
+      colorSwatchHotzones.push({ color, rect: { x: swatchOrigin.x, y: swatchOrigin.y, width: box, height: box } });
+      swatch.on("mouseenter", () => (container.style.cursor = "pointer"));
+      swatch.on("mouseleave", updateDefaultCursor);
       x += 21 * s;
     }
     watermarkInput.style.display = state.activeSubmenu === "watermark" ? watermarkInput.style.display : "none";
@@ -1396,7 +1980,12 @@
   watermarkInput.addEventListener("focus", () => command("focusWatermarkText"));
   watermarkInput.addEventListener("input", () => command("setWatermarkText", { text: watermarkInput.value }));
   watermarkInput.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" || (event.key === "Enter" && !event.shiftKey)) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      watermarkInput.blur();
+      command("blurWatermarkText");
+      command("copy");
+      event.preventDefault();
+    } else if (event.key === "Escape") {
       watermarkInput.blur();
       command("blurWatermarkText");
       event.preventDefault();
@@ -1466,39 +2055,38 @@
       return false;
     }
     for (let i = state.annotations.length - 1; i >= 0; i--) {
-      const annotation = state.annotations[i];
-      const kind = annotation.kind || {};
-      const bounds = physicalToCssRect(annotation.bounds);
-      const width = strokeWidth(annotation);
-      const radius = Math.max(8, width / 2 + 8);
-      if (kind.type === "line" || kind.type === "arrow" || (kind.type === "highlighter" && kind.shape === "line")) {
-        if (distanceToSegment(point, physicalToCssPoint(kind.start), physicalToCssPoint(kind.end)) <= radius) {
-          return true;
-        }
-      } else if (kind.type === "pen" || kind.type === "penArrow") {
-        const pts = (kind.points || []).map(physicalToCssPoint);
-        for (let j = 1; j < pts.length; j++) {
-          if (distanceToSegment(point, pts[j - 1], pts[j]) <= radius) {
-            return true;
-          }
-        }
-      } else if (kind.type === "tag") {
-        if (pointInRect(point, bounds, 4 * scale())) {
-          return true;
-        }
-        const anchor = physicalToCssPoint(kind.anchor);
-        if (Math.hypot(point.x - anchor.x, point.y - anchor.y) <= 14 * scale()) {
-          return true;
-        }
-      } else if (kind.type === "text" && !kind.framed) {
-        if (pointInRect(point, inlineTextHitBounds(bounds, kind), 0)) {
-          return true;
-        }
-      } else if (pointInRect(point, bounds, 4 * scale())) {
+      if (annotationContainsPoint(state.annotations[i], point)) {
         return true;
       }
     }
     return false;
+  }
+
+  function annotationContainsPoint(annotation, point) {
+    const kind = annotation.kind || {};
+    const bounds = physicalToCssRect(annotation.bounds);
+    const width = strokeWidth(annotation);
+    const radius = Math.max(8, width / 2 + 8);
+    if (kind.type === "line" || kind.type === "arrow" || (kind.type === "highlighter" && kind.shape === "line")) {
+      return distanceToSegment(point, physicalToCssPoint(kind.start), physicalToCssPoint(kind.end)) <= radius;
+    }
+    if (kind.type === "pen" || kind.type === "penArrow") {
+      const pts = (kind.points || []).map(physicalToCssPoint);
+      for (let j = 1; j < pts.length; j += 1) {
+        if (distanceToSegment(point, pts[j - 1], pts[j]) <= radius) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (kind.type === "tag") {
+      const anchor = physicalToCssPoint(kind.anchor);
+      return pointInRect(point, bounds, 4 * scale()) || Math.hypot(point.x - anchor.x, point.y - anchor.y) <= 14 * scale();
+    }
+    if (kind.type === "text" && !kind.framed) {
+      return pointInRect(point, inlineTextHitBounds(bounds, kind), 0);
+    }
+    return pointInRect(point, bounds, 4 * scale());
   }
 
   function inlineTextHitBounds(bounds, kind) {
@@ -1511,7 +2099,7 @@
       x: bounds.x - padding,
       y: bounds.y - fontSize * 1.12 - padding,
       width: width + padding * 2,
-      height: fontSize * 1.55 * lineCount + padding * 2,
+      height: fontSize * 1.22 * lineCount + padding * 2,
     };
   }
 
@@ -1547,17 +2135,35 @@
     if (isUiTarget(evt.target)) {
       return;
     }
+    if (evt.evt && evt.evt.button === 2) {
+      evt.evt.preventDefault();
+      preview = null;
+      cancelTextEditor();
+      applyLocalDeselect();
+      command("deselect");
+      schedulePreviewRender();
+      return;
+    }
+    if (textEditorSession) {
+      commitTextEditor(false);
+    }
     captureBrowserPointer(evt);
     watermarkInput.blur();
     const point = pointerPosition();
     if (!point) {
       return;
     }
+    showCaretNow();
     if (stepBadgeHitTest(point) != null) {
       return;
     }
     preview = shouldStartPreview(point) ? { start: point, current: point, points: [point] } : null;
-    command("pointerDown", cssToPhysicalPoint(point));
+    const payload = cssToPhysicalPoint(point);
+    const caretIndex = textCaretIndexAtPoint(point);
+    if (caretIndex != null) {
+      payload.caretIndex = caretIndex;
+    }
+    command("pointerDown", payload);
     schedulePreviewRender();
   });
 
@@ -1704,147 +2310,6 @@
 
   function renderWatermarkAnnotations() {
     watermarkLayer.destroyChildren();
-    if (!state || !state.captureRegion || !Array.isArray(state.annotations)) {
-      return;
-    }
-    drawWatermarkPattern();
-    for (const annotation of watermarkAnnotations(state.annotations)) {
-      const previousTarget = committedTarget;
-      committedTarget = watermarkLayer;
-      drawCommittedAnnotation(annotation);
-      committedTarget = previousTarget;
-    }
-  }
-
-  function drawWatermarkPattern() {
-    const text = (state.watermarkText || "").trim();
-    const date = state.watermarkDateEnabled ? new Date().toLocaleDateString() : "";
-    const image = watermarkImageForUrl(state.watermarkImageDataUrl || state.watermarkImageUrl);
-    const hasTextWatermark = !!(text || date);
-    if (!hasTextWatermark && !image) {
-      return;
-    }
-    const region = physicalToCssRect(state.captureRegion);
-    const color = hexColor(state.watermarkColor);
-    const opacity = 0.5;
-    const fontSize = Math.max(physicalScalar(state.fontSize || 27), physicalScalar(34));
-    const spread = fontSize / Math.max(1, physicalScalar(27));
-    const stepX = Math.max(physicalScalar(320), physicalScalar(240) * spread);
-    const stepY = Math.max(physicalScalar(200), physicalScalar(150) * spread);
-    const maxTiles = 72;
-    for (const tile of watermarkCombTiles(region, stepX, stepY, maxTiles)) {
-      const useImage = image && (!hasTextWatermark || tile.index % 2 === 0);
-      const useText = hasTextWatermark && (!image || tile.index % 2 === 1);
-      if (useImage) {
-        drawWatermarkLogo(image, tile.x, tile.y, fontSize, opacity);
-      }
-      if (useText) {
-        drawWatermarkTextBlock(text, date, tile.x, tile.y, fontSize, color, opacity);
-      }
-    }
-  }
-
-  function drawWatermarkLogo(image, x, y, fontSize, opacity) {
-    const imageSize = safeWatermarkImageSize(image, fontSize);
-    watermarkLayer.add(new Konva.Image({
-      x: x - imageSize.width / 2,
-      y: y - imageSize.height / 2,
-      image,
-      width: imageSize.width,
-      height: imageSize.height,
-      opacity,
-      rotation: -20,
-      listening: false,
-    }));
-  }
-
-  function drawWatermarkTextBlock(text, date, x, y, fontSize, color, opacity) {
-    if (text) {
-      const textWidth = approximateWatermarkTextWidth(text, fontSize);
-      watermarkLayer.add(new Konva.Text({ x: x - textWidth / 2, y, text, fontFamily: "Segoe UI", fontSize, fontStyle: "700", fill: color, opacity, rotation: -20, listening: false }));
-    }
-    if (date) {
-      const dateFont = fontSize * 0.72;
-      const textWidth = approximateWatermarkTextWidth(text || date, text ? fontSize : dateFont);
-      const dateWidth = approximateWatermarkTextWidth(date, dateFont);
-      watermarkLayer.add(new Konva.Text({ x: x - dateWidth / 2, y: y + (text ? fontSize * 1.02 : 0), text: date, fontFamily: "Segoe UI", fontSize: dateFont, fill: color, opacity, rotation: -20, listening: false }));
-    }
-  }
-
-  function watermarkCombTiles(region, stepX, stepY, maxTiles) {
-    const estimatedCols = Math.max(1, Math.ceil(region.width / Math.max(1, stepX)) + 1);
-    const estimatedRows = Math.max(1, Math.ceil(region.height / Math.max(1, stepY)) + 2);
-    let cols = estimatedCols;
-    let rows = estimatedRows;
-    if (cols * rows > maxTiles) {
-      const aspect = Math.max(0.25, Math.min(4, region.width / Math.max(1, region.height)));
-      cols = Math.max(1, Math.ceil(Math.sqrt(maxTiles * aspect)));
-      rows = Math.max(1, Math.floor(maxTiles / cols));
-      while (cols * rows > maxTiles && rows > 1) {
-        rows -= 1;
-      }
-      while (cols * rows > maxTiles && cols > 1) {
-        cols -= 1;
-      }
-    }
-    const marginX = Math.min(physicalScalar(24), region.width / 10);
-    const marginY = Math.min(physicalScalar(24), region.height / 10);
-    const usableWidth = Math.max(1, region.width - marginX * 2);
-    const usableHeight = Math.max(1, region.height - marginY * 2);
-    const toothWidth = usableWidth / Math.max(1, cols);
-    const toothHeight = usableHeight / Math.max(1, rows);
-    const tiles = [];
-    for (let col = 0; col < cols; col += 1) {
-      const x = region.x + marginX + toothWidth * (col + 0.5);
-      const phase = ((col * 0.61803398875) % 1) * toothHeight;
-      for (let row = 0; row < rows; row += 1) {
-        let y = region.y + marginY + toothHeight * (row + 0.5) + phase;
-        if (y > region.y + region.height - marginY) {
-          y -= usableHeight;
-        }
-        tiles.push({ x, y, row, col, index: tiles.length });
-      }
-    }
-    tiles.sort((a, b) => a.y - b.y || a.x - b.x);
-    tiles.forEach((tile, index) => {
-      tile.index = index;
-    });
-    return tiles;
-  }
-  function safeWatermarkImageSize(image, fontSize) {
-    const naturalWidth = Math.max(1, image.naturalWidth || image.width || 96);
-    const naturalHeight = Math.max(1, image.naturalHeight || image.height || 96);
-    const maxSide = Math.max(physicalScalar(96), fontSize * 3.2);
-    const scaleDown = Math.min(1, maxSide / Math.max(naturalWidth, naturalHeight));
-    return {
-      width: Math.max(1, naturalWidth * scaleDown),
-      height: Math.max(1, naturalHeight * scaleDown),
-    };
-  }
-  function watermarkImageForUrl(url) {
-    if (!url) {
-      return null;
-    }
-    let cached = watermarkImageCache.get(url);
-    if (!cached) {
-      const image = new Image();
-      cached = { image, loaded: false };
-      watermarkImageCache.set(url, cached);
-      image.onload = () => {
-        cached.loaded = true;
-        if (state) {
-          scheduleRender(state, { committed: true });
-        }
-      };
-      image.onerror = () => {
-        cached.failed = true;
-      };
-      image.src = url;
-    }
-    return cached.loaded ? cached.image : null;
-  }
-  function approximateWatermarkTextWidth(text, fontSize) {
-    return (text || "").length * fontSize * 0.62;
   }
 
   function isWatermarkAnnotation(annotation) {
@@ -1855,9 +2320,6 @@
     return (annotations || []).filter((annotation) => !isWatermarkAnnotation(annotation));
   }
 
-  function watermarkAnnotations(annotations) {
-    return (annotations || []).filter(isWatermarkAnnotation);
-  }
   function renderSelection() {
     selectionLayer.destroyChildren();
     const selected = selectedAnnotation();
@@ -2138,66 +2600,296 @@
     const text = kind.text || "";
     const filled = !!kind.filled;
     const framed = !!kind.framed;
+    const editingWithLexical = textEditorSession && textEditorSession.id === annotation.id;
     if (framed) {
       if (filled) {
         addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, cornerRadius: physicalScalar(12), fill: color }));
       }
-      const textNode = new Konva.Text({
-        x: bounds.x + padding,
-        y: bounds.y + padding,
-        width: Math.max(1, bounds.width - padding * 2),
-        text,
-        fontFamily: "Segoe UI",
-        fontSize,
-        lineHeight: 1.22,
-        fill: filled ? contrastTextColor(color) : color,
-      });
-      addCommitted(textNode);
-      if (state.editingTextId === annotation.id) {
+      if (!editingWithLexical) {
+        const textNode = new Konva.Text({
+          x: bounds.x + padding,
+          y: bounds.y + padding,
+          width: Math.max(1, bounds.width - padding * 2),
+          text,
+          fontFamily: "Segoe UI",
+          fontSize,
+          lineHeight: 1.22,
+          fill: filled ? contrastTextColor(color) : color,
+        });
+        addCommitted(textNode);
+      }
+      if (state.editingTextId === annotation.id && !editingWithLexical) {
         addCommitted(new Konva.Rect({ x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, dash: [5, 4], stroke: selectionColor(), strokeWidth: Math.max(1, physicalScalar(1)) }));
-        const caret = framedTextCaret(bounds, textNode, text, fontSize, padding);
+        const caret = textCaretForIndex(text, state.editingTextCaret || 0, bounds.x + padding, bounds.y + padding, fontSize, fontSize * 1.22, bounds.width - padding * 2);
         drawTextCaret(caret.x, caret.y, caret.height);
       }
     } else {
       const textY = bounds.y - fontSize * 1.08;
-      const textNode = new Konva.Text({
-        x: bounds.x,
-        y: textY,
-        text,
-        fontFamily: "Segoe UI",
-        fontSize,
-        lineHeight: 1,
-        fill: filled ? contrastTextColor(color) : color,
-      });
-      addCommitted(textNode);
+      const lineHeight = fontSize * 1.22;
+      const inlineLines = String(text || "").split(/\r?\n/);
       if (filled && text) {
-        textNode.moveToTop();
-        addCommitted(new Konva.Rect({ x: bounds.x - padding, y: textY - padding * 0.55, width: textNode.width() + padding * 2, height: fontSize * 1.28 + padding, cornerRadius: physicalScalar(12), fill: color }));
-        textNode.moveToTop();
+        inlineLines.forEach((line, index) => {
+          const lineWidth = Math.max(fontSize * 0.45, measureTextWidth(line, fontSize, false));
+          addCommitted(new Konva.Rect({
+            x: bounds.x - padding,
+            y: textY + index * lineHeight - padding * 0.45,
+            width: lineWidth + padding * 2,
+            height: lineHeight + padding * 0.45,
+            cornerRadius: physicalScalar(7),
+            fill: color,
+          }));
+        });
       }
-      if (state.editingTextId === annotation.id) {
-        drawTextCaret(bounds.x + textNode.width() + physicalScalar(2), textY, fontSize * 1.25);
+      if (!editingWithLexical) {
+        const textNode = new Konva.Text({
+          x: bounds.x,
+          y: textY,
+          text,
+          fontFamily: "Segoe UI",
+          fontSize,
+          lineHeight: 1.22,
+          fill: filled ? contrastTextColor(color) : color,
+        });
+        addCommitted(textNode);
+      }
+      if (state.editingTextId === annotation.id && !editingWithLexical) {
+        const caret = textCaretForIndex(text, state.editingTextCaret || 0, bounds.x, textY, fontSize, lineHeight, Infinity);
+        drawTextCaret(caret.x, caret.y, fontSize * 1.25);
       }
     }
   }
 
-  function framedTextCaret(bounds, textNode, text, fontSize, padding) {
-    const lines = String(text || "").split("\n");
-    const last = lines[lines.length - 1] || "";
-    const approxChar = fontSize * 0.56;
-    const lineHeight = fontSize * 1.22;
+  function textCaretForIndex(text, caretIndex, originX, originY, fontSize, lineHeight, maxWidth) {
+    const layout = textVisualLines(text, fontSize, maxWidth);
+    const safeIndex = clampCaretIndex(text, caretIndex);
+    const lineIndex = visualLineIndexForCaret(layout, safeIndex);
+    const line = layout[lineIndex] || { text: "", start: 0, end: 0 };
+    const chars = Array.from(String(text || ""));
+    const lineChars = chars.slice(line.start, Math.min(safeIndex, line.end)).join("");
+    const textWidth = measureTextWidth(lineChars, fontSize, false);
     return {
-      x: Math.min(bounds.x + bounds.width - padding, bounds.x + padding + last.length * approxChar + physicalScalar(2)),
-      y: bounds.y + padding + (lines.length - 1) * lineHeight,
+      x: Math.min(originX + Math.max(1, maxWidth), originX + textWidth + physicalScalar(2)),
+      y: originY + lineIndex * lineHeight,
       height: lineHeight,
     };
   }
 
+  function textVisualLines(text, fontSize, maxWidth) {
+    const chars = Array.from(String(text || ""));
+    const widthLimit = Number.isFinite(maxWidth) ? Math.max(fontSize, maxWidth) : Infinity;
+    const lines = [];
+    let hardStart = 0;
+    const pushWrapped = (start, end) => {
+      if (start >= end) {
+        lines.push({ text: "", start, end });
+        return;
+      }
+      let lineStart = start;
+      let index = start;
+      while (index < end) {
+        let lastFit = index + 1;
+        let lastBreak = -1;
+        let probe = index + 1;
+        while (probe <= end) {
+          const slice = chars.slice(lineStart, probe).join("");
+          if (measureTextWidth(slice, fontSize, false) > widthLimit && probe > lineStart + 1) {
+            break;
+          }
+          lastFit = probe;
+          if (/\s/.test(chars[probe - 1] || "")) {
+            lastBreak = probe;
+          }
+          probe += 1;
+        }
+        let lineEnd = lastFit;
+        if (lineEnd < end && lastBreak > lineStart) {
+          lineEnd = lastBreak;
+        }
+        const visibleEnd = lineEnd;
+        while (lineEnd < end && /\s/.test(chars[lineEnd] || "")) {
+          lineEnd += 1;
+        }
+        lines.push({ text: chars.slice(lineStart, visibleEnd).join("").trimEnd(), start: lineStart, end: visibleEnd });
+        lineStart = lineEnd;
+        index = lineEnd;
+      }
+    };
+    for (let index = 0; index <= chars.length; index += 1) {
+      if (index === chars.length || chars[index] === "\n") {
+        pushWrapped(hardStart, index);
+        hardStart = index + 1;
+      }
+    }
+    return lines.length > 0 ? lines : [{ text: "", start: 0, end: 0 }];
+  }
+
+  function visualLineIndexForCaret(layout, caretIndex) {
+    for (let index = 0; index < layout.length; index += 1) {
+      const line = layout[index];
+      const isLast = index === layout.length - 1;
+      if (caretIndex >= line.start && (caretIndex <= line.end || isLast)) {
+        return index;
+      }
+    }
+    return Math.max(0, layout.length - 1);
+  }
+
+  function clampCaretIndex(text, caretIndex) {
+    const length = Array.from(String(text || "")).length;
+    return Math.max(0, Math.min(length, caretIndex || 0));
+  }
+
+  function textCaretIndexFromPoint(text, point, originX, originY, fontSize, lineHeight, maxWidth) {
+    const layout = textVisualLines(text, fontSize, maxWidth);
+    const lineIndex = Math.max(0, Math.min(layout.length - 1, Math.floor((point.y - originY) / Math.max(1, lineHeight))));
+    const line = layout[lineIndex] || { start: 0, end: 0 };
+    const chars = Array.from(String(text || ""));
+    const localX = Math.max(0, point.x - originX);
+    let bestIndex = line.start;
+    let bestDistance = Infinity;
+    for (let index = line.start; index <= line.end; index += 1) {
+      const slice = chars.slice(line.start, index).join("");
+      const x = measureTextWidth(slice, fontSize, false);
+      const distance = Math.abs(x - localX);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    return clampCaretIndex(text, bestIndex);
+  }
+
+  function editingTextMetrics(annotation) {
+    if (!annotation || !annotation.kind) {
+      return null;
+    }
+    const kind = annotation.kind;
+    const bounds = physicalToCssRect(annotation.bounds);
+    const fontSize = physicalScalar(kind.fontSize || state.fontSize || 27);
+    const padding = physicalScalar(8);
+    if (kind.type === "text") {
+      if (kind.framed) {
+        return {
+          text: kind.text || "",
+          originX: bounds.x + padding,
+          originY: bounds.y + padding,
+          fontSize,
+          lineHeight: fontSize * 1.22,
+          maxWidth: Math.max(1, bounds.width - padding * 2),
+        };
+      }
+      return {
+        text: kind.text || "",
+        originX: bounds.x,
+        originY: bounds.y - fontSize * 1.08,
+        fontSize,
+        lineHeight: fontSize * 1.22,
+        maxWidth: Infinity,
+      };
+    }
+    if (kind.type === "tag") {
+      return {
+        text: kind.label || "",
+        originX: bounds.x + padding,
+        originY: bounds.y + padding,
+        fontSize,
+        lineHeight: fontSize * 1.22,
+        maxWidth: Math.max(1, bounds.width - padding * 2),
+      };
+    }
+    return null;
+  }
+
+  function textAnnotationAtPoint(point) {
+    if (!state || !Array.isArray(state.annotations)) {
+      return null;
+    }
+    for (let i = state.annotations.length - 1; i >= 0; i -= 1) {
+      const annotation = state.annotations[i];
+      const kind = annotation.kind || {};
+      if ((kind.type === "text" || kind.type === "tag") && annotationContainsPoint(annotation, point)) {
+        const bounds = physicalToCssRect(annotation.bounds);
+        if (kind.type !== "text" || kind.framed || pointInRect(point, inlineTextHitBounds(bounds, kind), 0)) {
+          return annotation;
+        }
+      }
+    }
+    return null;
+  }
+
+  function textCaretIndexAtPoint(point) {
+    const annotation = textAnnotationAtPoint(point);
+    const metrics = editingTextMetrics(annotation);
+    if (!metrics) {
+      return null;
+    }
+    return textCaretIndexFromPoint(metrics.text, point, metrics.originX, metrics.originY, metrics.fontSize, metrics.lineHeight, metrics.maxWidth);
+  }
+
+  function activeEditingTextAnnotation() {
+    if (!state || state.editingTextId == null || !Array.isArray(state.annotations)) {
+      return null;
+    }
+    return state.annotations.find((annotation) => annotation.id === state.editingTextId) || null;
+  }
+
+  function moveEditingCaretForArrow(key) {
+    const annotation = activeEditingTextAnnotation();
+    const metrics = editingTextMetrics(annotation);
+    if (!metrics) {
+      return false;
+    }
+    const caret = clampCaretIndex(metrics.text, state.editingTextCaret || 0);
+    let next = caret;
+    if (key === "ArrowLeft") {
+      next = Math.max(0, caret - 1);
+    } else if (key === "ArrowRight") {
+      next = Math.min(Array.from(String(metrics.text || "")).length, caret + 1);
+    } else {
+      const layout = textVisualLines(metrics.text, metrics.fontSize, metrics.maxWidth);
+      const lineIndex = visualLineIndexForCaret(layout, caret);
+      const caretPoint = textCaretForIndex(metrics.text, caret, metrics.originX, metrics.originY, metrics.fontSize, metrics.lineHeight, metrics.maxWidth);
+      const targetLineIndex = key === "ArrowUp" ? lineIndex - 1 : lineIndex + 1;
+      if (targetLineIndex < 0 || targetLineIndex >= layout.length) {
+        next = caret;
+      } else {
+        next = textCaretIndexFromPoint(
+          metrics.text,
+          { x: caretPoint.x, y: metrics.originY + targetLineIndex * metrics.lineHeight + metrics.lineHeight * 0.4 },
+          metrics.originX,
+          metrics.originY,
+          metrics.fontSize,
+          metrics.lineHeight,
+          metrics.maxWidth
+        );
+      }
+    }
+    state = { ...state, editingTextCaret: next };
+    showCaretNow();
+    scheduleRender(state, { committed: true });
+    command("setTextCaret", { caretIndex: next });
+    return true;
+  }
+
   function drawTextCaret(x, y, height) {
+    if (!caretVisible && Date.now() >= caretForceVisibleUntil) {
+      return;
+    }
     const outer = Math.max(2, physicalScalar(3));
     const inner = Math.max(1, physicalScalar(1));
     addCommitted(new Konva.Line({ points: [x, y, x, y + height], stroke: "#000000", strokeWidth: outer, opacity: 0.95, lineCap: "round" }));
     addCommitted(new Konva.Line({ points: [x, y, x, y + height], stroke: "#FFFFFF", strokeWidth: inner, opacity: 1, lineCap: "round" }));
+  }
+
+  function measureTextWidth(text, fontSize, bold) {
+    if (!text) {
+      return 0;
+    }
+    if (!watermarkMeasureContext) {
+      return text.length * fontSize * 0.56;
+    }
+    watermarkMeasureContext.font = `${bold ? "700 " : ""}${fontSize}px Segoe UI`;
+    return watermarkMeasureContext.measureText(text).width || 0;
   }
   function invertedColorAt(_x, _y, background) {
     return invertHexColor(background || "#FFFFFF");
@@ -2237,7 +2929,14 @@
     drawTagBody(committedTarget, bounds, anchor, color, frame, radius, baseFrame);
     const inner = bounds;
     addCommitted(new Konva.Rect({ x: inner.x, y: inner.y, width: inner.width, height: inner.height, cornerRadius: Math.max(1, radius), fill: "#FFFFFF" }));
-    addCommitted(new Konva.Text({ x: inner.x + padding, y: inner.y + padding, width: Math.max(1, inner.width - padding * 2), text: kind.label || "", fontFamily: "Segoe UI", fontSize, lineHeight: 1.22, fill: "#000000" }));
+    const editingWithLexical = textEditorSession && textEditorSession.id === annotation.id;
+    if (!editingWithLexical) {
+      addCommitted(new Konva.Text({ x: inner.x + padding, y: inner.y + padding, width: Math.max(1, inner.width - padding * 2), text: kind.label || "", fontFamily: "Segoe UI", fontSize, lineHeight: 1.22, fill: "#000000" }));
+    }
+    if (state.editingTextId === annotation.id && !editingWithLexical) {
+      const caret = textCaretForIndex(kind.label || "", state.editingTextCaret || 0, inner.x + padding, inner.y + padding, fontSize, fontSize * 1.22, inner.width - padding * 2);
+      drawTextCaret(caret.x, caret.y, caret.height);
+    }
   }
 
   function tagBaseFrame(style) {
@@ -2714,6 +3413,15 @@
     if (document.activeElement === watermarkInput) {
       return;
     }
+    if (textEditorSession) {
+      return;
+    }
+    if (state && state.editingTextId != null && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
+      if (moveEditingCaretForArrow(event.key)) {
+        event.preventDefault();
+        return;
+      }
+    }
     if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) {
       const slider = keyboardSliderForActiveTool();
       const direction = event.key === "ArrowRight" || event.key === "ArrowUp" ? 1 : -1;
@@ -2757,7 +3465,11 @@
     if (document.activeElement === watermarkInput) {
       return;
     }
+    if (textEditorSession) {
+      return;
+    }
     if (event.key && event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      showCaretNow();
       command("char", { charCode: event.key.charCodeAt(0) });
       event.preventDefault();
     }
@@ -2804,6 +3516,12 @@
     const hasPatch = Object.keys(patch).length > 0;
     const watermarkChanged = ["watermarkText", "watermarkColor", "watermarkImageUrl", "watermarkImageDataUrl", "watermarkDateEnabled", "watermarkMode"].some((key) => Object.prototype.hasOwnProperty.call(patch, key));
     const committedChanged = added.length > 0 || updated.length > 0 || removed.size > 0 || watermarkChanged;
+    if (
+      Object.prototype.hasOwnProperty.call(patch, "editingTextCaret") &&
+      baseState.editingTextCaret !== patch.editingTextCaret
+    ) {
+      showCaretNow();
+    }
     const nextState = Object.assign({}, baseState, patch, { annotations: nextAnnotations });
     if (committedChanged) {
       queueCommittedDiff(removed, added, updated);
@@ -2863,12 +3581,41 @@
   });
 
   window.setInterval(() => {
-    caretVisible = !caretVisible;
+    if (Date.now() >= caretForceVisibleUntil) {
+      caretVisible = !caretVisible;
+    } else {
+      caretVisible = true;
+    }
     if (state && state.editingTextId) {
-      scheduleRender(null, { selection: true });
+      scheduleRender(null, { committed: true });
     }
   }, 500);
 
-  document.addEventListener("contextmenu", (event) => event.preventDefault());
+  document.addEventListener("pointermove", (event) => {
+    syncEditorPointerEvents({ x: event.clientX, y: event.clientY });
+  });
+
+  document.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    applyLocalDeselect();
+    command("deselect");
+  });
+
+  function applyLocalDeselect() {
+    if (!state) {
+      return;
+    }
+    cancelTextEditor();
+    state = {
+      ...state,
+      selectedAnnotationId: null,
+      editingTextId: null,
+      editingTextCaret: 0,
+      editingStepNumberId: null,
+      editingWatermarkText: false,
+    };
+    watermarkInput.blur();
+    scheduleRender(state, { committed: true, selection: true, preview: true, ui: true });
+  }
   host({ type: "ready" });
 })();

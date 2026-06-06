@@ -33,6 +33,38 @@
       color: #4d4d4d;
       font: 15px "Segoe UI", Arial, sans-serif;
     }
+
+    .lexical-text-editor {
+      position: absolute;
+      z-index: 6;
+      display: none;
+      box-sizing: border-box;
+      min-width: 2px;
+      min-height: 1em;
+      margin: 0;
+      border: none;
+      outline: none;
+      background: transparent;
+      box-shadow: none;
+      resize: none;
+      overflow: hidden;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+      cursor: text;
+      user-select: text;
+      touch-action: auto;
+      caret-color: currentColor;
+    }
+
+    .lexical-text-editor p {
+      margin: 0;
+      padding: 0;
+    }
+
+    .lexical-text-editor br {
+      margin: 0;
+      padding: 0;
+    }
   </style>
 </head>
 <body>

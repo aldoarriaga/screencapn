@@ -1,3 +1,4 @@
+use crate::diagnostics;
 use crate::util::{point_from_lparam, rect_to_rect, SelectedPen, SelectedStockObject};
 use screencaptn_core::{
     Annotation, AnnotationId, AnnotationKind, CaptureDocument, Color, HighlightShape, History,
@@ -10,15 +11,15 @@ use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Result, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Globalization::{GetDateFormatEx, DATE_SHORTDATE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
-    AlphaBlend, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse,
-    FillRect, FrameRect, GetDC, GetDIBits, GetMonitorInfoW, GetPixel, InvalidateRect, LineTo,
+    AlphaBlend, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, FrameRect, GetDC,
+    GetDIBits, GetMonitorInfoW, GetPixel, GetTextExtentPoint32W, InvalidateRect, LineTo,
     MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
     TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
     DIB_RGB_COLORS, DT_LEFT, DT_WORDBREAK, HBITMAP, HDC, HGDIOBJ, MONITORINFO,
@@ -34,7 +35,8 @@ use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_EXPLORER, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_RETURN, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DOWN, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
@@ -43,15 +45,15 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor,
-    GetClientRect, GetCursorPos, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindow,
-    GetWindowLongW, GetWindowRect, IsIconic, IsWindowVisible, KillTimer, LoadCursorW,
-    RegisterClassW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_USERDATA, GWL_EXSTYLE,
-    GWL_STYLE, GW_OWNER, HMENU, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW,
-    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOW, WM_CHAR, WM_CREATE, WM_DESTROY, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
-    WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    GetCursorPos, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindow, GetWindowLongW,
+    GetWindowRect, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, RegisterClassW, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HMENU,
+    IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
+    IDC_SIZEWE, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    SW_SHOW, WM_CHAR, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 
 const OVERLAY_CLASS: windows::core::PCWSTR = w!("ScreenCaptnCaptureOverlay");
@@ -62,9 +64,14 @@ const TOOLBAR_BUTTON: f32 = 36.0;
 const TOOLBAR_HEIGHT: f32 = 36.0;
 const FRAME_HIT_WIDTH: f32 = 8.0;
 const CLICK_DRAG_THRESHOLD: f32 = 5.0;
-const TOP_EDGE_FULLSCREEN_THRESHOLD: f32 = 1.0;
-const TOP_CHROME_HEIGHT: f32 = 72.0;
+const ALL_SCREENS_TOP_EDGE_THRESHOLD_PX: f32 = 4.0;
+const CURRENT_SCREEN_TOP_THRESHOLD_PX: f32 = 32.0;
+const WINDOW_CHROME_MAX_HEIGHT_PX: f32 = 120.0;
+const WINDOW_CHROME_HEIGHT_RATIO: f32 = 0.18;
 const WINDOW_OVERLAP_TOLERANCE: f32 = 4.0;
+const HOVER_STABILITY_MS: u64 = 80;
+const MIN_RECT_CHANGE_PX: f32 = 16.0;
+const CONFIDENCE_SWITCH_DELTA: f32 = 0.15;
 const TOOLBAR_RADIUS: f32 = 10.0;
 const TOOL_ICON_SIZE: f32 = 24.0;
 const TOOL_ICON_SELECTED_RADIUS: f32 = 6.0;
@@ -90,6 +97,7 @@ const MAX_STROKE_WIDTH: f32 = 24.0;
 const MIN_FONT_SIZE: f32 = 27.0;
 const MAX_FONT_SIZE: f32 = 56.0;
 const WATERMARK_OPACITY: f32 = 0.5;
+const WATERMARK_ROTATION_DEGREES: f32 = -20.0;
 const WEB_EXPORT_ENABLED: bool = false;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,15 +127,21 @@ pub fn open_capture_overlay(theme: AppTheme) -> Result<()> {
         let screen_bounds = Rect::new(x as f32, y as f32, width as f32, height as f32);
         let detected_regions = collect_detected_regions(screen_bounds);
         let background_bitmap = capture_screen_bitmap(screen_bounds);
-        let initial_hover_region =
-            monitor_work_region_at(Point::new(x as f32, y as f32)).unwrap_or(screen_bounds);
+        let mut cursor = POINT::default();
+        let cursor_screen = if GetCursorPos(&mut cursor).is_ok() {
+            Point::new(cursor.x as f32, cursor.y as f32)
+        } else {
+            screen_bounds.center()
+        };
+        let initial_candidate = current_screen_candidate(cursor_screen, screen_bounds);
         let mut state = Box::new(OverlayState::new(
             screen_bounds,
             background_bitmap,
             detected_regions,
             theme,
         ));
-        state.hover_region = Some(initial_hover_region);
+        state.cursor_position = state.screen_to_overlay(cursor_screen);
+        state.smart_region = initial_candidate;
         let state_ptr = state.as_mut() as *mut OverlayState;
 
         let hwnd = CreateWindowExW(
@@ -177,7 +191,8 @@ struct OverlayState {
     screen_bounds: Rect,
     background_bitmap: HBITMAP,
     detected_regions: Vec<DetectedRegion>,
-    hover_region: Option<Rect>,
+    smart_region: Option<SmartRegionCandidate>,
+    pending_smart_region: Option<PendingSmartRegion>,
     cursor_position: Point,
     document: CaptureDocument,
     history: History<CaptureDocument>,
@@ -192,6 +207,7 @@ struct OverlayState {
     font_size: f32,
     next_step_number: u32,
     editing_text_id: Option<AnnotationId>,
+    editing_text_caret: usize,
     editing_step_number_id: Option<AnnotationId>,
     editing_step_number_replace: bool,
     toolbar_origin: Option<Point>,
@@ -221,6 +237,7 @@ struct OverlayState {
     force_web_full_snapshot: bool,
     render_cache: Option<RenderCache>,
     static_layer_dirty: bool,
+    defer_watermark_static_redraw_once: bool,
 }
 
 impl OverlayState {
@@ -237,7 +254,8 @@ impl OverlayState {
             screen_bounds,
             background_bitmap,
             detected_regions,
-            hover_region: None,
+            smart_region: None,
+            pending_smart_region: None,
             cursor_position: Point::new(0.0, 0.0),
             document: CaptureDocument::new(),
             history: History::new(100),
@@ -252,6 +270,7 @@ impl OverlayState {
             font_size: DEFAULT_TEXT_FONT_SIZE,
             next_step_number: 1,
             editing_text_id: None,
+            editing_text_caret: 0,
             editing_step_number_id: None,
             editing_step_number_replace: false,
             toolbar_origin: None,
@@ -281,6 +300,7 @@ impl OverlayState {
             force_web_full_snapshot: true,
             render_cache: None,
             static_layer_dirty: true,
+            defer_watermark_static_redraw_once: false,
         }
     }
 
@@ -334,9 +354,14 @@ struct WebUiMessage {
     key_code: Option<u32>,
     #[serde(rename = "charCode")]
     char_code: Option<u32>,
+    #[serde(rename = "caretIndex")]
+    caret_index: Option<usize>,
     #[serde(rename = "shiftKey")]
     shift_key: Option<bool>,
     reason: Option<String>,
+    level: Option<String>,
+    message: Option<String>,
+    details: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -400,8 +425,8 @@ impl RenderStyle {
             arrow_head_length_factor: 3.0,
             pen_tension: 0.35,
             highlighter_opacity: state.highlighter_opacity,
-            highlighter_line_base: 24.0,
-            highlighter_line_width_factor: 3.0,
+            highlighter_line_base: 12.0,
+            highlighter_line_width_factor: 1.5,
             mosaic_cell: scaled(state, 10.8),
             selection_color: Color::BLUE.into(),
             selection_handle_size: scaled(state, 8.0),
@@ -419,11 +444,58 @@ unsafe fn overlay_web_message(context: *mut c_void, message: String) {
         return;
     }
     let state = &mut *(context as *mut OverlayState);
+    let needs_static_redraw = web_message_needs_static_redraw(state, &message);
     let should_sync = handle_web_ui_message(state, &message);
     if should_sync {
-        state.mark_static_dirty();
+        if needs_static_redraw {
+            state.mark_static_dirty();
+        }
         let _ = InvalidateRect(state.hwnd, None, false);
         sync_web_after_change(state);
+    }
+}
+
+fn web_message_needs_static_redraw(state: &OverlayState, message: &str) -> bool {
+    let Ok(message) = serde_json::from_str::<WebUiMessage>(message) else {
+        return false;
+    };
+    match message.kind.as_str() {
+        "ready" => true,
+        "pointerUp" => matches!(
+            state.drag,
+            Some(
+                DragState::DrawingAnnotation { .. }
+                    | DragState::MovingRegion { .. }
+                    | DragState::ResizingRegion { .. }
+                    | DragState::MovingAnnotation { .. }
+                    | DragState::EditingAnnotation { .. }
+            )
+        ),
+        "pointerMove" => matches!(
+            state.drag,
+            Some(
+                DragState::MovingRegion { .. }
+                    | DragState::ResizingRegion { .. }
+                    | DragState::MovingAnnotation { .. }
+                    | DragState::EditingAnnotation { .. }
+            )
+        ),
+        "commitText" | "cancelText" | "setTextDraft" | "char" | "keyDown" | "setTextCaret" => true,
+        "setWatermarkMode" | "clearWatermark" | "focusWatermarkText" | "blurWatermarkText"
+        | "setWatermarkText" => true,
+        "setColor" => state.active_submenu == Some(ToolKind::Watermark),
+        "setFontSize" => {
+            state.active_submenu == Some(ToolKind::Watermark)
+                || state.editing_watermark_text
+                || state
+                    .document
+                    .selected_annotation_id
+                    .and_then(|id| state.document.annotation(id))
+                    .is_some_and(|annotation| {
+                        is_mosaic_annotation(annotation) || is_watermark_annotation(annotation)
+                    })
+        }
+        _ => false,
     }
 }
 
@@ -439,7 +511,7 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
         }
         "pointerDown" => {
             if let Some(point) = web_pointer_down_point(state, &message) {
-                handle_mouse_down(state, point);
+                handle_mouse_down(state, point, message.caret_index);
                 true
             } else {
                 false
@@ -531,6 +603,10 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
             handle_toolbar_action(state, ToolbarAction::Cancel);
             false
         }
+        "deselect" => {
+            deselect_all(state);
+            true
+        }
         "setColor" => {
             if let Some(color) = message.color.as_deref().and_then(color_from_hex) {
                 handle_submenu_action(state, SubmenuAction::Color(color));
@@ -583,6 +659,45 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 false
             }
         }
+        "setTextDraft" => {
+            if let (Some(id), Some(text)) = (message.id, message.text) {
+                update_text_annotation(state, id, text);
+                true
+            } else {
+                false
+            }
+        }
+        "commitText" => {
+            if let (Some(id), Some(text)) = (message.id, message.text) {
+                if text.is_empty() {
+                    state.document.selected_annotation_id = Some(id);
+                    let _ = state.document.remove_selected();
+                    state.mark_static_dirty();
+                } else {
+                    update_text_annotation(state, id, text);
+                }
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
+                true
+            } else {
+                false
+            }
+        }
+        "cancelText" => {
+            if let (Some(id), Some(text)) = (message.id, message.text) {
+                if text.is_empty() {
+                    state.document.selected_annotation_id = Some(id);
+                    let _ = state.document.remove_selected();
+                } else {
+                    update_text_annotation(state, id, text);
+                }
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
+                true
+            } else {
+                false
+            }
+        }
         "setWatermarkMode" => {
             if let Some(mode) = message
                 .mode
@@ -603,6 +718,7 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
             state.watermark_mode = WatermarkMode::Text;
             state.editing_watermark_text = true;
             state.editing_text_id = None;
+            state.editing_text_caret = 0;
             state.editing_step_number_id = None;
             true
         }
@@ -615,6 +731,7 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 state.watermark_mode = WatermarkMode::Text;
                 state.watermark_text = text;
                 state.editing_watermark_text = true;
+                state.mark_static_dirty();
                 true
             } else {
                 false
@@ -639,6 +756,18 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 false
             }
         }
+        "setTextCaret" => {
+            if let Some(caret) = message.caret_index {
+                set_text_caret(state, caret);
+                true
+            } else {
+                false
+            }
+        }
+        "diagnostic" => {
+            handle_web_diagnostic(&message);
+            false
+        }
         "exportReady" => {
             handle_web_export_ready(&message);
             false
@@ -651,6 +780,21 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
     }
 }
 
+fn handle_web_diagnostic(message: &WebUiMessage) {
+    diagnostics::log_event(
+        "web-js",
+        &format!(
+            "level={} message={} details={}",
+            message.level.as_deref().unwrap_or("unknown"),
+            message.message.as_deref().unwrap_or(""),
+            message
+                .details
+                .as_ref()
+                .map(serde_json::Value::to_string)
+                .unwrap_or_else(|| "null".to_string())
+        ),
+    );
+}
 fn handle_web_export_ready(message: &WebUiMessage) {
     write_web_ui_debug(&format!(
         "web-export-ready: request={:?} format={:?} size={:?}x{:?}",
@@ -1047,6 +1191,7 @@ fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
         "editingWatermarkText": state.editing_watermark_text,
         "selectedAnnotationId": state.document.selected_annotation_id,
         "editingTextId": state.editing_text_id,
+        "editingTextCaret": state.editing_text_caret,
         "editingStepNumberId": state.editing_step_number_id,
         "renderStyle": web_render_style_json(state),
     })
@@ -1389,14 +1534,46 @@ fn scaled(state: &OverlayState, value: f32) -> f32 {
     value * state.ui_scale
 }
 
-fn top_chrome_height(state: &OverlayState, window: Rect) -> f32 {
-    scaled(state, TOP_CHROME_HEIGHT).min(window.height * 0.28)
+fn top_chrome_height(window: Rect) -> f32 {
+    (window.height * WINDOW_CHROME_HEIGHT_RATIO).min(WINDOW_CHROME_MAX_HEIGHT_PX)
 }
 
 #[derive(Clone, Debug)]
 struct DetectedRegion {
+    hwnd: HWND,
     window: Rect,
-    client: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmartRegionKind {
+    AllScreens,
+    CurrentScreen,
+    Window,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmartRegionSource {
+    Monitor,
+    Win32,
+    Manual,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SmartRegionCandidate {
+    id: String,
+    kind: SmartRegionKind,
+    rect: Rect,
+    confidence: f32,
+    source: SmartRegionSource,
+    related_window_id: Option<isize>,
+    monitor_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSmartRegion {
+    candidate: SmartRegionCandidate,
+    since: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -1549,7 +1726,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                 }
             } else if wparam.0 == REGION_BORDER_TIMER_ID
                 && (state.document.capture_region.is_some()
-                    || state.hover_region.is_some()
+                    || state.smart_region.is_some()
                     || matches!(state.drag, Some(DragState::Selecting { .. })))
             {
                 let _ = InvalidateRect(hwnd, None, false);
@@ -1561,7 +1738,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                 return LRESULT(0);
             }
             let point = point_from_lparam(lparam);
-            handle_mouse_down(state, point);
+            handle_mouse_down(state, point, None);
             SetCapture(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
             sync_web_after_change(state);
@@ -1575,7 +1752,9 @@ unsafe extern "system" fn overlay_wnd_proc(
             state.cursor_position = point;
             if handle_mouse_move(state, point) {
                 let _ = InvalidateRect(hwnd, None, false);
-                sync_web_after_change(state);
+                if state.document.capture_region.is_some() {
+                    sync_web_after_change(state);
+                }
             }
             LRESULT(0)
         }
@@ -1600,9 +1779,19 @@ unsafe extern "system" fn overlay_wnd_proc(
                 return LRESULT(0);
             }
             let point = point_from_lparam(lparam);
+            let had_region = state.document.capture_region.is_some();
             handle_mouse_up(state, point);
+            if !had_region && state.document.capture_region.is_some() {
+                state.defer_watermark_static_redraw_once = true;
+            }
             state.mark_static_dirty();
             let _ = ReleaseCapture();
+            let _ = InvalidateRect(hwnd, None, false);
+            sync_web_after_change(state);
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            deselect_all(state);
             let _ = InvalidateRect(hwnd, None, false);
             sync_web_after_change(state);
             LRESULT(0)
@@ -1634,7 +1823,7 @@ unsafe extern "system" fn overlay_wnd_proc(
     }
 }
 
-fn handle_mouse_down(state: &mut OverlayState, point: Point) {
+fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: Option<usize>) {
     if let Some(slider) = state
         .submenu_sliders
         .iter()
@@ -1691,7 +1880,15 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point) {
 
         let screen_point = state.overlay_to_screen(point);
         if let Some(id) = select_annotation_at(state, screen_point) {
-            state.editing_text_id = editable_text_annotation(state, id).then_some(id);
+            if editable_text_annotation(state, id) {
+                state.editing_text_id = Some(id);
+                state.editing_text_caret = text_caret_index
+                    .or_else(|| text_caret_index_for_point(state, id, screen_point))
+                    .unwrap_or_else(|| annotation_text_len(state, id));
+            } else {
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
+            }
             state.editing_step_number_id = None;
             state.editing_step_number_replace = false;
             if let Some(original) = state.document.annotation(id).cloned() {
@@ -1700,7 +1897,10 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point) {
                     state.drag = Some(DragState::EditingAnnotation { id, edit, original });
                     return;
                 }
-                if matches!(original.kind, AnnotationKind::Text { .. }) {
+                if matches!(
+                    original.kind,
+                    AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+                ) {
                     state.editing_text_id = Some(id);
                     return;
                 }
@@ -1746,6 +1946,17 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point) {
         start: point,
         current: point,
     });
+}
+
+fn deselect_all(state: &mut OverlayState) {
+    state.document.selected_annotation_id = None;
+    state.editing_text_id = None;
+    state.editing_text_caret = 0;
+    state.editing_step_number_id = None;
+    state.editing_step_number_replace = false;
+    state.editing_watermark_text = false;
+    state.drag = None;
+    state.mark_static_dirty();
 }
 
 fn region_frame_contains(region: Rect, point: Point) -> bool {
@@ -1896,26 +2107,59 @@ fn editable_text_annotation(state: &OverlayState, id: AnnotationId) -> bool {
     })
 }
 
-fn detect_hover_region(state: &OverlayState, screen_point: Point) -> Option<Rect> {
-    if let Some(monitor) = unsafe { monitor_full_region_at_top_edge(screen_point) } {
-        return Some(monitor);
+fn detect_smart_region_candidate(
+    state: &mut OverlayState,
+    screen_point: Point,
+) -> Option<SmartRegionCandidate> {
+    if screen_point.y <= state.screen_bounds.y + ALL_SCREENS_TOP_EDGE_THRESHOLD_PX {
+        return Some(SmartRegionCandidate::new(
+            SmartRegionKind::AllScreens,
+            state.screen_bounds,
+            1.0,
+            SmartRegionSource::Monitor,
+            None,
+            Some("virtual-desktop".to_string()),
+        ));
+    }
+
+    if let Some(monitor) = unsafe { monitor_full_region_at(screen_point) } {
+        if screen_point.y <= monitor.y + CURRENT_SCREEN_TOP_THRESHOLD_PX {
+            return Some(SmartRegionCandidate::new(
+                SmartRegionKind::CurrentScreen,
+                monitor,
+                0.98,
+                SmartRegionSource::Monitor,
+                None,
+                Some(monitor_id(monitor)),
+            ));
+        }
     }
 
     if let Some((index, detected)) = top_app_window_at_point(state, screen_point) {
+        let detected = detected.clone();
         let covered = state.detected_regions[..index].iter().any(|higher| {
             overlaps_with_tolerance(higher.window, detected.window, WINDOW_OVERLAP_TOLERANCE)
         });
 
         if !covered {
-            if let Some(client) = client_region_for_hover(state, detected, screen_point) {
-                return Some(client);
-            }
-
-            return Some(detected.window);
+            let window_id = Some(detected.hwnd.0 as isize);
+            let confidence = if is_in_window_chrome_zone(detected.window, screen_point) {
+                0.94
+            } else {
+                0.86
+            };
+            return Some(SmartRegionCandidate::new(
+                SmartRegionKind::Window,
+                detected.window,
+                confidence,
+                SmartRegionSource::Win32,
+                window_id,
+                None,
+            ));
         }
     }
 
-    unsafe { monitor_region_at(screen_point) }
+    current_screen_candidate(screen_point, state.screen_bounds)
 }
 
 fn top_app_window_at_point(
@@ -1929,41 +2173,99 @@ fn top_app_window_at_point(
         .find(|(_, detected)| detected.window.contains(screen_point))
 }
 
-fn client_region_for_hover(
-    state: &OverlayState,
-    detected: &DetectedRegion,
-    screen_point: Point,
-) -> Option<Rect> {
-    let client = detected.client.unwrap_or(detected.window);
-    let client = if client.contains(screen_point) {
-        client
-    } else {
-        detected.window
-    };
-    let chrome_height = top_chrome_height(state, detected.window);
-    let content_top = if same_rect(client, detected.window, 4.0) {
-        detected.window.y + chrome_height
-    } else {
-        client.y + chrome_height
-    };
-    if screen_point.y <= content_top {
-        None
-    } else {
-        let content = Rect::new(
-            client.x,
-            content_top,
-            client.width,
-            (client.bottom() - content_top).max(0.0),
-        );
-        content.is_visible().then_some(content)
-    }
+fn current_screen_candidate(screen_point: Point, fallback: Rect) -> Option<SmartRegionCandidate> {
+    let monitor = unsafe { monitor_full_region_at(screen_point) }.unwrap_or(fallback);
+    Some(SmartRegionCandidate::new(
+        SmartRegionKind::CurrentScreen,
+        monitor,
+        0.6,
+        SmartRegionSource::Monitor,
+        None,
+        Some(monitor_id(monitor)),
+    ))
 }
 
-fn same_rect(a: Rect, b: Rect, tolerance: f32) -> bool {
-    (a.x - b.x).abs() <= tolerance
-        && (a.y - b.y).abs() <= tolerance
-        && (a.width - b.width).abs() <= tolerance
-        && (a.height - b.height).abs() <= tolerance
+fn is_in_window_chrome_zone(window: Rect, screen_point: Point) -> bool {
+    screen_point.y <= window.y + top_chrome_height(window)
+}
+
+fn rect_delta(a: Rect, b: Rect) -> f32 {
+    (a.x - b.x)
+        .abs()
+        .max((a.y - b.y).abs())
+        .max((a.width - b.width).abs())
+        .max((a.height - b.height).abs())
+}
+
+fn commit_smart_region_candidate(
+    state: &mut OverlayState,
+    next: Option<SmartRegionCandidate>,
+) -> bool {
+    let Some(next) = next else {
+        let changed = state.smart_region.take().is_some();
+        state.pending_smart_region = None;
+        return changed;
+    };
+
+    if smart_region_switches_immediately(&next) {
+        let changed = state.smart_region.as_ref() != Some(&next);
+        state.smart_region = Some(next);
+        state.pending_smart_region = None;
+        return changed;
+    }
+
+    if let Some(current) = &state.smart_region {
+        if current.kind == next.kind && rect_delta(current.rect, next.rect) < MIN_RECT_CHANGE_PX {
+            state.pending_smart_region = None;
+            return false;
+        }
+
+        if smart_region_replaces_current_immediately(current, &next) {
+            let changed = state.smart_region.as_ref() != Some(&next);
+            state.smart_region = Some(next);
+            state.pending_smart_region = None;
+            return changed;
+        }
+
+        if next.confidence < current.confidence + CONFIDENCE_SWITCH_DELTA {
+            let now = Instant::now();
+            let stable = match &state.pending_smart_region {
+                Some(pending) if pending.candidate == next => {
+                    now.duration_since(pending.since) >= Duration::from_millis(HOVER_STABILITY_MS)
+                }
+                _ => {
+                    state.pending_smart_region = Some(PendingSmartRegion {
+                        candidate: next.clone(),
+                        since: now,
+                    });
+                    false
+                }
+            };
+            if !stable {
+                return false;
+            }
+        }
+    }
+
+    let changed = state.smart_region.as_ref() != Some(&next);
+    state.smart_region = Some(next);
+    state.pending_smart_region = None;
+    changed
+}
+
+fn smart_region_switches_immediately(candidate: &SmartRegionCandidate) -> bool {
+    matches!(
+        candidate.kind,
+        SmartRegionKind::AllScreens | SmartRegionKind::CurrentScreen | SmartRegionKind::Manual
+    )
+}
+
+fn smart_region_replaces_current_immediately(
+    current: &SmartRegionCandidate,
+    next: &SmartRegionCandidate,
+) -> bool {
+    matches!(current.kind, SmartRegionKind::CurrentScreen)
+        && matches!(next.kind, SmartRegionKind::Window)
 }
 
 unsafe fn collect_detected_regions(screen_bounds: Rect) -> Vec<DetectedRegion> {
@@ -1986,6 +2288,60 @@ unsafe fn collect_detected_regions(screen_bounds: Rect) -> Vec<DetectedRegion> {
 
 struct WindowDetectionContext {
     regions: Vec<DetectedRegion>,
+}
+
+impl SmartRegionCandidate {
+    fn new(
+        kind: SmartRegionKind,
+        rect: Rect,
+        confidence: f32,
+        source: SmartRegionSource,
+        related_window_id: Option<isize>,
+        monitor_id: Option<String>,
+    ) -> Self {
+        Self {
+            id: smart_region_id(
+                kind,
+                rect,
+                source,
+                related_window_id.as_ref(),
+                monitor_id.as_deref(),
+            ),
+            kind,
+            rect,
+            confidence,
+            source,
+            related_window_id,
+            monitor_id,
+        }
+    }
+}
+
+fn smart_region_id(
+    kind: SmartRegionKind,
+    rect: Rect,
+    source: SmartRegionSource,
+    related_window_id: Option<&isize>,
+    monitor_id: Option<&str>,
+) -> String {
+    format!(
+        "{kind:?}:{source:?}:{:.0}:{:.0}:{:.0}:{:.0}:{}:{}",
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        related_window_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        monitor_id.unwrap_or("-")
+    )
+}
+
+fn monitor_id(rect: Rect) -> String {
+    format!(
+        "{:.0},{:.0},{:.0},{:.0}",
+        rect.x, rect.y, rect.width, rect.height
+    )
 }
 
 unsafe extern "system" fn enum_detected_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -2031,8 +2387,7 @@ unsafe fn detected_region_from_hwnd(hwnd: HWND) -> Option<DetectedRegion> {
         return None;
     }
 
-    let client = client_rect_for_window(hwnd, window);
-    Some(DetectedRegion { window, client })
+    Some(DetectedRegion { hwnd, window })
 }
 
 unsafe fn frame_rect_for_window(hwnd: HWND) -> Option<Rect> {
@@ -2057,52 +2412,7 @@ unsafe fn frame_rect_for_window(hwnd: HWND) -> Option<Rect> {
     Some(rect_from_win32(rect))
 }
 
-unsafe fn client_rect_for_window(hwnd: HWND, window: Rect) -> Option<Rect> {
-    let mut client_rect = RECT::default();
-    if GetClientRect(hwnd, &mut client_rect).is_err() {
-        return None;
-    }
-
-    let mut top_left = POINT {
-        x: client_rect.left,
-        y: client_rect.top,
-    };
-    let mut bottom_right = POINT {
-        x: client_rect.right,
-        y: client_rect.bottom,
-    };
-    if !ClientToScreen(hwnd, &mut top_left).as_bool()
-        || !ClientToScreen(hwnd, &mut bottom_right).as_bool()
-    {
-        return None;
-    }
-
-    let client = Rect::new(
-        top_left.x as f32,
-        top_left.y as f32,
-        (bottom_right.x - top_left.x) as f32,
-        (bottom_right.y - top_left.y) as f32,
-    );
-    if client.is_visible()
-        && client.width < window.width + 1.0
-        && client.height < window.height + 1.0
-    {
-        Some(client)
-    } else {
-        None
-    }
-}
-
-unsafe fn monitor_region_at(screen_point: Point) -> Option<Rect> {
-    if screen_point.y
-        <= monitor_full_region_at_top_edge(screen_point)?.y + TOP_EDGE_FULLSCREEN_THRESHOLD
-    {
-        return monitor_full_region_at_top_edge(screen_point);
-    }
-    monitor_work_region_at(screen_point)
-}
-
-unsafe fn monitor_work_region_at(screen_point: Point) -> Option<Rect> {
+unsafe fn monitor_full_region_at(screen_point: Point) -> Option<Rect> {
     let monitor = MonitorFromPoint(
         POINT {
             x: screen_point.x.round() as i32,
@@ -2117,26 +2427,7 @@ unsafe fn monitor_work_region_at(screen_point: Point) -> Option<Rect> {
     if !GetMonitorInfoW(monitor, &mut info).as_bool() {
         return None;
     }
-    Some(rect_from_win32(info.rcWork))
-}
-
-unsafe fn monitor_full_region_at_top_edge(screen_point: Point) -> Option<Rect> {
-    let monitor = MonitorFromPoint(
-        POINT {
-            x: screen_point.x.round() as i32,
-            y: screen_point.y.round() as i32,
-        },
-        MONITOR_DEFAULTTONEAREST,
-    );
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-        return None;
-    }
-    let monitor = rect_from_win32(info.rcMonitor);
-    (screen_point.y <= monitor.y + TOP_EDGE_FULLSCREEN_THRESHOLD).then_some(monitor)
+    Some(rect_from_win32(info.rcMonitor))
 }
 
 fn rect_from_win32(rect: RECT) -> Rect {
@@ -2241,11 +2532,8 @@ fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
         None => {
             update_cursor_for_hover(state, point);
             if state.document.capture_region.is_none() {
-                let next = detect_hover_region(state, screen_point);
-                if state.hover_region != next {
-                    state.hover_region = next;
-                    return true;
-                }
+                let next = detect_smart_region_candidate(state, screen_point);
+                let _ = commit_smart_region_candidate(state, next);
                 return true;
             }
             false
@@ -2265,6 +2553,26 @@ fn constrained_drawing_point(tool: ToolKind, start: Point, current: Point) -> Po
     } else {
         current
     }
+}
+
+fn submenu_geometry(state: &OverlayState) -> Option<(ToolKind, Rect, Rect)> {
+    let tool = state.active_submenu?;
+    let anchor = state
+        .toolbar_buttons
+        .iter()
+        .find(
+            |button| matches!(button.tool, ToolbarAction::Tool(button_tool) if button_tool == tool),
+        )?
+        .rect;
+    let height = scaled(state, SUBMENU_HEIGHT);
+    let width = submenu_width(state, tool);
+    let margin = scaled(state, 8.0);
+    let x = (anchor.center().x - width / 2.0)
+        .max(margin)
+        .min((state.screen_bounds.width - width - margin).max(margin));
+    let y = (anchor.bottom() + scaled(state, 18.0))
+        .min((state.screen_bounds.height - height - margin).max(margin));
+    Some((tool, anchor, Rect::new(x, y, width, height)))
 }
 
 fn update_cursor_for_hover(state: &OverlayState, point: Point) {
@@ -2475,12 +2783,21 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
             let drag_distance =
                 ((current.x - start.x).powi(2) + (current.y - start.y).powi(2)).sqrt();
             if drag_distance <= CLICK_DRAG_THRESHOLD {
-                if let Some(region) = state.hover_region {
+                if let Some(region) = state.smart_region.as_ref().map(|candidate| candidate.rect) {
                     state.document.set_capture_region(region);
                     state.toolbar_origin = Some(toolbar_origin_near_point(state, point, region));
                 }
             } else if rect.is_visible() {
                 state.document.set_capture_region(rect);
+                state.smart_region = Some(SmartRegionCandidate::new(
+                    SmartRegionKind::Manual,
+                    rect,
+                    1.0,
+                    SmartRegionSource::Manual,
+                    None,
+                    None,
+                ));
+                state.pending_smart_region = None;
                 state.toolbar_origin = Some(toolbar_origin_near_point(
                     state,
                     current,
@@ -2525,6 +2842,7 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
                 let id = state.document.add_annotation(annotation);
                 if is_textual {
                     state.editing_text_id = Some(id);
+                    state.editing_text_caret = 0;
                 }
                 if is_step {
                     state.next_step_number += 1;
@@ -2543,7 +2861,13 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     if state.editing_watermark_text && !ctrl_down {
         match key {
             0x1B => state.editing_watermark_text = false,
-            key if key == VK_RETURN.0 as u32 => state.editing_watermark_text = false,
+            key if key == VK_RETURN.0 as u32 => {
+                state.editing_watermark_text = false;
+                let _ = unsafe { copy_capture_to_clipboard(state) };
+                unsafe {
+                    let _ = DestroyWindow(state.hwnd);
+                }
+            }
             0x08 => {
                 state.watermark_text.pop();
             }
@@ -2554,19 +2878,25 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     }
     if state.editing_text_id.is_some() && !ctrl_down {
         match key {
-            0x1B => state.editing_text_id = None,
+            0x1B => {
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
+            }
             key if key == VK_RETURN.0 as u32 => {
                 if shift_down && editing_text_accepts_line_break(state) {
-                    edit_selected_text(state, |text| text.push('\n'));
+                    insert_text_at_caret(state, "\n");
                 } else {
                     state.editing_text_id = None;
+                    state.editing_text_caret = 0;
                 }
             }
             0x08 => {
-                edit_selected_text(state, |text| {
-                    text.pop();
-                });
+                delete_text_before_caret(state);
             }
+            0x2E => delete_text_after_caret(state),
+            key if key == VK_LEFT.0 as u32 => move_text_caret_horizontal(state, -1),
+            key if key == VK_RIGHT.0 as u32 => move_text_caret_horizontal(state, 1),
+            key if key == VK_UP.0 as u32 || key == VK_DOWN.0 as u32 => {}
             _ => {}
         }
         return;
@@ -2593,6 +2923,17 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
             let _ = DestroyWindow(state.hwnd);
         },
         key if key == VK_RETURN.0 as u32 => {
+            if state.document.capture_region.is_none() {
+                if let Some(region) = state.smart_region.as_ref().map(|candidate| candidate.rect) {
+                    state.document.set_capture_region(region);
+                    let overlay_region =
+                        region.translate(-state.screen_bounds.x, -state.screen_bounds.y);
+                    state.toolbar_origin = Some(default_toolbar_origin(state, overlay_region));
+                    state.defer_watermark_static_redraw_once = true;
+                    state.mark_static_dirty();
+                    return;
+                }
+            }
             let _ = unsafe { copy_capture_to_clipboard(state) };
             unsafe {
                 let _ = DestroyWindow(state.hwnd);
@@ -2647,7 +2988,8 @@ fn handle_char(state: &mut OverlayState, char_code: u32) {
     if state.editing_text_id.is_none() {
         return;
     }
-    edit_selected_text(state, |text| text.push(ch));
+    let mut buffer = [0_u8; 4];
+    insert_text_at_caret(state, ch.encode_utf8(&mut buffer));
     state.mark_static_dirty();
 }
 
@@ -2655,10 +2997,12 @@ fn editing_text_accepts_line_break(state: &OverlayState) -> bool {
     let Some(id) = state.editing_text_id else {
         return false;
     };
-    state
-        .document
-        .annotation(id)
-        .is_some_and(|annotation| matches!(annotation.kind, AnnotationKind::Text { .. }))
+    state.document.annotation(id).is_some_and(|annotation| {
+        matches!(
+            annotation.kind,
+            AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+        )
+    })
 }
 
 fn edit_selected_step_number(state: &mut OverlayState, edit: impl FnOnce(u32) -> u32) {
@@ -2681,10 +3025,36 @@ fn edit_selected_text(state: &mut OverlayState, edit: impl FnOnce(&mut String)) 
     let Some(id) = state.editing_text_id else {
         return;
     };
+    edit_text_annotation(state, id, edit);
+}
+
+fn update_text_annotation(state: &mut OverlayState, id: AnnotationId, text: String) {
+    edit_text_annotation(state, id, |current| {
+        *current = text;
+    });
+    state.mark_static_dirty();
+}
+
+fn edit_text_annotation(
+    state: &mut OverlayState,
+    id: AnnotationId,
+    edit: impl FnOnce(&mut String),
+) {
     if let Some(annotation) = state.document.annotation_mut(id) {
         let mut edited_tag = false;
+        let mut edited_framed_text_font_size = None;
         match &mut annotation.kind {
-            AnnotationKind::Text { text, .. } => edit(text),
+            AnnotationKind::Text {
+                text,
+                font_size,
+                framed,
+                ..
+            } => {
+                edit(text);
+                if *framed {
+                    edited_framed_text_font_size = Some(*font_size);
+                }
+            }
             AnnotationKind::Tag { label, .. } => {
                 edit(label);
                 edited_tag = true;
@@ -2698,7 +3068,172 @@ fn edit_selected_text(state: &mut OverlayState, edit: impl FnOnce(&mut String)) 
             };
             resize_tag_for_text(annotation, font_size);
         }
+        if let Some(font_size) = edited_framed_text_font_size {
+            resize_framed_text_for_text(annotation, font_size);
+        }
     }
+}
+
+fn insert_text_at_caret(state: &mut OverlayState, value: &str) {
+    let caret = state.editing_text_caret;
+    edit_selected_text(state, |text| {
+        let index = byte_index_for_char_index(text, caret);
+        text.insert_str(index, value);
+    });
+    state.editing_text_caret = state
+        .editing_text_caret
+        .saturating_add(value.chars().count());
+}
+
+fn delete_text_before_caret(state: &mut OverlayState) {
+    if state.editing_text_caret == 0 {
+        return;
+    }
+    let caret = state.editing_text_caret;
+    edit_selected_text(state, |text| {
+        let end = byte_index_for_char_index(text, caret);
+        let start = byte_index_for_char_index(text, caret.saturating_sub(1));
+        if start < end && end <= text.len() {
+            text.replace_range(start..end, "");
+        }
+    });
+    state.editing_text_caret = state.editing_text_caret.saturating_sub(1);
+}
+
+fn delete_text_after_caret(state: &mut OverlayState) {
+    let Some(id) = state.editing_text_id else {
+        return;
+    };
+    if state.editing_text_caret >= annotation_text_len(state, id) {
+        return;
+    }
+    let caret = state.editing_text_caret;
+    edit_selected_text(state, |text| {
+        let start = byte_index_for_char_index(text, caret);
+        let end = byte_index_for_char_index(text, caret.saturating_add(1));
+        if start < end && end <= text.len() {
+            text.replace_range(start..end, "");
+        }
+    });
+}
+
+fn set_text_caret(state: &mut OverlayState, caret: usize) {
+    let Some(id) = state.editing_text_id else {
+        return;
+    };
+    state.editing_text_caret = caret.min(annotation_text_len(state, id));
+}
+
+fn move_text_caret_horizontal(state: &mut OverlayState, direction: i32) {
+    let Some(id) = state.editing_text_id else {
+        return;
+    };
+    let len = annotation_text_len(state, id);
+    if direction < 0 {
+        state.editing_text_caret = state.editing_text_caret.saturating_sub(1);
+    } else if direction > 0 {
+        state.editing_text_caret = state.editing_text_caret.saturating_add(1).min(len);
+    }
+}
+
+fn byte_index_for_char_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn annotation_text_len(state: &OverlayState, id: AnnotationId) -> usize {
+    state
+        .document
+        .annotation(id)
+        .map(annotation_text)
+        .unwrap_or("")
+        .chars()
+        .count()
+}
+
+fn annotation_text(annotation: &Annotation) -> &str {
+    match &annotation.kind {
+        AnnotationKind::Text { text, .. } => text,
+        AnnotationKind::Tag { label, .. } => label,
+        _ => "",
+    }
+}
+
+fn text_caret_index_for_point(
+    state: &OverlayState,
+    id: AnnotationId,
+    point: Point,
+) -> Option<usize> {
+    let annotation = state.document.annotation(id)?;
+    let (text, font_size, origin, line_height) = match &annotation.kind {
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            ..
+        } => {
+            if *framed {
+                (
+                    text.as_str(),
+                    *font_size,
+                    Point::new(annotation.bounds.x + 8.0, annotation.bounds.y + 8.0),
+                    *font_size * 1.22,
+                )
+            } else {
+                (
+                    text.as_str(),
+                    *font_size,
+                    Point::new(annotation.bounds.x, annotation.bounds.y - *font_size * 1.08),
+                    *font_size,
+                )
+            }
+        }
+        AnnotationKind::Tag {
+            label, font_size, ..
+        } => (
+            label.as_str(),
+            *font_size,
+            Point::new(annotation.bounds.x + 8.0, annotation.bounds.y + 8.0),
+            *font_size * 1.22,
+        ),
+        _ => return None,
+    };
+    Some(caret_index_from_text_point(
+        text,
+        font_size,
+        origin,
+        line_height,
+        point,
+    ))
+}
+
+fn caret_index_from_text_point(
+    text: &str,
+    font_size: f32,
+    origin: Point,
+    line_height: f32,
+    point: Point,
+) -> usize {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line_count = lines.len().max(1);
+    let line_index = ((point.y - origin.y) / line_height.max(1.0))
+        .floor()
+        .clamp(0.0, (line_count - 1) as f32) as usize;
+    let approx_char = (font_size * 0.56).max(1.0);
+    let col = ((point.x - origin.x) / approx_char).round().max(0.0) as usize;
+    let mut index = 0_usize;
+    for line in lines.iter().take(line_index) {
+        index += line.chars().count() + 1;
+    }
+    index
+        + col.min(
+            lines
+                .get(line_index)
+                .map(|line| line.chars().count())
+                .unwrap_or(0),
+        )
 }
 
 fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
@@ -2829,6 +3364,7 @@ fn configurable_submenu_tool(tool: ToolKind) -> Option<ToolKind> {
 
 fn finish_text_editing(state: &mut OverlayState) {
     state.editing_text_id = None;
+    state.editing_text_caret = 0;
     state.editing_watermark_text = false;
     state.editing_step_number_id = None;
     state.editing_step_number_replace = false;
@@ -2911,12 +3447,24 @@ fn handle_watermark_mode_action(state: &mut OverlayState, mode: WatermarkMode) {
         WatermarkMode::Date => state.watermark_date_enabled = !state.watermark_date_enabled,
         WatermarkMode::Text => state.editing_watermark_text = true,
         WatermarkMode::Image => {
+            diagnostics::log_breadcrumb("watermark-image-picker-requested");
             if let Some(path) = unsafe { show_open_image_dialog(state.hwnd) } {
-                let bitmap =
-                    load_watermark_bitmap(&path, scaled(state, 72.0).round().max(1.0) as u32)
-                        .map(|bitmap| faded_watermark_bitmap(&bitmap, WATERMARK_OPACITY));
+                diagnostics::log_breadcrumb(format!(
+                    "watermark-image-selected path={}",
+                    path.display()
+                ));
+                let bitmap = load_watermark_bitmap(
+                    &path,
+                    (state.font_size.max(34.0) * 5.0).round().max(1.0) as u32,
+                )
+                .map(|bitmap| faded_watermark_bitmap(&bitmap, WATERMARK_OPACITY));
                 state.watermark_image_data_url =
                     bitmap.as_ref().and_then(watermark_bitmap_data_url);
+                diagnostics::log_breadcrumb(format!(
+                    "watermark-image-decoded ok={} data_url={}",
+                    bitmap.is_some(),
+                    state.watermark_image_data_url.is_some()
+                ));
                 state.watermark_image_path = Some(path);
                 state.watermark_image_bitmap = bitmap;
             }
@@ -2972,8 +3520,17 @@ fn apply_submenu_to_selected_annotation(state: &mut OverlayState, action: Submen
             annotation.stroke.color = color;
         }
         SubmenuAction::FontSize(size) => match &mut annotation.kind {
-            AnnotationKind::Text { font_size, .. } | AnnotationKind::Tag { font_size, .. } => {
+            AnnotationKind::Text {
+                font_size, framed, ..
+            } => {
                 *font_size = size;
+                if *framed {
+                    resize_framed_text_for_text(annotation, size);
+                }
+            }
+            AnnotationKind::Tag { font_size, .. } => {
+                *font_size = size;
+                resize_tag_for_text(annotation, size);
             }
             _ => {}
         },
@@ -3145,9 +3702,18 @@ unsafe fn paint_overlay(state: &mut OverlayState) {
     if state.region_overlay().is_some() {
         if state.static_layer_dirty {
             if let Some(cache) = state.render_cache.as_ref() {
-                paint_static_capture_surface(cache.static_dc, state);
+                paint_static_capture_surface(
+                    cache.static_dc,
+                    state,
+                    !state.defer_watermark_static_redraw_once,
+                );
             }
             state.static_layer_dirty = false;
+            if state.defer_watermark_static_redraw_once {
+                state.defer_watermark_static_redraw_once = false;
+                state.static_layer_dirty = true;
+                let _ = InvalidateRect(state.hwnd, None, false);
+            }
         }
         if let Some(cache) = state.render_cache.as_ref() {
             let back_dc = cache.back_dc;
@@ -3224,7 +3790,7 @@ unsafe fn destroy_render_cache(state: &mut OverlayState) {
     let _ = DeleteDC(cache.static_dc);
 }
 
-unsafe fn paint_static_capture_surface(hdc: HDC, state: &OverlayState) {
+unsafe fn paint_static_capture_surface(hdc: HDC, state: &OverlayState, include_watermark: bool) {
     paint_background(hdc, state);
     let Some(region) = state.region_overlay() else {
         return;
@@ -3233,10 +3799,16 @@ unsafe fn paint_static_capture_surface(hdc: HDC, state: &OverlayState) {
     draw_handles(hdc, region);
     if web_ui_owns_pointer_input(state) {
         draw_native_backed_annotations(hdc, state);
+        if include_watermark {
+            draw_watermark_pattern(hdc, state, region);
+            draw_watermark_annotations(hdc, state);
+        }
     } else {
         draw_annotations(hdc, state);
-        draw_watermark_pattern(hdc, state, region);
-        draw_watermark_annotations(hdc, state);
+        if include_watermark {
+            draw_watermark_pattern(hdc, state, region);
+            draw_watermark_annotations(hdc, state);
+        }
     }
 }
 
@@ -3253,8 +3825,6 @@ unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
             draw_annotations(hdc, state);
             draw_selected_annotation(hdc, state);
             draw_drag_preview(hdc, state);
-            draw_watermark_pattern(hdc, state, region);
-            draw_watermark_annotations(hdc, state);
             draw_toolbar(hdc, state, region);
             draw_tool_submenu(hdc, state);
         }
@@ -3264,10 +3834,11 @@ unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
         if !web_ui_owns_pointer_input(state) {
             draw_sniper_cursor(hdc, current);
         }
-    } else if let Some(region) = state
-        .hover_region
-        .map(|region| region.translate(-state.screen_bounds.x, -state.screen_bounds.y))
-    {
+    } else if let Some(region) = state.smart_region.as_ref().map(|candidate| {
+        candidate
+            .rect
+            .translate(-state.screen_bounds.x, -state.screen_bounds.y)
+    }) {
         draw_dim_outside_region(hdc, state.screen_bounds, region);
         draw_region_gradient_border(hdc, state, region);
         if !web_ui_owns_pointer_input(state) {
@@ -4117,28 +4688,13 @@ unsafe fn draw_tool_submenu(hdc: HDC, state: &mut OverlayState) {
         state.submenu_rect = None;
         return;
     };
-    let Some(anchor) = state
-        .toolbar_buttons
-        .iter()
-        .find(
-            |button| matches!(button.tool, ToolbarAction::Tool(button_tool) if button_tool == tool),
-        )
-        .map(|button| button.rect)
-    else {
+    let Some((_, anchor, rect)) = submenu_geometry(state) else {
         state.submenu_rect = None;
         return;
     };
 
     let palette = toolbar_palette(state.theme);
     let height = scaled(state, SUBMENU_HEIGHT);
-    let width = submenu_width(state, tool);
-    let margin = scaled(state, 8.0);
-    let x = (anchor.center().x - width / 2.0)
-        .max(margin)
-        .min((state.screen_bounds.width - width - margin).max(margin));
-    let y = (anchor.bottom() + scaled(state, 18.0))
-        .min((state.screen_bounds.height - height - margin).max(margin));
-    let rect = Rect::new(x, y, width, height);
     state.submenu_rect = Some(rect);
 
     draw_toolbar_shadow(hdc, state, rect);
@@ -4658,7 +5214,7 @@ unsafe fn draw_color_swatches(
             fill_rounded_rect_antialias(hdc, rect, radius, color);
         }
         state.submenu_buttons.push(SubmenuButton {
-            rect: button_rect,
+            rect,
             action: SubmenuAction::Color(color),
         });
         *x_cursor += rect.width + scaled(state, SUBMENU_GAP + 2.0);
@@ -4945,7 +5501,7 @@ unsafe fn draw_highlighter(
 }
 
 fn highlighter_line_width(stroke_width: f32) -> f32 {
-    24.0 + stroke_width.max(1.0) * 3.0
+    12.0 + stroke_width.max(1.0) * 1.5
 }
 
 unsafe fn fill_oval_antialias(hdc: HDC, rect: Rect, color: Color) {
@@ -5419,28 +5975,22 @@ unsafe fn draw_label_sized_color(
     let _ = DeleteObject(font);
 }
 
-unsafe fn draw_watermark_label_rotated(
+unsafe fn watermark_text_block_bitmap(
     hdc: HDC,
-    x: f32,
-    y: f32,
-    label: &str,
+    text: &str,
+    date: Option<&str>,
     font_size: f32,
+    max_text_width: f32,
     color: Color,
     degrees: f32,
-) {
-    if label.is_empty() || color.a == 0 {
-        return;
+) -> Option<WatermarkBitmap> {
+    if (text.is_empty() && date.is_none()) || color.a == 0 {
+        return None;
     }
-    let text_width = approximate_text_width(label, font_size).max(font_size);
-    let text_height = (font_size * 1.55).max(1.0);
-    let angle = degrees.to_radians();
-    let pad = (font_size * 2.0).ceil().max(8.0);
-    let width = (text_width * angle.cos().abs() + text_height * angle.sin().abs() + pad * 2.0)
-        .ceil()
-        .max(1.0) as u32;
-    let height = (text_width * angle.sin().abs() + text_height * angle.cos().abs() + pad * 2.0)
-        .ceil()
-        .max(1.0) as u32;
+    let layout = watermark_text_block_layout(hdc, text, date, font_size, max_text_width);
+    let pad = (font_size * 0.55).ceil().max(8.0);
+    let width = (layout.width + pad * 2.0).ceil().max(1.0) as u32;
+    let height = (layout.height + pad * 2.0).ceil().max(1.0) as u32;
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -5456,11 +6006,11 @@ unsafe fn draw_watermark_label_rotated(
     };
     let mut bits = std::ptr::null_mut();
     let Ok(bitmap) = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
-        return;
+        return None;
     };
     if bits.is_null() {
         let _ = DeleteObject(bitmap);
-        return;
+        return None;
     }
     let pixels = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (width * height * 4) as usize);
     pixels.fill(0);
@@ -5469,28 +6019,68 @@ unsafe fn draw_watermark_label_rotated(
     let old_bitmap = SelectObject(mem_dc, bitmap);
     SetBkMode(mem_dc, TRANSPARENT);
     SetTextColor(mem_dc, windows::Win32::Foundation::COLORREF(0x00ff_ffff));
-    let escapement = (degrees * 10.0).round() as i32;
-    let font = CreateFontW(
-        -(font_size.round().max(1.0) as i32),
-        0,
-        escapement,
-        escapement,
-        700,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        w!("Segoe UI"),
-    );
-    let old_font = SelectObject(mem_dc, font);
-    let wide: Vec<u16> = label.encode_utf16().collect();
-    let _ = TextOutW(mem_dc, pad.round() as i32, pad.round() as i32, &wide);
-    let _ = SelectObject(mem_dc, old_font);
-    let _ = DeleteObject(font);
+
+    if !layout.lines.is_empty() {
+        let font = CreateFontW(
+            -(font_size.round().max(1.0) as i32),
+            0,
+            0,
+            0,
+            700,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        );
+        let old_font = SelectObject(mem_dc, font);
+        for (index, line) in layout.lines.iter().enumerate() {
+            let text_width = measure_watermark_text_width(hdc, line, font_size, true);
+            let wide: Vec<u16> = line.encode_utf16().collect();
+            let _ = TextOutW(
+                mem_dc,
+                (pad + (layout.width - text_width) / 2.0).round() as i32,
+                (pad + index as f32 * layout.line_height).round() as i32,
+                &wide,
+            );
+        }
+        let _ = SelectObject(mem_dc, old_font);
+        let _ = DeleteObject(font);
+    }
+
+    if let Some(date) = date {
+        let date_width = measure_watermark_text_width(hdc, date, layout.date_font, false);
+        let font = CreateFontW(
+            -(layout.date_font.round().max(1.0) as i32),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        );
+        let old_font = SelectObject(mem_dc, font);
+        let wide: Vec<u16> = date.encode_utf16().collect();
+        let _ = TextOutW(
+            mem_dc,
+            (pad + (layout.width - date_width) / 2.0).round() as i32,
+            (pad + layout.date_y).round() as i32,
+            &wide,
+        );
+        let _ = SelectObject(mem_dc, old_font);
+        let _ = DeleteObject(font);
+    }
 
     for pixel in pixels.chunks_exact_mut(4) {
         let coverage = pixel[0].max(pixel[1]).max(pixel[2]);
@@ -5502,34 +6092,22 @@ unsafe fn draw_watermark_label_rotated(
             continue;
         }
         let alpha = ((coverage as u16 * color.a as u16) / 255) as u8;
-        pixel[0] = ((color.b as u16 * alpha as u16) / 255) as u8;
-        pixel[1] = ((color.g as u16 * alpha as u16) / 255) as u8;
-        pixel[2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+        pixel[0] = color.b;
+        pixel[1] = color.g;
+        pixel[2] = color.r;
         pixel[3] = alpha;
     }
 
-    let blend = BLENDFUNCTION {
-        BlendOp: AC_SRC_OVER as u8,
-        BlendFlags: 0,
-        SourceConstantAlpha: 255,
-        AlphaFormat: AC_SRC_ALPHA as u8,
+    let source = WatermarkBitmap {
+        width,
+        height,
+        bgra: pixels.to_vec(),
     };
-    let _ = AlphaBlend(
-        hdc,
-        (x - pad).round() as i32,
-        (y - pad).round() as i32,
-        width as i32,
-        height as i32,
-        mem_dc,
-        0,
-        0,
-        width as i32,
-        height as i32,
-        blend,
-    );
     let _ = SelectObject(mem_dc, old_bitmap);
     let _ = DeleteObject(bitmap);
     let _ = DeleteDC(mem_dc);
+
+    Some(rotated_watermark_bitmap(&source, degrees, 1.0))
 }
 unsafe fn draw_text_annotation(
     hdc: HDC,
@@ -5565,7 +6143,7 @@ unsafe fn draw_text_annotation(
     } else {
         color
     };
-    if filled {
+    if filled && framed {
         fill_rounded_rect_antialias(hdc, draw_bounds, 18.0, color);
     }
     SetBkMode(hdc, TRANSPARENT);
@@ -5587,21 +6165,57 @@ unsafe fn draw_text_annotation(
         w!("Segoe UI"),
     );
     let old_font = SelectObject(hdc, font);
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
-    let mut rect = rect_to_rect(Rect::new(
-        draw_bounds.x + padding,
-        draw_bounds.y + padding,
-        (draw_bounds.width - padding * 2.0).max(1.0),
-        (draw_bounds.height - padding * 2.0).max(1.0),
-    ));
-    let flags = if framed {
-        DT_LEFT | DT_WORDBREAK
+    if framed {
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut rect = rect_to_rect(Rect::new(
+            draw_bounds.x + padding,
+            draw_bounds.y + padding,
+            (draw_bounds.width - padding * 2.0).max(1.0),
+            (draw_bounds.height - padding * 2.0).max(1.0),
+        ));
+        let _ = DrawTextW(hdc, &mut wide, &mut rect, DT_LEFT | DT_WORDBREAK);
     } else {
-        DT_LEFT
-    };
-    let _ = DrawTextW(hdc, &mut wide, &mut rect, flags);
+        let text_y = bounds.y - font_size * 1.08;
+        let line_height = font_size * 1.22;
+        for (index, line) in text.lines().enumerate() {
+            if filled {
+                let line_width = measure_current_font_text_width(hdc, line).max(font_size * 0.45);
+                fill_rounded_rect_antialias(
+                    hdc,
+                    Rect::new(
+                        bounds.x - padding,
+                        text_y + index as f32 * line_height - padding * 0.45,
+                        line_width + padding * 2.0,
+                        line_height + padding * 0.45,
+                    ),
+                    7.0,
+                    color,
+                );
+            }
+            let wide: Vec<u16> = line.encode_utf16().collect();
+            let _ = TextOutW(
+                hdc,
+                bounds.x.round() as i32,
+                (text_y + index as f32 * line_height).round() as i32,
+                &wide,
+            );
+        }
+    }
     let _ = SelectObject(hdc, old_font);
     let _ = DeleteObject(font);
+}
+
+unsafe fn measure_current_font_text_width(hdc: HDC, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE { cx: 0, cy: 0 };
+    if GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() && size.cx > 0 {
+        size.cx as f32
+    } else {
+        text.chars().count() as f32 * 12.0
+    }
 }
 
 unsafe fn draw_inline_text_caret(
@@ -5716,6 +6330,30 @@ fn resize_tag_for_text(annotation: &mut Annotation, font_size: f32) {
     let desired_height = 16.0 + line_count * font_size * 1.45;
     if desired_height > annotation.bounds.height {
         annotation.bounds.height = desired_height;
+    }
+}
+
+fn resize_framed_text_for_text(annotation: &mut Annotation, font_size: f32) {
+    let AnnotationKind::Text {
+        text, framed: true, ..
+    } = &annotation.kind
+    else {
+        return;
+    };
+    let inner_width = (annotation.bounds.width - 16.0).max(font_size);
+    let chars_per_line = (inner_width / (font_size * 0.58)).floor().max(1.0);
+    let line_count = text
+        .lines()
+        .map(|line| {
+            (line.chars().count() as f32 / chars_per_line)
+                .ceil()
+                .max(1.0)
+        })
+        .sum::<f32>()
+        .max(1.0);
+    let desired_height = 16.0 + line_count * font_size * 1.22;
+    if desired_height > annotation.bounds.height {
+        annotation.bounds.height = desired_height.ceil();
     }
 }
 
@@ -6079,7 +6717,12 @@ unsafe fn draw_wrapped_text(hdc: HDC, rect: Rect, text: &str, font_size: f32, co
 
 unsafe fn draw_annotations(hdc: HDC, state: &OverlayState) {
     for annotation in &state.document.annotations {
-        if !is_watermark_annotation(annotation) {
+        if is_mosaic_annotation(annotation) && !is_watermark_annotation(annotation) {
+            draw_annotation(hdc, state, annotation);
+        }
+    }
+    for annotation in &state.document.annotations {
+        if !is_watermark_annotation(annotation) && !is_mosaic_annotation(annotation) {
             draw_annotation(hdc, state, annotation);
         }
     }
@@ -6095,12 +6738,14 @@ unsafe fn draw_watermark_annotations(hdc: HDC, state: &OverlayState) {
 
 unsafe fn draw_native_backed_annotations(hdc: HDC, state: &OverlayState) {
     for annotation in &state.document.annotations {
-        if matches!(annotation.kind, AnnotationKind::Mosaic { .. })
-            && !is_watermark_annotation(annotation)
-        {
+        if is_mosaic_annotation(annotation) && !is_watermark_annotation(annotation) {
             draw_annotation(hdc, state, annotation);
         }
     }
+}
+
+fn is_mosaic_annotation(annotation: &Annotation) -> bool {
+    matches!(annotation.kind, AnnotationKind::Mosaic { .. })
 }
 
 fn is_watermark_annotation(annotation: &Annotation) -> bool {
@@ -6151,50 +6796,38 @@ unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
         state.watermark_color.b,
         (255.0 * WATERMARK_OPACITY).round() as u8,
     );
-    let font_size = scaled(state, state.font_size).max(scaled(state, 34.0));
-    let spread = font_size / scaled(state, 27.0).max(1.0);
-    let step_x = scaled(state, 320.0).max(scaled(state, 240.0) * spread);
-    let step_y = scaled(state, 200.0).max(scaled(state, 150.0) * spread);
-    let mut row = 0;
-    let mut y = region.y + scaled(state, 24.0);
-    while y < region.bottom() {
-        let mut x = region.x
-            + if row % 2 == 0 {
-                scaled(state, 24.0)
-            } else {
-                step_x / 2.0
-            };
-        while x < region.right() {
-            let mut text_y = y;
-            if let Some(bitmap) = &image {
-                draw_watermark_bitmap(hdc, bitmap, x, y - scaled(state, 16.0));
-                text_y += scaled(state, 54.0);
+    let font_size = state.font_size.max(34.0);
+    let max_text_width = watermark_max_text_width(region, font_size);
+    let (footprint_width, footprint_height) =
+        watermark_tile_footprint(hdc, text, date.as_deref(), image, font_size, max_text_width);
+    let metrics = watermark_honeycomb_metrics(footprint_width, footprint_height, font_size);
+    let has_text_watermark = !text.is_empty() || date.is_some();
+    let text_bitmap = if has_text_watermark {
+        watermark_text_block_bitmap(
+            hdc,
+            text,
+            date.as_deref(),
+            font_size,
+            max_text_width,
+            color,
+            WATERMARK_ROTATION_DEGREES,
+        )
+    } else {
+        None
+    };
+    for tile in watermark_honeycomb_tiles(region, metrics, 72) {
+        let use_image = image.is_some() && (!has_text_watermark || tile.parity == 0);
+        let use_text = has_text_watermark && (image.is_none() || tile.parity == 1);
+        if use_image {
+            if let Some(bitmap) = image {
+                draw_watermark_bitmap(hdc, bitmap, tile.x, tile.y);
             }
-            if !text.is_empty() {
-                draw_watermark_label_rotated(hdc, x, text_y, text, font_size, color, -20.0);
-            }
-            if let Some(date) = &date {
-                let date_font = font_size * 0.72;
-                let text_width = if text.is_empty() {
-                    approximate_watermark_text_width(date, date_font)
-                } else {
-                    approximate_watermark_text_width(text, font_size)
-                };
-                let date_width = approximate_watermark_text_width(date, date_font);
-                draw_watermark_label_rotated(
-                    hdc,
-                    x + (text_width - date_width) / 2.0,
-                    text_y + font_size * 1.02,
-                    date,
-                    date_font,
-                    color,
-                    -20.0,
-                );
-            }
-            x += step_x;
         }
-        y += step_y;
-        row += 1;
+        if use_text {
+            if let Some(bitmap) = &text_bitmap {
+                draw_watermark_bitmap(hdc, bitmap, tile.x, tile.y);
+            }
+        }
     }
 }
 
@@ -6203,7 +6836,252 @@ fn approximate_text_width(text: &str, font_size: f32) -> f32 {
 }
 
 fn approximate_watermark_text_width(text: &str, font_size: f32) -> f32 {
-    text.chars().count() as f32 * font_size * 0.62
+    text.chars().count() as f32 * font_size * 0.78
+}
+
+fn measure_watermark_text_width(hdc: HDC, text: &str, font_size: f32, bold: bool) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    unsafe {
+        let font = CreateFontW(
+            -(font_size.round().max(1.0) as i32),
+            0,
+            0,
+            0,
+            if bold { 700 } else { 400 },
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        );
+        if font.is_invalid() {
+            return approximate_watermark_text_width(text, font_size);
+        }
+        let old_font = SelectObject(hdc, font);
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE { cx: 0, cy: 0 };
+        let ok = GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool();
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        if ok && size.cx > 0 {
+            size.cx as f32
+        } else {
+            approximate_watermark_text_width(text, font_size)
+        }
+    }
+}
+
+fn watermark_tile_footprint(
+    hdc: HDC,
+    text: &str,
+    date: Option<&str>,
+    image: Option<&WatermarkBitmap>,
+    font_size: f32,
+    max_text_width: f32,
+) -> (f32, f32) {
+    let layout = watermark_text_block_layout(hdc, text, date, font_size, max_text_width);
+    let (rotated_text_width, rotated_text_height) =
+        rotated_bounds(layout.width, layout.height, WATERMARK_ROTATION_DEGREES);
+    let image_width = image.map(|bitmap| bitmap.width as f32).unwrap_or(0.0);
+    let image_height = image.map(|bitmap| bitmap.height as f32).unwrap_or(0.0);
+    (
+        rotated_text_width.max(image_width).max(80.0),
+        rotated_text_height.max(image_height).max(56.0),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct WatermarkHoneycombMetrics {
+    side: f32,
+    width: f32,
+    height: f32,
+    dx: f32,
+    dy: f32,
+}
+
+#[derive(Clone, Copy)]
+struct WatermarkTile {
+    x: f32,
+    y: f32,
+    parity: usize,
+}
+
+fn watermark_honeycomb_metrics(
+    footprint_width: f32,
+    footprint_height: f32,
+    font_size: f32,
+) -> WatermarkHoneycombMetrics {
+    let padding = 28.0_f32.max(font_size * 0.65);
+    let side = 118.0_f32
+        .max((footprint_width + padding * 2.0) / 3.0_f32.sqrt())
+        .max((footprint_height + padding * 2.0) / 2.0);
+    watermark_honeycomb_metrics_from_side(side)
+}
+
+fn watermark_honeycomb_metrics_from_side(side: f32) -> WatermarkHoneycombMetrics {
+    WatermarkHoneycombMetrics {
+        side,
+        width: 3.0_f32.sqrt() * side,
+        height: 2.0 * side,
+        dx: 3.0_f32.sqrt() * side,
+        dy: 1.5 * side,
+    }
+}
+
+fn watermark_honeycomb_tiles(
+    region: Rect,
+    metrics: WatermarkHoneycombMetrics,
+    max_tiles: usize,
+) -> Vec<WatermarkTile> {
+    let mut actual = metrics;
+    let estimated_cols = ((region.width + actual.width * 2.0) / actual.dx).ceil() as usize + 1;
+    let estimated_rows = ((region.height + actual.height * 2.0) / actual.dy).ceil() as usize + 1;
+    let estimated = estimated_cols.saturating_mul(estimated_rows);
+    if estimated > max_tiles {
+        let scale_up = (estimated as f32 / max_tiles.max(1) as f32).sqrt();
+        actual = watermark_honeycomb_metrics_from_side(actual.side * scale_up);
+    }
+    let mut tiles = Vec::new();
+    let mut row = 0_usize;
+    let mut y = region.y - actual.height;
+    while y <= region.bottom() + actual.height {
+        let stagger = if row % 2 == 0 { 0.0 } else { actual.dx / 2.0 };
+        let mut col = 0_usize;
+        let mut x = region.x - actual.width + stagger;
+        while x <= region.right() + actual.width {
+            tiles.push(WatermarkTile {
+                x,
+                y,
+                parity: (row + col) % 2,
+            });
+            col += 1;
+            x += actual.dx;
+        }
+        row += 1;
+        y += actual.dy;
+    }
+    tiles.sort_by(|a, b| {
+        a.y.partial_cmp(&b.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    tiles
+}
+
+struct WatermarkTextBlockLayout {
+    lines: Vec<String>,
+    width: f32,
+    height: f32,
+    line_height: f32,
+    date_y: f32,
+    date_font: f32,
+}
+
+fn watermark_text_block_layout(
+    hdc: HDC,
+    text: &str,
+    date: Option<&str>,
+    font_size: f32,
+    max_text_width: f32,
+) -> WatermarkTextBlockLayout {
+    let date_font = font_size * 0.72;
+    let lines = if text.is_empty() {
+        Vec::new()
+    } else {
+        wrap_watermark_text(hdc, text, font_size, max_text_width)
+    };
+    let line_height = font_size * 1.08;
+    let text_width = lines
+        .iter()
+        .map(|line| measure_watermark_text_width(hdc, line, font_size, true))
+        .fold(0.0, f32::max);
+    let date_width = date
+        .map(|date| measure_watermark_text_width(hdc, date, date_font, false))
+        .unwrap_or(0.0);
+    let text_height = if lines.is_empty() {
+        0.0
+    } else {
+        (lines.len() - 1) as f32 * line_height + font_size
+    };
+    let date_height = if date.is_some() { date_font } else { 0.0 };
+    let gap = if !lines.is_empty() && date.is_some() {
+        font_size * 0.18
+    } else {
+        0.0
+    };
+    WatermarkTextBlockLayout {
+        lines,
+        width: text_width.max(date_width).max(font_size),
+        height: font_size.max(text_height + gap + date_height),
+        line_height,
+        date_y: if text_height > 0.0 {
+            text_height + gap
+        } else {
+            0.0
+        },
+        date_font,
+    }
+}
+
+fn watermark_max_text_width(region: Rect, font_size: f32) -> f32 {
+    260.0_f32.max((font_size * 13.0).min(region.width * 0.24))
+}
+
+fn wrap_watermark_text(hdc: HDC, text: &str, font_size: f32, max_width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if measure_watermark_text_width(hdc, &candidate, font_size, true) <= max_width {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if measure_watermark_text_width(hdc, word, font_size, true) <= max_width {
+            line = word.to_string();
+            continue;
+        }
+        let mut chunk = String::new();
+        for ch in word.chars() {
+            let mut candidate = chunk.clone();
+            candidate.push(ch);
+            if !chunk.is_empty()
+                && measure_watermark_text_width(hdc, &candidate, font_size, true) > max_width
+            {
+                lines.push(std::mem::take(&mut chunk));
+                chunk.push(ch);
+            } else {
+                chunk = candidate;
+            }
+        }
+        line = chunk;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() && !text.is_empty() {
+        lines.push(text.to_string());
+    }
+    lines
+}
+
+fn rotated_bounds(width: f32, height: f32, degrees: f32) -> (f32, f32) {
+    let radians = degrees.abs().to_radians();
+    let cos = radians.cos();
+    let sin = radians.sin();
+    (width * cos + height * sin, width * sin + height * cos)
 }
 
 fn watermark_caret_visible() -> bool {
@@ -6222,7 +7100,15 @@ struct WatermarkBitmap {
 fn watermark_bitmap_data_url(bitmap: &WatermarkBitmap) -> Option<String> {
     let mut rgba = Vec::with_capacity((bitmap.width * bitmap.height * 4) as usize);
     for px in bitmap.bgra.chunks_exact(4) {
-        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+        let alpha = px[3];
+        if alpha == 0 {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let r = ((px[2] as u16 * 255) / alpha as u16).min(255) as u8;
+            let g = ((px[1] as u16 * 255) / alpha as u16).min(255) as u8;
+            let b = ((px[0] as u16 * 255) / alpha as u16).min(255) as u8;
+            rgba.extend_from_slice(&[r, g, b, alpha]);
+        }
     }
     let mut png_bytes = Vec::new();
     {
@@ -7040,7 +7926,13 @@ unsafe fn show_save_png_dialog(owner: HWND) -> Option<PathBuf> {
 unsafe fn show_open_image_dialog(owner: HWND) -> Option<PathBuf> {
     let _ = ReleaseCapture();
     match show_open_image_dialog_modern(owner) {
-        Ok(path) => path,
+        Ok(path) => {
+            diagnostics::log_breadcrumb(format!(
+                "watermark-image-dialog-result selected={}",
+                path.is_some()
+            ));
+            path
+        }
         Err(error) => {
             write_web_ui_debug(&format!("watermark-image-dialog-failed: {error:?}"));
             None
@@ -7113,7 +8005,12 @@ fn wide_null_double(value: &str) -> Vec<u16> {
 unsafe fn draw_export_annotations(hdc: HDC, state: &OverlayState, region: Rect) {
     let space = AnnotationRenderSpace::export(region);
     for annotation in &state.document.annotations {
-        if !is_watermark_annotation(annotation) {
+        if is_mosaic_annotation(annotation) && !is_watermark_annotation(annotation) {
+            draw_annotation_in_space(hdc, state, annotation, space);
+        }
+    }
+    for annotation in &state.document.annotations {
+        if !is_watermark_annotation(annotation) && !is_mosaic_annotation(annotation) {
             draw_annotation_in_space(hdc, state, annotation, space);
         }
     }

@@ -1,0 +1,16 @@
+{
+  "name": "screencaptn-web-ui",
+  "private": true,
+  "scripts": {
+    "build:web": "esbuild crates/screencaptn-win/assets/web-ui/src/app-entry.js --bundle --format=iife --target=chrome120 --define:process.env.NODE_ENV=\\\"production\\\" --minify --outfile=crates/screencaptn-win/assets/web-ui/app.bundle.js",
+    "check:web": "node --check crates/screencaptn-win/assets/web-ui/app.bundle.js"
+  },
+  "dependencies": {
+    "@lexical/history": "^0.28.0",
+    "@lexical/plain-text": "^0.28.0",
+    "lexical": "^0.28.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

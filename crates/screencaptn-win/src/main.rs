@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod diagnostics;
 mod native;
 mod overlay;
 mod theme;
@@ -11,5 +12,7 @@ use native::NativeApp;
 use windows::core::Result;
 
 fn main() -> Result<()> {
+    diagnostics::install();
+    diagnostics::log_breadcrumb("app-main-enter");
     NativeApp::new()?.run()
 }
