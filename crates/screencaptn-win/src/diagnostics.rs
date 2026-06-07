@@ -9,8 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn install() {
+    if !enabled() {
+        return;
+    }
     let path = log_path();
-    let _ = fs::create_dir_all(path.parent().unwrap_or_else(|| path.as_path()));
+    let _ = fs::create_dir_all(path.parent().unwrap_or(path.as_path()));
     log_event("app", "diagnostics-installed");
     panic::set_hook(Box::new(|info| {
         let thread = std::thread::current();
@@ -47,6 +50,9 @@ pub fn log_breadcrumb(message: impl AsRef<str>) {
 }
 
 pub fn log_event(scope: &str, message: &str) {
+    if !enabled() {
+        return;
+    }
     let path = log_path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -73,4 +79,8 @@ fn timestamp_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0)
+}
+
+pub fn enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os("SCREENCAPTN_DIAGNOSTICS").is_some()
 }

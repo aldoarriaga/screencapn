@@ -1,6 +1,6 @@
-# Screen Captn
+# Screen Cap'n
 
-Screen Captn is a Rust-first native Windows screen capture app focused on fast capture, no-admin install, accessibility, and a compact Lark-style annotation workflow.
+Screen Cap'n is a Rust-first native Windows screen capture app focused on fast capture, no-admin install, accessibility, and a compact annotation workflow.
 
 ## V1 Direction
 
@@ -9,11 +9,11 @@ Screen Captn is a Rust-first native Windows screen capture app focused on fast c
 - Editable capture region after annotation begins.
 - Object-based annotations until confirm.
 - Default confirm action copies the final capture to the clipboard.
-- Portable `.exe` and no-admin per-user installer are the intended release paths.
+- Microsoft Store MSIX is the intended v1 release path.
 
 ## Current Implementation Slice
 
-This repository contains the first native foundation:
+This repository contains the native foundation:
 
 - `screencaptn-core`: geometry, annotation model, capture document, settings, and undo/redo history.
 - `screencaptn-win`: Windows tray/hotkey shell and capture overlay.
@@ -57,7 +57,7 @@ You do not need to reinstall the app while developing. Run the latest debug buil
 .\scripts\dev-run.ps1
 ```
 
-That script stops any running Screen Captn process, rebuilds `screencaptn-win`, and launches `target\debug\screencaptn.exe`.
+That script stops any running Screen Cap'n process, rebuilds `screencaptn-win`, and launches `target\debug\screencaptn.exe`.
 
 Stop the running dev app with:
 
@@ -71,10 +71,19 @@ Run formatting, type checks, and tests with:
 .\scripts\dev-check.ps1
 ```
 
-## Packaging Goals
+## Microsoft Store Path A
 
-V1 distribution should avoid admin requirements:
+The v1 release path is Microsoft Store first:
 
-- Portable app: run the compiled executable directly.
-- Per-user installer: install into `%LocalAppData%\ScreenCaptn`.
-- Microsoft Store later: package as MSIX when the app is ready for Store certification.
+- Store MSIX distribution first.
+- Microsoft Store signing for the Store package.
+- Website/GitHub direct downloads deferred until a trusted direct-download signing option is chosen.
+- Minimum target: Windows 10 version 1809 / build 17763 or later.
+
+Run the local Store-readiness check with:
+
+```powershell
+.\scripts\store-release-check.ps1
+```
+
+See [`docs/microsoft-store-path-a.md`](docs/microsoft-store-path-a.md) and [`PRIVACY.md`](PRIVACY.md) before Microsoft Store submission.

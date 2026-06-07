@@ -10,8 +10,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Screen Captn"]
 license = "MIT"
-repository = "https://example.invalid/screencaptn"
+repository = "https://github.com/aldoarriaga/screencapn"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-

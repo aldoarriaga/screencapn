@@ -817,6 +817,9 @@ fn handle_web_export_failed(message: &WebUiMessage) {
 }
 
 fn write_web_ui_debug(message: &str) {
+    if !diagnostics::enabled() {
+        return;
+    }
     let path = std::env::temp_dir().join("screencaptn-web-ui-debug.log");
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{message}");
@@ -3449,10 +3452,7 @@ fn handle_watermark_mode_action(state: &mut OverlayState, mode: WatermarkMode) {
         WatermarkMode::Image => {
             diagnostics::log_breadcrumb("watermark-image-picker-requested");
             if let Some(path) = unsafe { show_open_image_dialog(state.hwnd) } {
-                diagnostics::log_breadcrumb(format!(
-                    "watermark-image-selected path={}",
-                    path.display()
-                ));
+                diagnostics::log_breadcrumb("watermark-image-selected");
                 let bitmap = load_watermark_bitmap(
                     &path,
                     (state.font_size.max(34.0) * 5.0).round().max(1.0) as u32,
@@ -7934,7 +7934,8 @@ unsafe fn show_open_image_dialog(owner: HWND) -> Option<PathBuf> {
             path
         }
         Err(error) => {
-            write_web_ui_debug(&format!("watermark-image-dialog-failed: {error:?}"));
+            let _ = error;
+            write_web_ui_debug("watermark-image-dialog-failed");
             None
         }
     }

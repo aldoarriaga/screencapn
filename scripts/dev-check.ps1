@@ -10,6 +10,9 @@ if (Test-Path $cargoBin) {
 
 Get-Process -Name "screencaptn" -ErrorAction SilentlyContinue | Stop-Process -Force
 
+npm.cmd run build:web
+npm.cmd run check:web
+
 cargo fmt --all -- --check
 cargo check
 cargo test -p screencaptn-core
