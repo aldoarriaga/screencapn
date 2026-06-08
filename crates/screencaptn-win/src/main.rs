@@ -1,8 +1,11 @@
 #![windows_subsystem = "windows"]
 
+mod app_icon;
 mod diagnostics;
 mod native;
 mod overlay;
+mod settings;
+mod shortcut_window;
 mod theme;
 mod tray;
 mod util;

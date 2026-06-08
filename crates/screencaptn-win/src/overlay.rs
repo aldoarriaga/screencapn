@@ -1,4 +1,5 @@
 use crate::diagnostics;
+use crate::settings::{save_settings, AppSettings, AspectRatioMode};
 use crate::util::{point_from_lparam, rect_to_rect, SelectedPen, SelectedStockObject};
 use screencaptn_core::{
     Annotation, AnnotationId, AnnotationKind, CaptureDocument, Color, HighlightShape, History,
@@ -20,10 +21,10 @@ use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, FrameRect, GetDC,
     GetDIBits, GetMonitorInfoW, GetPixel, GetTextExtentPoint32W, InvalidateRect, LineTo,
-    MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-    TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, DT_LEFT, DT_WORDBREAK, HBITMAP, HDC, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, SRCCOPY, TRANSPARENT,
+    MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetStretchBltMode,
+    SetTextColor, StretchBlt, TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, BLENDFUNCTION, COLORONCOLOR, DIB_RGB_COLORS, DT_LEFT, DT_WORDBREAK, HBITMAP, HDC,
+    HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
@@ -52,17 +53,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE,
     IDC_SIZEWE, MSG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     SW_SHOW, WM_CHAR, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_CAPTION,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
+    WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 
 const OVERLAY_CLASS: windows::core::PCWSTR = w!("ScreenCaptnCaptureOverlay");
 const CF_BITMAP_FORMAT: u32 = 2;
 const HANDLE_RADIUS: f32 = 6.0;
+const REGION_RESIZE_HIT_RADIUS: f32 = 26.0;
 const MIN_REGION_SIZE: f32 = 24.0;
 const TOOLBAR_BUTTON: f32 = 36.0;
 const TOOLBAR_HEIGHT: f32 = 36.0;
-const FRAME_HIT_WIDTH: f32 = 8.0;
+const FRAME_HIT_WIDTH: f32 = 22.0;
 const CLICK_DRAG_THRESHOLD: f32 = 5.0;
 const ALL_SCREENS_TOP_EDGE_THRESHOLD_PX: f32 = 4.0;
 const CURRENT_SCREEN_TOP_THRESHOLD_PX: f32 = 32.0;
@@ -99,6 +101,12 @@ const MAX_FONT_SIZE: f32 = 56.0;
 const WATERMARK_OPACITY: f32 = 0.5;
 const WATERMARK_ROTATION_DEGREES: f32 = -20.0;
 const WEB_EXPORT_ENABLED: bool = false;
+const REGION_CONTROL_ICON_SIZE: f32 = 16.0;
+const REGION_CONTROL_GAP: f32 = 11.0;
+const REGION_CONTROL_MARGIN: f32 = 18.0;
+const REGION_CONTROL_DIVIDER_HEIGHT: f32 = 22.0;
+const MAGNIFIER_SIZE: f32 = 104.0;
+const MAGNIFIER_SAMPLE_SIZE: f32 = 18.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppTheme {
@@ -106,7 +114,7 @@ pub enum AppTheme {
     Dark,
 }
 
-pub fn open_capture_overlay(theme: AppTheme) -> Result<()> {
+pub fn open_capture_overlay(theme: AppTheme, settings: AppSettings) -> Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
@@ -139,9 +147,11 @@ pub fn open_capture_overlay(theme: AppTheme) -> Result<()> {
             background_bitmap,
             detected_regions,
             theme,
+            settings,
         ));
         state.cursor_position = state.screen_to_overlay(cursor_screen);
         state.smart_region = initial_candidate;
+        apply_locked_region_on_launch(&mut state, cursor_screen);
         let state_ptr = state.as_mut() as *mut OverlayState;
 
         let hwnd = CreateWindowExW(
@@ -193,6 +203,7 @@ struct OverlayState {
     detected_regions: Vec<DetectedRegion>,
     smart_region: Option<SmartRegionCandidate>,
     pending_smart_region: Option<PendingSmartRegion>,
+    ratio_placement_mode: bool,
     cursor_position: Point,
     document: CaptureDocument,
     history: History<CaptureDocument>,
@@ -238,6 +249,10 @@ struct OverlayState {
     render_cache: Option<RenderCache>,
     static_layer_dirty: bool,
     defer_watermark_static_redraw_once: bool,
+    settings: AppSettings,
+    region_control_buttons: Vec<RegionControlButton>,
+    region_control_bounds: Option<Rect>,
+    hovered_region_control: Option<RegionControlKind>,
 }
 
 impl OverlayState {
@@ -246,7 +261,9 @@ impl OverlayState {
         background_bitmap: HBITMAP,
         detected_regions: Vec<DetectedRegion>,
         theme: AppTheme,
+        mut settings: AppSettings,
     ) -> Self {
+        settings.aspect_ratio = AspectRatioMode::Custom;
         let ui_scale = ui_scale_for_screen(screen_bounds);
         let current_stroke = StrokeStyle::default();
         Self {
@@ -256,6 +273,7 @@ impl OverlayState {
             detected_regions,
             smart_region: None,
             pending_smart_region: None,
+            ratio_placement_mode: false,
             cursor_position: Point::new(0.0, 0.0),
             document: CaptureDocument::new(),
             history: History::new(100),
@@ -281,7 +299,7 @@ impl OverlayState {
             submenu_rect: None,
             active_submenu: Some(ToolKind::Rectangle),
             pen_mode: PenMode::Free,
-            highlighter_shape: HighlightShape::RoundedRectangle,
+            highlighter_shape: HighlightShape::Rectangle,
             text_filled: false,
             watermark_mode: WatermarkMode::Text,
             watermark_date_enabled: false,
@@ -301,6 +319,10 @@ impl OverlayState {
             render_cache: None,
             static_layer_dirty: true,
             defer_watermark_static_redraw_once: false,
+            settings,
+            region_control_buttons: Vec::new(),
+            region_control_bounds: None,
+            hovered_region_control: None,
         }
     }
 
@@ -554,6 +576,14 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 false
             }
         }
+        "toggleRegionLock" => {
+            handle_region_control_action(state, RegionControlKind::Lock);
+            true
+        }
+        "cycleAspectRatio" => {
+            handle_region_control_action(state, RegionControlKind::Ratio);
+            true
+        }
         "selectTool" => {
             if let Some(tool) = message.tool.as_deref().and_then(tool_from_web_name) {
                 handle_toolbar_action(state, ToolbarAction::Tool(tool));
@@ -669,7 +699,7 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
         }
         "commitText" => {
             if let (Some(id), Some(text)) = (message.id, message.text) {
-                if text.is_empty() {
+                if text.is_empty() && should_remove_empty_text_annotation(state, id) {
                     state.document.selected_annotation_id = Some(id);
                     let _ = state.document.remove_selected();
                     state.mark_static_dirty();
@@ -685,7 +715,7 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
         }
         "cancelText" => {
             if let (Some(id), Some(text)) = (message.id, message.text) {
-                if text.is_empty() {
+                if text.is_empty() && should_remove_empty_text_annotation(state, id) {
                     state.document.selected_annotation_id = Some(id);
                     let _ = state.document.remove_selected();
                 } else {
@@ -1150,6 +1180,9 @@ fn web_ui_state(state: &OverlayState) -> serde_json::Value {
 
 fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
     let region = state.region_overlay();
+    let region_locked = current_region_monitor(state)
+        .map(|(monitor_id, _)| state.settings.is_region_locked(&monitor_id))
+        .unwrap_or(false);
     let toolbar = region.map(|region| {
         let origin = state
             .toolbar_origin
@@ -1171,6 +1204,10 @@ fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
             "height": state.screen_bounds.height,
         },
         "captureRegion": region.map(rect_json),
+        "regionControls": {
+            "locked": region_locked,
+            "aspectRatio": aspect_ratio_web_name(state.settings.aspect_ratio),
+        },
         "toolbar": toolbar,
         "activeTool": tool_web_name(state.active_tool),
         "activeSubmenu": state.active_submenu.map(tool_web_name),
@@ -1198,6 +1235,16 @@ fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
         "editingStepNumberId": state.editing_step_number_id,
         "renderStyle": web_render_style_json(state),
     })
+}
+
+fn aspect_ratio_web_name(mode: AspectRatioMode) -> &'static str {
+    match mode {
+        AspectRatioMode::Custom => "custom",
+        AspectRatioMode::Ratio9x16 => "9x16",
+        AspectRatioMode::Ratio16x9 => "16x9",
+        AspectRatioMode::Ratio1x1 => "1x1",
+        AspectRatioMode::Ratio4x5 => "4x5",
+    }
 }
 
 fn watermark_file_url(path: &PathBuf) -> String {
@@ -1602,6 +1649,18 @@ struct SubmenuSlider {
 }
 
 #[derive(Clone, Copy)]
+struct RegionControlButton {
+    rect: Rect,
+    kind: RegionControlKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegionControlKind {
+    Lock,
+    Ratio,
+}
+
+#[derive(Clone, Copy)]
 enum SubmenuSliderKind {
     StrokeWidth,
     FontSize,
@@ -1660,6 +1719,7 @@ enum DragState {
     },
     ResizingRegion {
         handle: ResizeHandle,
+        original: Rect,
     },
     MovingAnnotation {
         start: Point,
@@ -1761,6 +1821,17 @@ unsafe extern "system" fn overlay_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_MOUSEWHEEL => {
+            if web_ui_owns_pointer_input(state) {
+                return LRESULT(0);
+            }
+            let delta = ((wparam.0 >> 16) & 0xffff) as i16;
+            if handle_mouse_wheel(state, delta) {
+                state.mark_static_dirty();
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
         WM_SETCURSOR => {
             if web_ui_owns_pointer_input(state) {
                 return LRESULT(1);
@@ -1827,6 +1898,29 @@ unsafe extern "system" fn overlay_wnd_proc(
 }
 
 fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: Option<usize>) {
+    if let Some(action) = state
+        .region_control_buttons
+        .iter()
+        .find(|button| button.rect.contains(point))
+        .map(|button| button.kind)
+    {
+        handle_region_control_action(state, action);
+        return;
+    }
+
+    if state.ratio_placement_mode && state.settings.aspect_ratio != AspectRatioMode::Custom {
+        if state
+            .region_control_bounds
+            .is_some_and(|rect| rect.contains(point))
+        {
+            return;
+        }
+        state.ratio_placement_mode = false;
+        persist_locked_region_if_needed(state);
+        state.mark_static_dirty();
+        return;
+    }
+
     if let Some(slider) = state
         .submenu_sliders
         .iter()
@@ -1874,10 +1968,21 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: O
     }
 
     if let Some(region) = state.region_overlay() {
-        if let Some(handle) = region.hit_resize_handle(point, HANDLE_RADIUS + 4.0) {
+        if let Some(handle) = region.hit_resize_handle(point, REGION_RESIZE_HIT_RADIUS) {
             finish_text_editing(state);
             state.checkpoint();
-            state.drag = Some(DragState::ResizingRegion { handle });
+            if state.settings.aspect_ratio != AspectRatioMode::Custom
+                && !is_corner_resize_handle(handle)
+            {
+                state.settings.aspect_ratio = AspectRatioMode::Custom;
+            }
+            state.drag = Some(DragState::ResizingRegion {
+                handle,
+                original: state
+                    .document
+                    .capture_region
+                    .expect("overlay region maps from document region"),
+            });
             return;
         }
 
@@ -1897,6 +2002,10 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: O
             if let Some(original) = state.document.annotation(id).cloned() {
                 state.checkpoint();
                 if let Some(edit) = hit_annotation_edit_handle(state, &original, screen_point) {
+                    state.editing_text_id = None;
+                    state.editing_text_caret = 0;
+                    state.editing_step_number_id = None;
+                    state.editing_step_number_replace = false;
                     state.drag = Some(DragState::EditingAnnotation { id, edit, original });
                     return;
                 }
@@ -1972,6 +2081,28 @@ fn region_frame_contains(region: Rect, point: Point) -> bool {
         || point.y >= region.bottom() - FRAME_HIT_WIDTH
 }
 
+fn is_corner_resize_handle(handle: ResizeHandle) -> bool {
+    matches!(
+        handle,
+        ResizeHandle::NorthWest
+            | ResizeHandle::NorthEast
+            | ResizeHandle::SouthEast
+            | ResizeHandle::SouthWest
+    )
+}
+
+fn has_user_annotations(state: &OverlayState) -> bool {
+    state
+        .document
+        .annotations
+        .iter()
+        .any(|annotation| !matches!(annotation.kind, AnnotationKind::Watermark { .. }))
+}
+
+fn region_control_chrome_hidden(state: &OverlayState) -> bool {
+    has_user_annotations(state) || matches!(state.drag, Some(DragState::DrawingAnnotation { .. }))
+}
+
 fn select_annotation_at(state: &mut OverlayState, screen_point: Point) -> Option<AnnotationId> {
     let hit = state
         .document
@@ -2033,6 +2164,16 @@ fn tool_for_annotation(annotation: &Annotation) -> ToolKind {
 
 fn annotation_hit_test(annotation: &Annotation, screen_point: Point) -> bool {
     match &annotation.kind {
+        AnnotationKind::Rectangle => rect_stroke_hit(
+            annotation.bounds,
+            screen_point,
+            line_hit_radius(annotation.stroke.width),
+        ),
+        AnnotationKind::Oval => oval_stroke_hit(
+            annotation.bounds,
+            screen_point,
+            line_hit_radius(annotation.stroke.width),
+        ),
         AnnotationKind::Text {
             text,
             font_size,
@@ -2074,11 +2215,39 @@ fn annotation_hit_test(annotation: &Annotation, screen_point: Point) -> bool {
         }
         AnnotationKind::Tag { anchor, .. } => {
             annotation.bounds.contains(screen_point)
+                || rect_stroke_hit(
+                    annotation.bounds,
+                    screen_point,
+                    line_hit_radius(tag_frame_for_width(annotation.stroke.width)),
+                )
                 || near_point(screen_point, *anchor, HANDLE_RADIUS + 12.0)
                 || tag_pointer_hit(annotation.bounds, *anchor, screen_point)
         }
         _ => annotation.bounds.contains(screen_point),
     }
+}
+
+fn rect_stroke_hit(rect: Rect, point: Point, radius: f32) -> bool {
+    expand_rect(rect, radius).contains(point) && !shrink_rect(rect, radius).contains(point)
+}
+
+fn shrink_rect(rect: Rect, amount: f32) -> Rect {
+    let width = (rect.width - amount * 2.0).max(0.0);
+    let height = (rect.height - amount * 2.0).max(0.0);
+    Rect::new(rect.x + amount, rect.y + amount, width, height)
+}
+
+fn oval_stroke_hit(rect: Rect, point: Point, radius: f32) -> bool {
+    if !expand_rect(rect, radius).contains(point) {
+        return false;
+    }
+    let rx = (rect.width / 2.0).max(1.0);
+    let ry = (rect.height / 2.0).max(1.0);
+    let center = rect.center();
+    let normalized =
+        (((point.x - center.x) / rx).powi(2) + ((point.y - center.y) / ry).powi(2)).sqrt();
+    let tolerance = (radius / rx.min(ry)).max(0.05);
+    (normalized - 1.0).abs() <= tolerance
 }
 
 fn inline_text_hit_bounds(bounds: Rect, text: &str, font_size: f32) -> Rect {
@@ -2094,11 +2263,11 @@ fn inline_text_hit_bounds(bounds: Rect, text: &str, font_size: f32) -> Rect {
 }
 
 fn tag_pointer_hit(bounds: Rect, anchor: Point, point: Point) -> bool {
-    let left = anchor.x.min(bounds.x).min(bounds.right()) - HANDLE_RADIUS;
-    let top = anchor.y.min(bounds.y).min(bounds.bottom()) - HANDLE_RADIUS;
-    let right = anchor.x.max(bounds.x).max(bounds.right()) + HANDLE_RADIUS;
-    let bottom = anchor.y.max(bounds.y).max(bounds.bottom()) + HANDLE_RADIUS;
-    Rect::new(left, top, right - left, bottom - top).contains(point)
+    let target = Point::new(
+        anchor.x.clamp(bounds.x, bounds.right()),
+        anchor.y.clamp(bounds.y, bounds.bottom()),
+    );
+    near_segment(point, anchor, target, line_hit_radius(TAG_FRAME))
 }
 
 fn editable_text_annotation(state: &OverlayState, id: AnnotationId) -> bool {
@@ -2347,6 +2516,296 @@ fn monitor_id(rect: Rect) -> String {
     )
 }
 
+fn apply_locked_region_on_launch(state: &mut OverlayState, cursor_screen: Point) {
+    let Some(monitor) = (unsafe { monitor_full_region_at(cursor_screen) }) else {
+        return;
+    };
+    let id = monitor_id(monitor);
+    let Some(region) = state.settings.locked_region_for_monitor(&id, monitor) else {
+        return;
+    };
+    state.document.set_capture_region(region);
+    state.smart_region = Some(SmartRegionCandidate::new(
+        SmartRegionKind::Manual,
+        region,
+        1.0,
+        SmartRegionSource::Manual,
+        None,
+        Some(id),
+    ));
+    let overlay_region = region.translate(-state.screen_bounds.x, -state.screen_bounds.y);
+    state.toolbar_origin = Some(default_toolbar_origin(state, overlay_region));
+}
+
+fn current_region_monitor(state: &OverlayState) -> Option<(String, Rect)> {
+    let region = state.document.capture_region?;
+    monitor_for_region(region)
+}
+
+fn active_region_rect(state: &OverlayState) -> Option<Rect> {
+    state
+        .document
+        .capture_region
+        .or_else(|| state.smart_region.as_ref().map(|candidate| candidate.rect))
+}
+
+fn monitor_for_region(region: Rect) -> Option<(String, Rect)> {
+    let monitor = unsafe { monitor_full_region_at(region.center()) }?;
+    Some((monitor_id(monitor), monitor))
+}
+
+fn update_locked_region_if_needed(state: &mut OverlayState) {
+    let Some(region) = state.document.capture_region else {
+        return;
+    };
+    let Some((monitor_id, monitor)) = current_region_monitor(state) else {
+        return;
+    };
+    if state.settings.is_region_locked(&monitor_id) {
+        state
+            .settings
+            .set_locked_region(monitor_id, monitor, region);
+    }
+}
+
+fn persist_locked_region_if_needed(state: &mut OverlayState) {
+    update_locked_region_if_needed(state);
+    save_settings(&state.settings);
+}
+
+fn toggle_region_lock(state: &mut OverlayState) {
+    let Some(region) = active_region_rect(state) else {
+        return;
+    };
+    let Some((monitor_id, monitor)) = monitor_for_region(region) else {
+        return;
+    };
+    if state.settings.is_region_locked(&monitor_id) {
+        state.settings.remove_locked_region(&monitor_id);
+    } else {
+        state
+            .settings
+            .set_locked_region(monitor_id, monitor, region);
+    }
+    save_settings(&state.settings);
+}
+
+fn handle_region_control_action(state: &mut OverlayState, action: RegionControlKind) {
+    match action {
+        RegionControlKind::Lock => toggle_region_lock(state),
+        RegionControlKind::Ratio => {
+            state.settings.aspect_ratio = state.settings.aspect_ratio.next();
+            if state.settings.aspect_ratio == AspectRatioMode::Custom {
+                state.ratio_placement_mode = false;
+                apply_custom_full_screen_region(state);
+            } else {
+                state.ratio_placement_mode = true;
+                apply_aspect_ratio_to_current_region(state);
+            }
+        }
+    }
+}
+
+fn apply_custom_full_screen_region(state: &mut OverlayState) {
+    let anchor = active_region_rect(state)
+        .map(|region| region.center())
+        .unwrap_or_else(|| state.overlay_to_screen(state.cursor_position));
+    let monitor = unsafe { monitor_full_region_at(anchor) }.unwrap_or(state.screen_bounds);
+    set_active_ratio_region(state, monitor);
+    state.pending_smart_region = None;
+    state.mark_static_dirty();
+}
+
+fn apply_aspect_ratio_to_current_region(state: &mut OverlayState) {
+    let Some(ratio) = state.settings.aspect_ratio.value() else {
+        return;
+    };
+    let Some(region) = active_region_rect(state) else {
+        return;
+    };
+    let bounds = monitor_full_region_for_rect(state, region).unwrap_or(state.screen_bounds);
+    let mut width = region.width.max(MIN_REGION_SIZE);
+    let mut height = width / ratio;
+    if height > bounds.height {
+        height = bounds.height;
+        width = height * ratio;
+    }
+    if width > bounds.width {
+        width = bounds.width;
+        height = width / ratio;
+    }
+    let center = region.center();
+    let x = (center.x - width / 2.0)
+        .max(bounds.x)
+        .min((bounds.right() - width).max(bounds.x));
+    let y = (center.y - height / 2.0)
+        .max(bounds.y)
+        .min((bounds.bottom() - height).max(bounds.y));
+    let next = Rect::new(x, y, width, height);
+    if state.document.capture_region.is_some() {
+        state.document.set_capture_region(next);
+        state.smart_region = Some(SmartRegionCandidate::new(
+            SmartRegionKind::Manual,
+            next,
+            1.0,
+            SmartRegionSource::Manual,
+            None,
+            None,
+        ));
+        state.toolbar_origin = Some(default_toolbar_origin(
+            state,
+            next.translate(-state.screen_bounds.x, -state.screen_bounds.y),
+        ));
+        update_locked_region_if_needed(state);
+    } else if let Some(candidate) = &mut state.smart_region {
+        candidate.rect = next;
+        candidate.id = smart_region_id(
+            candidate.kind,
+            candidate.rect,
+            candidate.source,
+            candidate.related_window_id.as_ref(),
+            candidate.monitor_id.as_deref(),
+        );
+        state.pending_smart_region = None;
+    } else if state.ratio_placement_mode {
+        set_ratio_smart_region(state, next);
+    }
+    state.mark_static_dirty();
+}
+
+fn set_active_ratio_region(state: &mut OverlayState, rect: Rect) {
+    if state.document.capture_region.is_some() {
+        state.document.set_capture_region(rect);
+        state.smart_region = Some(SmartRegionCandidate::new(
+            SmartRegionKind::Manual,
+            rect,
+            1.0,
+            SmartRegionSource::Manual,
+            None,
+            unsafe { monitor_full_region_at(rect.center()) }.map(monitor_id),
+        ));
+        state.pending_smart_region = None;
+        state.toolbar_origin = Some(default_toolbar_origin(
+            state,
+            rect.translate(-state.screen_bounds.x, -state.screen_bounds.y),
+        ));
+        update_locked_region_if_needed(state);
+        state.mark_static_dirty();
+    } else {
+        set_ratio_smart_region(state, rect);
+    }
+}
+
+fn set_ratio_smart_region(state: &mut OverlayState, rect: Rect) {
+    let monitor = unsafe { monitor_full_region_at(rect.center()) };
+    state.smart_region = Some(SmartRegionCandidate::new(
+        SmartRegionKind::Manual,
+        rect,
+        1.0,
+        SmartRegionSource::Manual,
+        None,
+        monitor.map(monitor_id),
+    ));
+    state.pending_smart_region = None;
+}
+
+fn position_ratio_region_at_cursor(state: &mut OverlayState, cursor: Point) {
+    let Some(ratio) = state.settings.aspect_ratio.value() else {
+        return;
+    };
+    let monitor = unsafe { monitor_full_region_at(cursor) }.unwrap_or(state.screen_bounds);
+    let base = active_region_rect(state)
+        .unwrap_or_else(|| default_ratio_rect_for_monitor(monitor, ratio).unwrap_or(monitor));
+    let width = base.width.min(monitor.width).max(MIN_REGION_SIZE);
+    let height = (width / ratio).min(monitor.height).max(MIN_REGION_SIZE);
+    let rect = clamp_region_to_bounds(
+        Rect::new(
+            cursor.x - width / 2.0,
+            cursor.y - height / 2.0,
+            width,
+            height,
+        ),
+        monitor,
+    );
+    set_active_ratio_region(state, rect);
+}
+
+fn default_ratio_rect_for_monitor(bounds: Rect, ratio: f32) -> Option<Rect> {
+    if ratio <= 0.0 || !bounds.is_visible() {
+        return None;
+    }
+    let mut width = bounds.width * 0.72;
+    let mut height = width / ratio;
+    if height > bounds.height * 0.72 {
+        height = bounds.height * 0.72;
+        width = height * ratio;
+    }
+    Some(Rect::new(
+        bounds.center().x - width / 2.0,
+        bounds.center().y - height / 2.0,
+        width.max(MIN_REGION_SIZE),
+        height.max(MIN_REGION_SIZE),
+    ))
+}
+
+fn clamp_region_to_bounds(region: Rect, bounds: Rect) -> Rect {
+    let width = region
+        .width
+        .min(bounds.width)
+        .max(MIN_REGION_SIZE.min(bounds.width));
+    let height = region
+        .height
+        .min(bounds.height)
+        .max(MIN_REGION_SIZE.min(bounds.height));
+    Rect::new(
+        region
+            .x
+            .max(bounds.x)
+            .min((bounds.right() - width).max(bounds.x)),
+        region
+            .y
+            .max(bounds.y)
+            .min((bounds.bottom() - height).max(bounds.y)),
+        width,
+        height,
+    )
+}
+
+fn handle_mouse_wheel(state: &mut OverlayState, delta: i16) -> bool {
+    if !state.ratio_placement_mode || state.settings.aspect_ratio == AspectRatioMode::Custom {
+        return false;
+    }
+    let Some(ratio) = state.settings.aspect_ratio.value() else {
+        return false;
+    };
+    let Some(region) = active_region_rect(state) else {
+        return false;
+    };
+    let monitor = unsafe { monitor_full_region_at(region.center()) }.unwrap_or(state.screen_bounds);
+    let scale = if delta >= 0 { 1.08 } else { 1.0 / 1.08 };
+    let mut width = (region.width * scale).clamp(MIN_REGION_SIZE, monitor.width);
+    let mut height = width / ratio;
+    if height > monitor.height {
+        height = monitor.height;
+        width = height * ratio;
+    }
+    let next = clamp_region_to_bounds(
+        Rect::new(
+            region.center().x - width / 2.0,
+            region.center().y - height / 2.0,
+            width,
+            height,
+        ),
+        monitor,
+    );
+    set_active_ratio_region(state, next);
+    true
+}
+
+fn monitor_full_region_for_rect(state: &OverlayState, region: Rect) -> Option<Rect> {
+    unsafe { monitor_full_region_at(region.center()) }.or_else(|| Some(state.screen_bounds))
+}
+
 unsafe extern "system" fn enum_detected_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let context = &mut *(lparam.0 as *mut WindowDetectionContext);
     if !is_app_root_window(hwnd) {
@@ -2454,6 +2913,17 @@ fn overlaps_with_tolerance(a: Rect, b: Rect, tolerance: f32) -> bool {
 }
 
 fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
+    let over_region_control_hud = state
+        .region_control_bounds
+        .is_some_and(|rect| rect.contains(point));
+    let hovered_region_control = state
+        .region_control_buttons
+        .iter()
+        .find(|button| button.rect.contains(point))
+        .map(|button| button.kind);
+    let region_control_hover_changed = state.hovered_region_control != hovered_region_control;
+    state.hovered_region_control = hovered_region_control;
+
     if let Some(DragState::AdjustingSubmenuSlider { slider }) = &state.drag {
         apply_submenu_slider_at(state, *slider, point);
         return true;
@@ -2461,8 +2931,8 @@ fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
 
     let screen_point = state.overlay_to_screen(point);
     match &mut state.drag {
-        Some(DragState::Selecting { current, .. }) => {
-            *current = point;
+        Some(DragState::Selecting { start, current }) => {
+            *current = constrained_selection_point(*start, point, state.settings.aspect_ratio);
             true
         }
         Some(DragState::MovingRegion { start, original }) => {
@@ -2471,6 +2941,7 @@ fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
             state
                 .document
                 .set_capture_region(original.translate(dx, dy));
+            update_locked_region_if_needed(state);
             state.mark_static_dirty();
             true
         }
@@ -2480,15 +2951,16 @@ fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
             state.toolbar_origin = Some(original.translate(dx, dy));
             true
         }
-        Some(DragState::ResizingRegion { handle }) => {
-            if let Some(region) = state.document.capture_region {
-                state.document.set_capture_region(region.resize_from_handle(
-                    *handle,
-                    screen_point,
-                    MIN_REGION_SIZE,
-                ));
-                state.mark_static_dirty();
-            }
+        Some(DragState::ResizingRegion { handle, original }) => {
+            let region = resize_region_with_aspect(
+                *original,
+                *handle,
+                screen_point,
+                state.settings.aspect_ratio,
+            );
+            state.document.set_capture_region(region);
+            update_locked_region_if_needed(state);
+            state.mark_static_dirty();
             true
         }
         Some(DragState::MovingAnnotation {
@@ -2534,12 +3006,20 @@ fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
         Some(DragState::AdjustingSubmenuSlider { .. }) => true,
         None => {
             update_cursor_for_hover(state, point);
+            if state.ratio_placement_mode && state.settings.aspect_ratio != AspectRatioMode::Custom
+            {
+                if over_region_control_hud {
+                    return region_control_hover_changed;
+                }
+                position_ratio_region_at_cursor(state, screen_point);
+                return true;
+            }
             if state.document.capture_region.is_none() {
                 let next = detect_smart_region_candidate(state, screen_point);
                 let _ = commit_smart_region_candidate(state, next);
                 return true;
             }
-            false
+            region_control_hover_changed
         }
     }
 }
@@ -2556,6 +3036,101 @@ fn constrained_drawing_point(tool: ToolKind, start: Point, current: Point) -> Po
     } else {
         current
     }
+}
+
+fn constrained_selection_point(start: Point, current: Point, mode: AspectRatioMode) -> Point {
+    let Some(ratio) = mode.value() else {
+        return current;
+    };
+    let dx = current.x - start.x;
+    let dy = current.y - start.y;
+    if dx.abs() < 1.0 && dy.abs() < 1.0 {
+        return current;
+    }
+    let width_from_x = dx.abs().max(MIN_REGION_SIZE);
+    let height_from_y = dy.abs().max(MIN_REGION_SIZE);
+    let width_if_height_locked = height_from_y * ratio;
+    let height_if_width_locked = width_from_x / ratio;
+    let (width, height) = if (width_if_height_locked - width_from_x).abs()
+        < (height_if_width_locked - height_from_y).abs()
+    {
+        (width_if_height_locked, height_from_y)
+    } else {
+        (width_from_x, height_if_width_locked)
+    };
+    Point::new(start.x + width.copysign(dx), start.y + height.copysign(dy))
+}
+
+fn resize_region_with_aspect(
+    original: Rect,
+    handle: ResizeHandle,
+    to: Point,
+    mode: AspectRatioMode,
+) -> Rect {
+    let Some(ratio) = mode.value() else {
+        return original.resize_from_handle(handle, to, MIN_REGION_SIZE);
+    };
+
+    let anchor = match handle {
+        ResizeHandle::NorthWest => Point::new(original.right(), original.bottom()),
+        ResizeHandle::North => Point::new(original.center().x, original.bottom()),
+        ResizeHandle::NorthEast => Point::new(original.x, original.bottom()),
+        ResizeHandle::East => Point::new(original.x, original.center().y),
+        ResizeHandle::SouthEast => Point::new(original.x, original.y),
+        ResizeHandle::South => Point::new(original.center().x, original.y),
+        ResizeHandle::SouthWest => Point::new(original.right(), original.y),
+        ResizeHandle::West => Point::new(original.right(), original.center().y),
+    };
+
+    let mut dx = to.x - anchor.x;
+    let mut dy = to.y - anchor.y;
+    match handle {
+        ResizeHandle::North | ResizeHandle::South => {
+            dy = if dy.abs() < MIN_REGION_SIZE {
+                MIN_REGION_SIZE.copysign(dy)
+            } else {
+                dy
+            };
+            dx = original
+                .width
+                .copysign(if matches!(handle, ResizeHandle::North) {
+                    original.x - anchor.x
+                } else {
+                    original.right() - anchor.x
+                });
+        }
+        ResizeHandle::East | ResizeHandle::West => {
+            dx = if dx.abs() < MIN_REGION_SIZE {
+                MIN_REGION_SIZE.copysign(dx)
+            } else {
+                dx
+            };
+            dy = original
+                .height
+                .copysign(if matches!(handle, ResizeHandle::West) {
+                    original.y - anchor.y
+                } else {
+                    original.bottom() - anchor.y
+                });
+        }
+        _ => {}
+    }
+
+    let width = dx.abs().max(MIN_REGION_SIZE);
+    let height = dy.abs().max(MIN_REGION_SIZE);
+    let height_from_width = width / ratio;
+    let width_from_height = height * ratio;
+    let (width, height) = if (height_from_width - height).abs() <= (width_from_height - width).abs()
+    {
+        (width, height_from_width)
+    } else {
+        (width_from_height, height)
+    };
+    let corner = Point::new(
+        anchor.x + width.copysign(dx),
+        anchor.y + height.copysign(dy),
+    );
+    Rect::from_points(anchor, corner)
 }
 
 fn submenu_geometry(state: &OverlayState) -> Option<(ToolKind, Rect, Rect)> {
@@ -2589,6 +3164,13 @@ fn update_cursor_for_hover(state: &OverlayState, point: Point) {
                 .submenu_sliders
                 .iter()
                 .any(|slider| slider.rect.contains(point))
+            || state
+                .region_control_buttons
+                .iter()
+                .any(|button| button.rect.contains(point))
+            || state
+                .region_control_bounds
+                .is_some_and(|rect| rect.contains(point))
         {
             IDC_ARROW
         } else if state
@@ -2604,7 +3186,7 @@ fn update_cursor_for_hover(state: &OverlayState, point: Point) {
         {
             IDC_ARROW
         } else if let Some(region) = state.region_overlay() {
-            if let Some(handle) = region.hit_resize_handle(point, HANDLE_RADIUS + 4.0) {
+            if let Some(handle) = region.hit_resize_handle(point, REGION_RESIZE_HIT_RADIUS) {
                 cursor_for_resize_handle(handle)
             } else if region_frame_contains(region, point) {
                 IDC_SIZEALL
@@ -2665,16 +3247,14 @@ fn hit_annotation_edit_handle(
                 None
             }
         }
-        AnnotationKind::Tag { anchor, .. } => {
-            if near_point(screen_point, *anchor, HANDLE_RADIUS + 6.0) {
-                Some(AnnotationEdit::TagAnchor)
-            } else {
-                annotation
-                    .bounds
-                    .hit_resize_handle(screen_point, HANDLE_RADIUS + 4.0)
-                    .map(AnnotationEdit::BoxResize)
-            }
-        }
+        AnnotationKind::Tag { anchor, .. } => annotation
+            .bounds
+            .hit_resize_handle(screen_point, HANDLE_RADIUS + 10.0)
+            .map(AnnotationEdit::BoxResize)
+            .or_else(|| {
+                near_point(screen_point, *anchor, HANDLE_RADIUS + 8.0)
+                    .then_some(AnnotationEdit::TagAnchor)
+            }),
         AnnotationKind::Pen { .. } | AnnotationKind::PenArrow { .. } => None,
         _ => annotation
             .bounds
@@ -2808,9 +3388,10 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
                 ));
             }
         }
-        DragState::MovingRegion { .. }
-        | DragState::MovingToolbar { .. }
-        | DragState::ResizingRegion { .. }
+        DragState::MovingRegion { .. } | DragState::ResizingRegion { .. } => {
+            persist_locked_region_if_needed(state);
+        }
+        DragState::MovingToolbar { .. }
         | DragState::MovingAnnotation { .. }
         | DragState::EditingAnnotation { .. }
         | DragState::AdjustingSubmenuSlider { .. } => {}
@@ -2950,7 +3531,11 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
             }
         }
         0x53 if ctrl_down => {
-            let _ = unsafe { save_capture_to_file(state) };
+            if unsafe { save_capture_to_file(state) }.is_ok() {
+                unsafe {
+                    let _ = DestroyWindow(state.hwnd);
+                }
+            }
         }
         0x2E => {
             state.checkpoint();
@@ -3288,7 +3873,11 @@ fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
         }
         ToolbarAction::Save => {
             state.active_submenu = None;
-            let _ = unsafe { save_capture_to_file(state) };
+            if unsafe { save_capture_to_file(state) }.is_ok() {
+                unsafe {
+                    let _ = DestroyWindow(state.hwnd);
+                }
+            }
         }
         ToolbarAction::Cancel => unsafe {
             let _ = DestroyWindow(state.hwnd);
@@ -3371,6 +3960,13 @@ fn finish_text_editing(state: &mut OverlayState) {
     state.editing_watermark_text = false;
     state.editing_step_number_id = None;
     state.editing_step_number_replace = false;
+}
+
+fn should_remove_empty_text_annotation(state: &OverlayState, id: AnnotationId) -> bool {
+    state
+        .document
+        .annotation(id)
+        .is_some_and(|annotation| matches!(annotation.kind, AnnotationKind::Text { .. }))
 }
 
 fn handle_numbering_mode(state: &mut OverlayState, mode: &str) {
@@ -3673,6 +4269,19 @@ fn tag_bounds_from_drag(state: &OverlayState, anchor: Point, release: Point) -> 
     } else {
         let dx = release.x - anchor.x;
         let dy = release.y - anchor.y;
+        if dx.abs() > width * 0.22 && dy.abs() > height * 0.35 {
+            let x = if dx >= 0.0 {
+                release.x
+            } else {
+                release.x - width
+            };
+            let y = if dy >= 0.0 {
+                release.y
+            } else {
+                release.y - height
+            };
+            return Rect::new(x, y, width, height);
+        }
         if dx.abs() >= dy.abs() {
             let x = if dx >= 0.0 {
                 release.x
@@ -3796,6 +4405,7 @@ unsafe fn paint_static_capture_surface(hdc: HDC, state: &OverlayState, include_w
         return;
     };
     draw_dim_outside_region(hdc, state.screen_bounds, region);
+    draw_region_control_backdrop(hdc, state, region);
     draw_handles(hdc, region);
     if web_ui_owns_pointer_input(state) {
         draw_native_backed_annotations(hdc, state);
@@ -3813,12 +4423,18 @@ unsafe fn paint_static_capture_surface(hdc: HDC, state: &OverlayState, include_w
 }
 
 unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
+    state.region_control_buttons.clear();
+    state.region_control_bounds = None;
     paint_background(hdc, state);
 
     if let Some(region) = state.region_overlay() {
         draw_dim_outside_region(hdc, state.screen_bounds, region);
+        draw_region_control_backdrop(hdc, state, region);
         draw_region_gradient_border(hdc, state, region);
         draw_handles(hdc, region);
+        if !region_control_chrome_hidden(state) {
+            draw_region_controls(hdc, state, region);
+        }
         if web_ui_owns_pointer_input(state) {
             draw_native_backed_annotations(hdc, state);
         } else {
@@ -3833,6 +4449,7 @@ unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
         draw_region_gradient_border(hdc, state, region);
         if !web_ui_owns_pointer_input(state) {
             draw_sniper_cursor(hdc, current);
+            draw_pixel_magnifier(hdc, state, current);
         }
     } else if let Some(region) = state.smart_region.as_ref().map(|candidate| {
         candidate
@@ -3840,12 +4457,18 @@ unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
             .translate(-state.screen_bounds.x, -state.screen_bounds.y)
     }) {
         draw_dim_outside_region(hdc, state.screen_bounds, region);
+        draw_region_control_backdrop(hdc, state, region);
         draw_region_gradient_border(hdc, state, region);
+        if !region_control_chrome_hidden(state) {
+            draw_region_controls(hdc, state, region);
+        }
         if !web_ui_owns_pointer_input(state) {
             draw_sniper_cursor(hdc, state.cursor_position);
+            draw_pixel_magnifier(hdc, state, state.cursor_position);
         }
     } else if !web_ui_owns_pointer_input(state) {
         draw_sniper_cursor(hdc, state.cursor_position);
+        draw_pixel_magnifier(hdc, state, state.cursor_position);
     }
 }
 
@@ -3886,6 +4509,66 @@ unsafe fn draw_sniper_cursor(hdc: HDC, point: Point) {
     }
 }
 
+unsafe fn draw_pixel_magnifier(hdc: HDC, state: &OverlayState, point: Point) {
+    let size = scaled(state, MAGNIFIER_SIZE);
+    let sample = scaled(state, MAGNIFIER_SAMPLE_SIZE).round().max(8.0);
+    let margin = scaled(state, 18.0);
+    let offset = scaled(state, 28.0);
+    let mut x = point.x + offset;
+    let mut y = point.y + offset;
+    if x + size + margin > state.screen_bounds.width {
+        x = point.x - offset - size;
+    }
+    if y + size + margin > state.screen_bounds.height {
+        y = point.y - offset - size;
+    }
+    x = x
+        .max(margin)
+        .min((state.screen_bounds.width - size - margin).max(margin));
+    y = y
+        .max(margin)
+        .min((state.screen_bounds.height - size - margin).max(margin));
+    let dest = Rect::new(x, y, size, size);
+
+    let source_dc = CreateCompatibleDC(hdc);
+    let old = SelectObject(source_dc, state.background_bitmap);
+    let source_x = (point.x - sample / 2.0)
+        .max(0.0)
+        .min((state.screen_bounds.width - sample).max(0.0))
+        .round() as i32;
+    let source_y = (point.y - sample / 2.0)
+        .max(0.0)
+        .min((state.screen_bounds.height - sample).max(0.0))
+        .round() as i32;
+    let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+    let _ = StretchBlt(
+        hdc,
+        dest.x.round() as i32,
+        dest.y.round() as i32,
+        dest.width.round() as i32,
+        dest.height.round() as i32,
+        source_dc,
+        source_x,
+        source_y,
+        sample.round() as i32,
+        sample.round() as i32,
+        SRCCOPY,
+    );
+    let _ = SelectObject(source_dc, old);
+    let _ = DeleteDC(source_dc);
+
+    alpha_fill_rect(hdc, dest, Color::BLACK, 34);
+    let _pen = SelectedPen::new(hdc, 2.0, Color::rgb(0xff, 0x3b, 0x30));
+    let _brush = SelectedStockObject::null_brush(hdc);
+    let r = rect_to_rect(dest);
+    let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+    let center = dest.center();
+    let _ = MoveToEx(hdc, dest.x.round() as i32, center.y.round() as i32, None);
+    let _ = LineTo(hdc, dest.right().round() as i32, center.y.round() as i32);
+    let _ = MoveToEx(hdc, center.x.round() as i32, dest.y.round() as i32, None);
+    let _ = LineTo(hdc, center.x.round() as i32, dest.bottom().round() as i32);
+}
+
 unsafe fn draw_dim_outside_region(hdc: HDC, screen_bounds: Rect, region: Rect) {
     let full = Rect::new(0.0, 0.0, screen_bounds.width, screen_bounds.height);
     for rect in [
@@ -3905,8 +4588,35 @@ unsafe fn draw_dim_outside_region(hdc: HDC, screen_bounds: Rect, region: Rect) {
         ),
     ] {
         if rect.is_visible() {
-            alpha_fill_rect(hdc, rect, Color::BLACK, 85);
+            alpha_fill_rect(hdc, rect, Color::BLACK, 153);
         }
+    }
+}
+
+unsafe fn draw_region_control_backdrop(hdc: HDC, state: &OverlayState, region: Rect) {
+    if region_control_chrome_hidden(state) {
+        return;
+    }
+    let height = scaled(state, 55.0).min(region.height.max(0.0));
+    if height <= 0.0 {
+        return;
+    }
+    let steps = 18;
+    for step in 0..steps {
+        let t0 = step as f32 / steps as f32;
+        let t1 = (step + 1) as f32 / steps as f32;
+        let alpha = (0.85 * 255.0 * (1.0 - t0).powf(1.65)).round() as u8;
+        if alpha == 0 {
+            continue;
+        }
+        let y = region.y + height * t0;
+        let h = (height * (t1 - t0)).ceil().max(1.0);
+        alpha_fill_rect(
+            hdc,
+            Rect::new(region.x, y, region.width, h),
+            Color::BLACK,
+            alpha,
+        );
     }
 }
 
@@ -4159,7 +4869,8 @@ unsafe fn paint_background(hdc: HDC, state: &OverlayState) {
 }
 
 unsafe fn draw_handles(hdc: HDC, region: Rect) {
-    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00ffffff));
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00303bff));
+    let radius = HANDLE_RADIUS * 0.5;
     let points = [
         Point::new(region.x, region.y),
         Point::new(region.center().x, region.y),
@@ -4172,14 +4883,105 @@ unsafe fn draw_handles(hdc: HDC, region: Rect) {
     ];
     for point in points {
         let handle = Rect::new(
-            point.x - HANDLE_RADIUS,
-            point.y - HANDLE_RADIUS,
-            HANDLE_RADIUS * 2.0,
-            HANDLE_RADIUS * 2.0,
+            point.x - radius,
+            point.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        );
+        alpha_fill_rect(
+            hdc,
+            expand_rect(handle, 2.0),
+            Color::rgb(0xff, 0x3b, 0x30),
+            42,
         );
         FillRect(hdc, &rect_to_rect(handle), brush);
     }
     let _ = DeleteObject(brush);
+}
+
+unsafe fn draw_region_controls(hdc: HDC, state: &mut OverlayState, region: Rect) {
+    let lock_icon = scaled(state, REGION_CONTROL_ICON_SIZE * 1.1);
+    let ratio_icon = scaled(state, REGION_CONTROL_ICON_SIZE * 1.2);
+    let icon = lock_icon.max(ratio_icon);
+    let gap = scaled(state, REGION_CONTROL_GAP);
+    let margin = scaled(state, REGION_CONTROL_MARGIN);
+    let divider_height = scaled(state, REGION_CONTROL_DIVIDER_HEIGHT);
+    let top = (region.y + margin).clamp(
+        margin,
+        (state.screen_bounds.height - icon - margin).max(margin),
+    );
+    let controls_width = lock_icon + ratio_icon + gap * 2.0;
+    let left = (region.center().x - controls_width / 2.0)
+        .max(margin)
+        .min((state.screen_bounds.width - controls_width - margin).max(margin));
+    let lock_rect = Rect::new(left, top + (icon - lock_icon) / 2.0, lock_icon, lock_icon);
+    let divider = Rect::new(
+        lock_rect.right() + gap * 0.85,
+        top + (icon - divider_height) / 2.0,
+        scaled(state, 2.0),
+        divider_height,
+    );
+    let ratio_rect = Rect::new(divider.right() + gap * 0.85, top, ratio_icon, ratio_icon);
+    state.region_control_bounds = Some(Rect::new(
+        left - scaled(state, 8.0),
+        top - scaled(state, 6.0),
+        controls_width + scaled(state, 16.0),
+        icon + scaled(state, 12.0),
+    ));
+
+    let lock_active =
+        monitor_for_region(region.translate(state.screen_bounds.x, state.screen_bounds.y))
+            .map(|(monitor_id, _)| state.settings.is_region_locked(&monitor_id))
+            .unwrap_or(false);
+    let lock_svg = if lock_active {
+        include_str!("../assets/region-controls/locked.svg")
+    } else {
+        include_str!("../assets/region-controls/unlocked.svg")
+    };
+    let ratio_svg = ratio_svg(state.settings.aspect_ratio);
+
+    draw_region_control_icon(hdc, state, lock_rect, lock_svg, RegionControlKind::Lock);
+    alpha_fill_rect(hdc, divider, Color::WHITE, 166);
+    draw_region_control_icon(hdc, state, ratio_rect, ratio_svg, RegionControlKind::Ratio);
+
+    state.region_control_buttons.push(RegionControlButton {
+        rect: lock_rect,
+        kind: RegionControlKind::Lock,
+    });
+    state.region_control_buttons.push(RegionControlButton {
+        rect: ratio_rect,
+        kind: RegionControlKind::Ratio,
+    });
+}
+
+unsafe fn draw_region_control_icon(
+    hdc: HDC,
+    state: &OverlayState,
+    rect: Rect,
+    svg: &str,
+    kind: RegionControlKind,
+) {
+    let hovered = state.hovered_region_control == Some(kind);
+    let color = if hovered {
+        Color::rgb(0xff, 0x3b, 0x30)
+    } else {
+        Color::WHITE
+    };
+    let mut svg = recolor_svg(svg, color);
+    if !hovered {
+        svg = svg.replacen("<svg ", "<svg opacity=\"0.9\" ", 1);
+    }
+    let _ = draw_svg(hdc, &svg, rect);
+}
+
+fn ratio_svg(mode: AspectRatioMode) -> &'static str {
+    match mode {
+        AspectRatioMode::Custom => include_str!("../assets/region-controls/ratio-custom.svg"),
+        AspectRatioMode::Ratio9x16 => include_str!("../assets/region-controls/ratio-9x16.svg"),
+        AspectRatioMode::Ratio16x9 => include_str!("../assets/region-controls/ratio-16x9.svg"),
+        AspectRatioMode::Ratio1x1 => include_str!("../assets/region-controls/ratio-1x1.svg"),
+        AspectRatioMode::Ratio4x5 => include_str!("../assets/region-controls/ratio-4x5.svg"),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4529,45 +5331,27 @@ unsafe fn draw_toolbar(hdc: HDC, state: &mut OverlayState, region: Rect) {
 fn default_toolbar_origin(state: &OverlayState, region: Rect) -> Point {
     let width = toolbar_width(state);
     let height = scaled(state, TOOLBAR_HEIGHT);
-    let x = region
-        .x
-        .max(8.0)
-        .min((state.screen_bounds.width - width - 8.0).max(8.0));
-    let y = if region.y > height + 16.0 {
-        region.y - height - 8.0
+    let margin = scaled(state, 18.0);
+    let submenu_clearance = scaled(state, SUBMENU_HEIGHT + 34.0);
+    let x = (region.center().x - width / 2.0)
+        .max(margin)
+        .min((state.screen_bounds.width - width - margin).max(margin));
+    let lowest_with_options_visible =
+        (state.screen_bounds.height - height - submenu_clearance - margin).max(margin);
+    let preferred_y = if region.height > height + margin * 2.0 {
+        region.bottom() - height - margin
+    } else if region.bottom() + height + margin <= state.screen_bounds.height {
+        region.bottom() + margin
     } else {
-        region.bottom() + 8.0
+        (region.y - height - margin).max(margin)
     };
+    let y = preferred_y.min(lowest_with_options_visible).max(margin);
     Point::new(x, y)
 }
 
-fn toolbar_origin_near_point(state: &OverlayState, click: Point, screen_region: Rect) -> Point {
-    let width = toolbar_width(state);
-    let height = scaled(state, TOOLBAR_HEIGHT);
-    let margin = scaled(state, 12.0);
+fn toolbar_origin_near_point(state: &OverlayState, _click: Point, screen_region: Rect) -> Point {
     let region = screen_region.translate(-state.screen_bounds.x, -state.screen_bounds.y);
-    if click.y <= region.y + scaled(state, 96.0) {
-        let x = (region.x + region.width / 2.0 - width / 2.0)
-            .max(margin)
-            .min((state.screen_bounds.width - width - margin).max(margin));
-        let y = (region.y + region.height * 0.64)
-            .max(margin)
-            .min((state.screen_bounds.height - height - margin).max(margin));
-        return Point::new(x, y);
-    }
-    let x = (click.x - width / 2.0)
-        .max(margin)
-        .min((state.screen_bounds.width - width - margin).max(margin));
-    let preferred_below = click.y + margin;
-    let preferred_above = click.y - height - margin;
-    let y = if preferred_below + height <= state.screen_bounds.height - margin {
-        preferred_below
-    } else if preferred_above >= margin {
-        preferred_above
-    } else {
-        default_toolbar_origin(state, region).y
-    };
-    Point::new(x, y)
+    default_toolbar_origin(state, region)
 }
 
 fn color_distance(a: Color, b: Color) -> u16 {
@@ -6365,10 +7149,11 @@ unsafe fn draw_tag_annotation(
     frame_color: Color,
     font_size: f32,
     frame_width: f32,
+    style: RenderStyle,
 ) {
     let frame = tag_frame_for_width(frame_width);
-    let pointer_frame = TAG_FRAME;
-    let radius = TAG_RADIUS;
+    let pointer_frame = style.tag_frame;
+    let radius = style.tag_radius;
     draw_tag_outer_shape(
         hdc,
         bounds,
@@ -6534,7 +7319,7 @@ fn tag_pointer_geometry(
     let horizontal_half =
         (frame * 0.77).clamp(6.0, ((bounds.width - r * 2.0) / 2.0 - 1.0).max(6.0));
     let vertical_half = (frame * 0.77).clamp(6.0, ((bounds.height - r * 2.0) / 2.0 - 1.0).max(6.0));
-    let overlap = (frame * 0.70).max(4.0);
+    let overlap = (frame * 1.08).max(6.0);
     let round = frame * 0.72;
     match edge {
         0 => {
@@ -7467,13 +8252,8 @@ unsafe fn draw_drag_preview(hdc: HDC, state: &OverlayState) {
         state.active_tool,
         ToolKind::Rectangle | ToolKind::Oval | ToolKind::Line | ToolKind::Arrow
     ) {
-        draw_fast_geometry_preview(
-            hdc,
-            state.active_tool,
-            state.screen_to_overlay(*start),
-            state.screen_to_overlay(*current),
-            state.current_stroke,
-        );
+        let annotation = annotation_from_tool(state, *start, *current, points.clone());
+        draw_annotation(hdc, state, &annotation);
         return;
     }
 
@@ -7491,38 +8271,6 @@ unsafe fn draw_drag_preview(hdc: HDC, state: &OverlayState) {
             .bounds
             .translate(-state.screen_bounds.x, -state.screen_bounds.y);
         draw_dotted_rect(hdc, bounds);
-    }
-}
-
-unsafe fn draw_fast_geometry_preview(
-    hdc: HDC,
-    tool: ToolKind,
-    start: Point,
-    current: Point,
-    stroke: StrokeStyle,
-) {
-    let _pen = SelectedPen::new(hdc, stroke.width, stroke.color);
-    let _brush = SelectedStockObject::null_brush(hdc);
-    match tool {
-        ToolKind::Rectangle => {
-            let rect = rect_to_rect(Rect::from_points(start, current));
-            let _ = Rectangle(hdc, rect.left, rect.top, rect.right, rect.bottom);
-        }
-        ToolKind::Oval => {
-            let rect = rect_to_rect(Rect::from_points(start, current));
-            let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
-        }
-        ToolKind::Line => {
-            let _ = MoveToEx(hdc, start.x.round() as i32, start.y.round() as i32, None);
-            let _ = LineTo(hdc, current.x.round() as i32, current.y.round() as i32);
-        }
-        ToolKind::Arrow => {
-            let shaft_end = arrow_shaft_end(start, current, stroke);
-            let _ = MoveToEx(hdc, start.x.round() as i32, start.y.round() as i32, None);
-            let _ = LineTo(hdc, shaft_end.x.round() as i32, shaft_end.y.round() as i32);
-            draw_arrow_tip(hdc, start, current, stroke);
-        }
-        _ => {}
     }
 }
 
@@ -7617,6 +8365,7 @@ unsafe fn draw_annotation_in_space(
                 annotation.stroke.color,
                 *font_size,
                 annotation.stroke.width,
+                style,
             );
         }
         AnnotationKind::Mosaic { .. } => {
@@ -7776,6 +8525,7 @@ unsafe fn copy_capture_to_clipboard(state: &OverlayState) -> Result<()> {
     EmptyClipboard()?;
     SetClipboardData(CF_BITMAP_FORMAT, HANDLE(bitmap.0))?;
     CloseClipboard()?;
+    auto_save_capture_if_enabled(state);
     Ok(())
 }
 
@@ -7793,6 +8543,48 @@ unsafe fn save_capture_to_file(state: &OverlayState) -> Result<()> {
     }
     let _ = DeleteObject(bitmap);
     Ok(())
+}
+
+unsafe fn auto_save_capture_if_enabled(state: &OverlayState) {
+    if !state.settings.auto_save.enabled {
+        return;
+    }
+    let Some(region) = state.document.capture_region else {
+        return;
+    };
+    let Some(bitmap) = render_capture_bitmap(state) else {
+        return;
+    };
+    let path = next_auto_save_path(&state.settings.auto_save.folder);
+    let _ = write_png_file(bitmap, region, &path);
+    let _ = DeleteObject(bitmap);
+}
+
+fn next_auto_save_path(folder: &PathBuf) -> PathBuf {
+    let _ = fs::create_dir_all(folder);
+    let stamp = local_timestamp();
+    for index in 0..1000 {
+        let filename = if index == 0 {
+            format!("ScreenCapn-{stamp}.png")
+        } else {
+            format!("ScreenCapn-{stamp}-{index}.png")
+        };
+        let path = folder.join(filename);
+        if !path.exists() {
+            return path;
+        }
+    }
+    folder.join(format!("ScreenCapn-{stamp}-overflow.png"))
+}
+
+fn local_timestamp() -> String {
+    unsafe {
+        let local = GetLocalTime();
+        format!(
+            "{:04}-{:02}-{:02}-{:02}{:02}{:02}",
+            local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond
+        )
+    }
 }
 
 unsafe fn render_capture_bitmap(state: &OverlayState) -> Option<HBITMAP> {
@@ -7981,13 +8773,13 @@ fn default_save_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
         .join("Pictures")
-        .join("ScreenCaptn");
+        .join("Screen Cap'n");
     let _ = fs::create_dir_all(&dir);
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    dir.join(format!("screencaptn-{seconds}.png"))
+    dir.join(format!("ScreenCapn-{seconds}.png"))
 }
 
 fn wide_null(value: &str) -> Vec<u16> {

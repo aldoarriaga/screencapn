@@ -231,7 +231,14 @@ fn icons_json() -> String {
         "smallerFont": include_str!("../assets/toolbar/smaller-font.svg"),
         "largerFont": include_str!("../assets/toolbar/larger-font.svg"),
         "restartNumbering": include_str!("../assets/toolbar/restart-numbering.svg"),
-        "continueNumbering": include_str!("../assets/toolbar/continue-numbering.svg")
+        "continueNumbering": include_str!("../assets/toolbar/continue-numbering.svg"),
+        "regionLocked": include_str!("../assets/region-controls/locked.svg"),
+        "regionUnlocked": include_str!("../assets/region-controls/unlocked.svg"),
+        "ratioCustom": include_str!("../assets/region-controls/ratio-custom.svg"),
+        "ratio9x16": include_str!("../assets/region-controls/ratio-9x16.svg"),
+        "ratio16x9": include_str!("../assets/region-controls/ratio-16x9.svg"),
+        "ratio1x1": include_str!("../assets/region-controls/ratio-1x1.svg"),
+        "ratio4x5": include_str!("../assets/region-controls/ratio-4x5.svg")
     })
     .to_string()
 }

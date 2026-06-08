@@ -51,6 +51,7 @@
   let state = null;
   let preview = null;
   let toolbarDrag = null;
+  let regionResizeDrag = false;
   let toggleTween = null;
   let toolbarWasVisible = false;
   let toolbarAppearTweens = [];
@@ -245,6 +246,9 @@
   function currentFontSize() {
     const selected = selectedAnnotation();
     const kind = selected && selected.kind;
+    if (state && state.activeSubmenu === "watermark") {
+      return state.fontSize || 27;
+    }
     if ((kind && kind.type === "text") || (kind && kind.type === "tag")) {
       return kind.fontSize || state.fontSize || 27;
     }
@@ -257,7 +261,7 @@
     }
     const tool = state.activeSubmenu;
     if (slider.kind === "font") {
-      return tool === "text" || tool === "tag";
+      return tool === "text" || tool === "tag" || tool === "watermark";
     }
     return ["rectangle", "oval", "line", "arrow", "pen", "highlighter", "tag"].includes(tool);
   }
@@ -270,7 +274,7 @@
       return null;
     }
     const tool = state.activeSubmenu;
-    if (tool === "text" || tool === "tag") {
+    if (tool === "text" || tool === "tag" || tool === "watermark") {
       return { kind: "font", min: 27, max: 56 };
     }
     if (["rectangle", "oval", "line", "arrow", "pen", "highlighter"].includes(tool)) {
@@ -392,7 +396,7 @@
   }
 
   function physicalStrokeWidth(width) {
-    return Math.max(1, width || 1);
+    return Math.max(1, physicalScalar(width || 1));
   }
 
   function strokeColor(annotation) {
@@ -711,7 +715,9 @@
       activeSubmenu: value.activeSubmenu,
       theme: value.theme,
       uiScale: value.uiScale,
+      captureRegion: value.captureRegion,
       toolbar: value.toolbar,
+      regionControls: value.regionControls,
       currentStroke: value.currentStroke,
       fontSize: value.fontSize,
       penMode: value.penMode,
@@ -1059,7 +1065,7 @@
     const framed = kind.type === "text" && !!kind.framed;
     const color = strokeColor(annotation);
     const filled = kind.type === "text" && !!kind.filled;
-    const textColor = filled ? contrastTextColor(color) : color;
+    const textColor = kind.type === "tag" ? "#000000" : filled ? contrastTextColor(color) : color;
     root.style.display = "block";
     root.style.left = `${metrics.originX}px`;
     root.style.top = `${metrics.originY}px`;
@@ -1278,6 +1284,9 @@
       colorSwatchHotzones = [];
       stopToolbarAppearTweens();
       uiLayer.destroyChildren();
+      drawRegionControlBackdrop();
+      drawRegionControls();
+      drawRegionResizeHandles();
       drawToolbar(rect, animateToolbar);
       drawSubmenu(rect, animateToolbar);
       uiLayer.batchDraw();
@@ -1400,6 +1409,233 @@
         updateDefaultCursor();
       });
       x += w;
+    }
+  }
+
+  function drawRegionControls() {
+    if (!state || !state.captureRegion || regionControlChromeHidden()) {
+      return;
+    }
+    const region = physicalToCssRect(state.captureRegion);
+    const s = scale();
+    const lockIconSize = 16 * s * 1.1;
+    const ratioIconSize = lockIconSize * 1.2;
+    const iconSize = Math.max(lockIconSize, ratioIconSize);
+    const margin = 18 * s;
+    const gap = 11 * s;
+    const dividerHeight = 22 * s;
+    const controlsWidth = lockIconSize + ratioIconSize + gap * 2;
+    const left = Math.max(6 * s, Math.min(region.x + region.width / 2 - controlsWidth / 2, window.innerWidth - controlsWidth - 6 * s));
+    const top = Math.max(8 * s, Math.min(region.y + margin, window.innerHeight - iconSize - 8 * s));
+    const lockName = state.regionControls && state.regionControls.locked ? "regionLocked" : "regionUnlocked";
+    const ratioName = ratioIconName(state.regionControls && state.regionControls.aspectRatio);
+    const normal = "#FFFFFF";
+    const hover = "#FF3B30";
+    const group = new Konva.Group({ x: left, y: top, name: "ui" });
+    uiLayer.add(group);
+    group.add(new Konva.Rect({
+      x: -8 * s,
+      y: -6 * s,
+      width: controlsWidth + 16 * s,
+      height: iconSize + 12 * s,
+      fill: "rgba(0,0,0,0)",
+      name: "ui",
+    }));
+
+    drawRegionControlButton(group, 0, (iconSize - lockIconSize) / 2, lockIconSize, lockName, normal, hover, () => {
+      state = {
+        ...state,
+        regionControls: {
+          ...(state.regionControls || {}),
+          locked: !(state.regionControls && state.regionControls.locked),
+        },
+      };
+      command("toggleRegionLock");
+      scheduleRender(state, { ui: true });
+    });
+
+    const dividerX = lockIconSize + gap;
+    group.add(new Konva.Line({
+      points: [dividerX, (iconSize - dividerHeight) / 2, dividerX, (iconSize + dividerHeight) / 2],
+      stroke: normal,
+      opacity: 0.65,
+      strokeWidth: Math.max(2, 2 * s),
+      lineCap: "round",
+      listening: false,
+      name: "ui",
+    }));
+
+    drawRegionControlButton(group, dividerX + gap, 0, ratioIconSize, ratioName, normal, hover, () => {
+      const current = state.regionControls && state.regionControls.aspectRatio;
+      state = {
+        ...state,
+        regionControls: {
+          ...(state.regionControls || {}),
+          aspectRatio: nextAspectRatio(current),
+        },
+      };
+      command("cycleAspectRatio");
+      scheduleRender(state, { ui: true });
+    });
+  }
+
+  function drawRegionControlButton(group, x, y, size, icon, normalColor, hoverColor, onClick) {
+    const button = new Konva.Group({ x, y, name: "ui" });
+    group.add(button);
+    button.add(new Konva.Rect({ x: -5, y: -5, width: size + 10, height: size + 10, fill: "rgba(0,0,0,0)", name: "ui" }));
+    const normalIcon = drawIcon(button, icon, 0, 0, size, normalColor, 0.9);
+    const hoverIcon = drawIcon(button, icon, 0, 0, size, hoverColor, 0);
+    if (hoverIcon) {
+      hoverIcon.shadowColor(hoverColor);
+      hoverIcon.shadowBlur(14 * scale());
+      hoverIcon.shadowOpacity(0.85);
+      hoverIcon.shadowForStrokeEnabled(false);
+    }
+    let tween = null;
+    const setHover = (hovered) => {
+      if (tween) {
+        tween.destroy();
+      }
+      if (!normalIcon || !hoverIcon) {
+        return;
+      }
+      tween = new Konva.Tween({
+        node: hoverIcon,
+        duration: 0.12,
+        easing: Konva.Easings.EaseInOut,
+        opacity: hovered ? 1 : 0,
+      });
+      tween.play();
+      normalIcon.opacity(hovered ? 0 : 0.9);
+      uiLayer.batchDraw();
+    };
+    button.on("mouseenter", () => {
+      container.style.cursor = "pointer";
+      setHover(true);
+    });
+    button.on("mouseleave", () => {
+      updateDefaultCursor();
+      setHover(false);
+    });
+    button.on("click tap", (evt) => {
+      evt.cancelBubble = true;
+      onClick();
+    });
+  }
+
+  function drawRegionControlBackdrop() {
+    return;
+  }
+
+  function drawRegionResizeHandles() {
+    if (!state || !state.captureRegion) {
+      return;
+    }
+    const region = physicalToCssRect(state.captureRegion);
+    const s = scale();
+    const size = Math.max(5, 4.5 * s);
+    const half = size / 2;
+    const hitPad = 13 * s;
+    const handles = [
+      { key: "nw", cursor: "nwse-resize", x: region.x, y: region.y },
+      { key: "n", cursor: "ns-resize", x: region.x + region.width / 2, y: region.y },
+      { key: "ne", cursor: "nesw-resize", x: region.x + region.width, y: region.y },
+      { key: "e", cursor: "ew-resize", x: region.x + region.width, y: region.y + region.height / 2 },
+      { key: "se", cursor: "nwse-resize", x: region.x + region.width, y: region.y + region.height },
+      { key: "s", cursor: "ns-resize", x: region.x + region.width / 2, y: region.y + region.height },
+      { key: "sw", cursor: "nesw-resize", x: region.x, y: region.y + region.height },
+      { key: "w", cursor: "ew-resize", x: region.x, y: region.y + region.height / 2 },
+    ];
+    handles.forEach((handle) => {
+      const x = Math.max(half, Math.min(window.innerWidth - half, handle.x));
+      const y = Math.max(half, Math.min(window.innerHeight - half, handle.y));
+      const group = new Konva.Group({ x: x - half, y: y - half, name: "ui" });
+      uiLayer.add(group);
+      group.add(new Konva.Rect({
+        x: -hitPad,
+        y: -hitPad,
+        width: size + hitPad * 2,
+        height: size + hitPad * 2,
+        fill: "rgba(0,0,0,0)",
+        name: "ui",
+      }));
+      group.add(new Konva.Rect({
+        x: 0,
+        y: 0,
+        width: size,
+        height: size,
+        fill: "#FF3B30",
+        stroke: "#FF3B30",
+        strokeWidth: Math.max(1, 1.25 * s),
+        cornerRadius: Math.max(1.5, 1.5 * s),
+        shadowColor: "#FF3B30",
+        shadowBlur: 10 * s,
+        shadowOpacity: 0.58,
+        name: "ui",
+      }));
+      group.on("mouseenter", () => {
+        container.style.cursor = handle.cursor;
+      });
+      group.on("mouseleave", updateDefaultCursor);
+      group.on("mousedown touchstart", (evt) => {
+        evt.cancelBubble = true;
+        captureBrowserPointer(evt);
+        const point = pointerPosition() || { x, y };
+        regionResizeDrag = true;
+        if (state.regionControls && state.regionControls.aspectRatio !== "custom" && !isCornerRegionHandle(handle.key)) {
+          state = {
+            ...state,
+            regionControls: {
+              ...state.regionControls,
+              aspectRatio: "custom",
+            },
+          };
+          scheduleRender(state, { ui: true });
+        }
+        command("pointerDown", cssToPhysicalPoint(point));
+      });
+    });
+  }
+
+  function hasUserAnnotations() {
+    return !!(state && Array.isArray(state.annotations) && state.annotations.some((annotation) => annotation && annotation.kind && annotation.kind.type !== "watermark"));
+  }
+
+  function regionControlChromeHidden() {
+    return hasUserAnnotations() || !!preview;
+  }
+
+  function isCornerRegionHandle(key) {
+    return key === "nw" || key === "ne" || key === "se" || key === "sw";
+  }
+
+  function ratioIconName(mode) {
+    switch (mode) {
+      case "9x16":
+        return "ratio9x16";
+      case "16x9":
+        return "ratio16x9";
+      case "1x1":
+        return "ratio1x1";
+      case "4x5":
+        return "ratio4x5";
+      default:
+        return "ratioCustom";
+    }
+  }
+
+  function nextAspectRatio(mode) {
+    switch (mode) {
+      case "custom":
+        return "9x16";
+      case "9x16":
+        return "16x9";
+      case "16x9":
+        return "1x1";
+      case "1x1":
+        return "4x5";
+      default:
+        return "custom";
     }
   }
 
@@ -1906,6 +2142,10 @@
       rect: { x: absolute.x + x, y: absolute.y + y, width, height: 24 * s },
     });
     const apply = () => {
+      if (kind === "font" && state && state.activeSubmenu === "watermark" && document.activeElement === watermarkInput) {
+        watermarkInput.blur();
+        command("blurWatermarkText");
+      }
       const pointer = stage.getPointerPosition();
       if (!pointer) {
         return;
@@ -2067,6 +2307,12 @@
     const bounds = physicalToCssRect(annotation.bounds);
     const width = strokeWidth(annotation);
     const radius = Math.max(8, width / 2 + 8);
+    if (kind.type === "rectangle") {
+      return rectStrokeHit(bounds, point, radius);
+    }
+    if (kind.type === "oval") {
+      return ovalStrokeHit(bounds, point, radius);
+    }
     if (kind.type === "line" || kind.type === "arrow" || (kind.type === "highlighter" && kind.shape === "line")) {
       return distanceToSegment(point, physicalToCssPoint(kind.start), physicalToCssPoint(kind.end)) <= radius;
     }
@@ -2081,12 +2327,46 @@
     }
     if (kind.type === "tag") {
       const anchor = physicalToCssPoint(kind.anchor);
-      return pointInRect(point, bounds, 4 * scale()) || Math.hypot(point.x - anchor.x, point.y - anchor.y) <= 14 * scale();
+      return pointInRect(point, bounds, 0) || rectStrokeHit(bounds, point, Math.max(radius, 12 * scale())) || Math.hypot(point.x - anchor.x, point.y - anchor.y) <= 14 * scale() || tagPointerHit(bounds, anchor, point);
     }
     if (kind.type === "text" && !kind.framed) {
       return pointInRect(point, inlineTextHitBounds(bounds, kind), 0);
     }
     return pointInRect(point, bounds, 4 * scale());
+  }
+
+  function rectStrokeHit(rect, point, radius) {
+    return pointInRect(point, rect, radius) && !pointInRect(point, insetRect(rect, radius), 0);
+  }
+
+  function insetRect(rect, amount) {
+    return {
+      x: rect.x + amount,
+      y: rect.y + amount,
+      width: Math.max(0, rect.width - amount * 2),
+      height: Math.max(0, rect.height - amount * 2),
+    };
+  }
+
+  function ovalStrokeHit(rect, point, radius) {
+    if (!pointInRect(point, rect, radius)) {
+      return false;
+    }
+    const rx = Math.max(1, rect.width / 2);
+    const ry = Math.max(1, rect.height / 2);
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    const normalized = Math.sqrt(((point.x - cx) / rx) ** 2 + ((point.y - cy) / ry) ** 2);
+    const tolerance = Math.max(0.05, radius / Math.min(rx, ry));
+    return Math.abs(normalized - 1) <= tolerance;
+  }
+
+  function tagPointerHit(bounds, anchor, point) {
+    const target = {
+      x: Math.max(bounds.x, Math.min(bounds.x + bounds.width, anchor.x)),
+      y: Math.max(bounds.y, Math.min(bounds.y + bounds.height, anchor.y)),
+    };
+    return distanceToSegment(point, anchor, target) <= 16 * scale();
   }
 
   function inlineTextHitBounds(bounds, kind) {
@@ -2138,7 +2418,11 @@
     if (evt.evt && evt.evt.button === 2) {
       evt.evt.preventDefault();
       preview = null;
-      cancelTextEditor();
+      if (textEditorSession) {
+        commitTextEditor(false);
+      } else {
+        cancelTextEditor();
+      }
       applyLocalDeselect();
       command("deselect");
       schedulePreviewRender();
@@ -2158,6 +2442,9 @@
       return;
     }
     preview = shouldStartPreview(point) ? { start: point, current: point, points: [point] } : null;
+    if (preview && state) {
+      scheduleRender(state, { ui: true });
+    }
     const payload = cssToPhysicalPoint(point);
     const caretIndex = textCaretIndexAtPoint(point);
     if (caretIndex != null) {
@@ -2172,6 +2459,13 @@
       const point = pointerPosition();
       if (point) {
         command("setToolbarOrigin", cssToPhysicalPoint({ x: point.x - toolbarDrag.dx, y: point.y - toolbarDrag.dy }));
+      }
+      return;
+    }
+    if (regionResizeDrag) {
+      const point = pointerPosition();
+      if (point) {
+        schedulePointerMove(point);
       }
       return;
     }
@@ -2198,6 +2492,16 @@
 
   stage.on("mouseup touchend", (evt) => {
     releaseBrowserPointer(evt);
+    if (regionResizeDrag) {
+      regionResizeDrag = false;
+      const point = pointerPosition();
+      if (point) {
+        flushPointerMove();
+        command("pointerUp", cssToPhysicalPoint(point));
+      }
+      updateDefaultCursor();
+      return;
+    }
     if (toolbarDrag) {
       toolbarDrag = null;
       updateDefaultCursor();
@@ -2213,6 +2517,9 @@
     flushPointerMove();
     command("pointerUp", cssToPhysicalPoint(point));
     preview = null;
+    if (state) {
+      scheduleRender(state, { ui: true });
+    }
     schedulePreviewRender();
   });
 
@@ -3028,7 +3335,7 @@
     const sideHalf = Math.max(6, frame * 0.77);
     const horizontalHalf = Math.max(4, Math.min(sideHalf, maxHorizontalHalf));
     const verticalHalf = Math.max(4, Math.min(sideHalf, maxVerticalHalf));
-    const overlap = Math.max(4, frame * 0.7);
+    const overlap = Math.max(6, frame * 1.08);
     const tipRound = frame * 0.72;
     if (edge === "left") {
       const y = Math.max(box.y + r + verticalHalf, Math.min(box.y + box.height - r - verticalHalf, anchor.y));
@@ -3295,7 +3602,7 @@
     }
     const tool = state.activeTool;
     const color = activeColor();
-    const width = currentWidth();
+    const width = physicalStrokeWidth(currentWidth());
     const start = preview.start;
     const end = preview.current;
     const rect = rectFromPoints(start, end);
@@ -3372,6 +3679,14 @@
     }
     const dx = current.x - anchor.x;
     const dy = current.y - anchor.y;
+    if (Math.abs(dx) > width * 0.22 && Math.abs(dy) > height * 0.35) {
+      return {
+        x: dx >= 0 ? current.x : current.x - width,
+        y: dy >= 0 ? current.y : current.y - height,
+        width,
+        height,
+      };
+    }
     if (Math.abs(dx) >= Math.abs(dy)) {
       return {
         x: dx >= 0 ? current.x : current.x - width,
@@ -3514,7 +3829,7 @@
       .map((id) => annotationsById.get(id));
     const patch = diff.state && typeof diff.state === "object" ? diff.state : {};
     const hasPatch = Object.keys(patch).length > 0;
-    const watermarkChanged = ["watermarkText", "watermarkColor", "watermarkImageUrl", "watermarkImageDataUrl", "watermarkDateEnabled", "watermarkMode"].some((key) => Object.prototype.hasOwnProperty.call(patch, key));
+    const watermarkChanged = ["watermarkText", "watermarkColor", "watermarkImageUrl", "watermarkImageDataUrl", "watermarkDateEnabled", "watermarkMode", "fontSize"].some((key) => Object.prototype.hasOwnProperty.call(patch, key));
     const committedChanged = added.length > 0 || updated.length > 0 || removed.size > 0 || watermarkChanged;
     if (
       Object.prototype.hasOwnProperty.call(patch, "editingTextCaret") &&
