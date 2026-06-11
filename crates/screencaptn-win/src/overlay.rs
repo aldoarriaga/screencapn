@@ -1873,8 +1873,12 @@ unsafe extern "system" fn overlay_wnd_proc(
         WM_KEYDOWN => {
             let key = wparam.0 as u32;
             let was_text_editing = state.editing_text_id.is_some() || state.editing_watermark_text;
+            let had_active_annotation = has_active_annotation_state(state);
             handle_key_down(state, key, shift_key_down());
-            if was_text_editing || (key != 0x1B && key != VK_RETURN.0 as u32) {
+            if was_text_editing
+                || had_active_annotation
+                || (key != 0x1B && key != VK_RETURN.0 as u32)
+            {
                 state.mark_static_dirty();
                 let _ = InvalidateRect(hwnd, None, false);
                 sync_web_after_change(state);
@@ -2069,6 +2073,21 @@ fn deselect_all(state: &mut OverlayState) {
     state.editing_watermark_text = false;
     state.drag = None;
     state.mark_static_dirty();
+}
+
+fn has_active_annotation_state(state: &OverlayState) -> bool {
+    state.document.selected_annotation_id.is_some()
+        || state.editing_text_id.is_some()
+        || state.editing_step_number_id.is_some()
+        || state.editing_watermark_text
+        || matches!(
+            state.drag,
+            Some(
+                DragState::MovingAnnotation { .. }
+                    | DragState::EditingAnnotation { .. }
+                    | DragState::DrawingAnnotation { .. }
+            )
+        )
 }
 
 fn region_frame_contains(region: Rect, point: Point) -> bool {
@@ -3444,7 +3463,7 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 };
     if state.editing_watermark_text && !ctrl_down {
         match key {
-            0x1B => state.editing_watermark_text = false,
+            0x1B => deselect_all(state),
             key if key == VK_RETURN.0 as u32 => {
                 state.editing_watermark_text = false;
                 let _ = unsafe { copy_capture_to_clipboard(state) };
@@ -3462,10 +3481,7 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     }
     if state.editing_text_id.is_some() && !ctrl_down {
         match key {
-            0x1B => {
-                state.editing_text_id = None;
-                state.editing_text_caret = 0;
-            }
+            0x1B => deselect_all(state),
             key if key == VK_RETURN.0 as u32 => {
                 if shift_down && editing_text_accepts_line_break(state) {
                     insert_text_at_caret(state, "\n");
@@ -3487,10 +3503,7 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     }
     if state.editing_step_number_id.is_some() && !ctrl_down {
         match key {
-            0x1B => {
-                state.editing_step_number_id = None;
-                state.editing_step_number_replace = false;
-            }
+            0x1B => deselect_all(state),
             key if key == VK_RETURN.0 as u32 => {
                 state.editing_step_number_id = None;
                 state.editing_step_number_replace = false;
@@ -3503,9 +3516,15 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     }
 
     match key {
-        0x1B => unsafe {
-            let _ = DestroyWindow(state.hwnd);
-        },
+        0x1B => {
+            if has_active_annotation_state(state) {
+                deselect_all(state);
+            } else {
+                unsafe {
+                    let _ = DestroyWindow(state.hwnd);
+                }
+            }
+        }
         key if key == VK_RETURN.0 as u32 => {
             if state.document.capture_region.is_none() {
                 if let Some(region) = state.smart_region.as_ref().map(|candidate| candidate.rect) {
@@ -3840,6 +3859,7 @@ fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
         }
         ToolbarAction::Tool(tool) => {
             finish_text_editing(state);
+            state.document.selected_annotation_id = None;
             if state.active_tool == ToolKind::Highlighter && tool != ToolKind::Highlighter {
                 state.current_stroke.color = state.normal_stroke_color;
             } else if state.active_tool != ToolKind::Highlighter && tool == ToolKind::Highlighter {

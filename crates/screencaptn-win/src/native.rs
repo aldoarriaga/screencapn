@@ -1,11 +1,12 @@
+use crate::diagnostics;
 use crate::overlay::{open_capture_overlay, AppTheme};
 use crate::settings::{load_settings, save_settings, AppSettings};
 use crate::shortcut_window::edit_hotkey;
 use crate::theme::{load_theme, save_theme, toggled_theme};
 use crate::tray::{
-    add_tray_icon, remove_tray_icon, show_tray_menu, update_tray_icon, TRAY_EXIT_COMMAND,
-    TRAY_SET_AUTO_SAVE_FOLDER_COMMAND, TRAY_SET_SHORTCUT_COMMAND, TRAY_TOGGLE_AUTO_SAVE_COMMAND,
-    TRAY_TOGGLE_THEME_COMMAND, WM_TRAYICON,
+    add_tray_icon, remove_tray_icon, show_tray_menu, update_tray_icon, TRAY_DONATE_COMMAND,
+    TRAY_EXIT_COMMAND, TRAY_SET_AUTO_SAVE_FOLDER_COMMAND, TRAY_SET_SHORTCUT_COMMAND,
+    TRAY_TOGGLE_AUTO_SAVE_COMMAND, TRAY_TOGGLE_THEME_COMMAND, WM_TRAYICON,
 };
 use std::path::PathBuf;
 use windows::core::{w, Result};
@@ -21,15 +22,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
 use windows::Win32::UI::Shell::{
-    FileOpenDialog, IFileOpenDialog, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
-    SIGDN_FILESYSPATH,
+    FileOpenDialog, IFileOpenDialog, ShellExecuteW, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+    FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, ShowWindow,
     TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU,
-    IDC_ARROW, MSG, SIZE_MINIMIZED, SW_HIDE, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    IDC_ARROW, MSG, SIZE_MINIMIZED, SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SIZE, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW,
 };
 
 const APP_CLASS: windows::core::PCWSTR = w!("ScreenCaptnHiddenWindow");
@@ -82,8 +84,12 @@ impl NativeApp {
                 instance,
                 Some(state_ptr.cast()),
             )?;
-            register_configured_hotkey(hwnd, &mut state)?;
-            add_tray_icon(hwnd, &state.settings)?;
+            if let Err(error) = register_configured_hotkey(hwnd, &mut state) {
+                diagnostics::log_event("startup", &format!("hotkey-register-failed: {error:?}"));
+            }
+            if let Err(error) = add_tray_icon(hwnd, &state.settings) {
+                diagnostics::log_event("startup", &format!("tray-add-failed: {error:?}"));
+            }
             Box::leak(state);
 
             Ok(Self { hwnd })
@@ -143,6 +149,7 @@ unsafe extern "system" fn app_wnd_proc(
                     Some(TRAY_TOGGLE_AUTO_SAVE_COMMAND) => toggle_auto_save(hwnd),
                     Some(TRAY_SET_AUTO_SAVE_FOLDER_COMMAND) => choose_auto_save_folder(hwnd),
                     Some(TRAY_TOGGLE_THEME_COMMAND) => toggle_theme(hwnd),
+                    Some(TRAY_DONATE_COMMAND) => open_donation_page(hwnd),
                     Some(TRAY_EXIT_COMMAND) => {
                         let _ = DestroyWindow(hwnd);
                     }
@@ -236,6 +243,17 @@ unsafe fn choose_auto_save_folder(hwnd: HWND) {
             update_tray_icon(hwnd, &state.settings);
         }
     }
+}
+
+unsafe fn open_donation_page(hwnd: HWND) {
+    let _ = ShellExecuteW(
+        hwnd,
+        w!("open"),
+        w!("https://screencapn.com/donate"),
+        None,
+        None,
+        SW_SHOWNORMAL,
+    );
 }
 
 unsafe fn register_configured_hotkey(hwnd: HWND, state: &mut AppState) -> Result<()> {

@@ -18,7 +18,8 @@ pub const TRAY_SET_SHORTCUT_COMMAND: usize = 9000;
 pub const TRAY_TOGGLE_AUTO_SAVE_COMMAND: usize = 9001;
 pub const TRAY_SET_AUTO_SAVE_FOLDER_COMMAND: usize = 9002;
 pub const TRAY_TOGGLE_THEME_COMMAND: usize = 9003;
-pub const TRAY_EXIT_COMMAND: usize = 9004;
+pub const TRAY_DONATE_COMMAND: usize = 9004;
+pub const TRAY_EXIT_COMMAND: usize = 9005;
 const TRAY_UID: u32 = 1;
 
 pub unsafe fn add_tray_icon(hwnd: HWND, settings: &AppSettings) -> Result<()> {
@@ -105,6 +106,14 @@ pub unsafe fn show_tray_menu(hwnd: HWND, theme: AppTheme, settings: &AppSettings
         AppTheme::Dark => w!("Switch to light mode"),
     };
     AppendMenuW(menu, MF_STRING, TRAY_TOGGLE_THEME_COMMAND, toggle_label).ok()?;
+    AppendMenuW(menu, MF_SEPARATOR, 0, None).ok()?;
+    AppendMenuW(
+        menu,
+        MF_STRING,
+        TRAY_DONATE_COMMAND,
+        w!("Enjoying Screen Cap'n? Consider donating"),
+    )
+    .ok()?;
     AppendMenuW(menu, MF_STRING, TRAY_EXIT_COMMAND, w!("Exit Screen Captn")).ok()?;
 
     let mut cursor = POINT::default();
