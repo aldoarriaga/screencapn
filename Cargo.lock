@@ -339,11 +339,11 @@ dependencies = [
 
 [[package]]
 name = "screencaptn-core"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "screencaptn-win"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "png",
  "resvg",

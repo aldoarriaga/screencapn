@@ -9,9 +9,9 @@ Path A means Screen Cap'n launches through Microsoft Store first. Microsoft Stor
 - Direct download: deferred
 - Minimum Windows version: Windows 10 version 1809 / build 17763 or later
 - Architecture for first submission: x64
-- Store privacy policy: use `PRIVACY.md` as the source copy, then publish it at a public URL before submission
-- Support URL: TODO
-- Website URL: TODO
+- Store privacy policy: `https://screencapn.com/privacy` (use `PRIVACY.md` as the source copy; confirm the page is live before submission)
+- Support URL: TODO (likely under `https://screencapn.com`, not yet decided)
+- Website URL: `https://screencapn.com` (site is under construction but owned and live)
 - Store category: Productivity
 
 ## Store Submission Checklist
@@ -51,6 +51,6 @@ The script validates the local build and dependency surface. It does not create 
 - Create package identity and publisher identity.
 - Generate Store visual assets.
 - Capture Store screenshots.
-- Publish `PRIVACY.md` as a public privacy policy URL.
+- Publish `PRIVACY.md` at `https://screencapn.com/privacy` and confirm it loads publicly.
 - Run WACK against the generated package.
 - Submit through Partner Center.

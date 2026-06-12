@@ -29,7 +29,7 @@ The Windows app currently supports:
 - Click annotations directly to select/move/delete them; selection is contextual, not a toolbar tool.
 - Undo.
 - Enter/Copy toolbar action to copy the selected region with annotations to the clipboard.
-- Save toolbar action or `Ctrl+S` to write a BMP file to `%USERPROFILE%\Pictures\ScreenCaptn`.
+- Save toolbar action or `Ctrl+S` to write a PNG file; optional auto-save defaults to `%USERPROFILE%\Pictures\Screen Cap'n`.
 - Escape/Cancel to close the overlay.
 
 ## Development

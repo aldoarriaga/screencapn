@@ -57,11 +57,11 @@ Important metadata:
 - Architecture: `x64`
 - Capability: `runFullTrust`
 
-Known release metadata debt:
+Release metadata alignment (resolved 2026-06-11):
 
-- Workspace crate version in `Cargo.toml` is still `0.1.0`.
-- `crates\screencaptn-win\app.manifest` assembly identity is still `0.1.0.0`.
-- This does not stop the current MSIX package from using `1.0.0.0`, but it should be aligned before a final tagged release.
+- Workspace crate version in `Cargo.toml` is `1.0.0`.
+- `crates\screencaptn-win\app.manifest` assembly identity is `1.0.0.0`.
+- These now match the MSIX package version `1.0.0.0`.
 
 ## 3. Repository Layout
 
@@ -309,9 +309,9 @@ Tray tooltip:
 
 - `Screen Cap'n - {hotkey display label}`
 
-Current caveat:
+Encoding note (resolved 2026-06-11):
 
-- The checkbox glyph strings in `tray.rs` show mojibake in the source (`â˜‘` / `â˜`). Functionally they are intended as checked/unchecked checkbox labels. This should be cleaned up to proper UTF-8 or replaced with ASCII-safe labels before final polish.
+- The checkbox glyph strings in `tray.rs` are valid UTF-8 (`☑` / `☐`) and render correctly; earlier reports of mojibake came from viewing the file with a non-UTF-8 encoding. Original report: the glyphs appeared corrupted in the source (`â˜‘` / `â˜`). No source change is needed.
 
 ### Settings
 
@@ -1067,15 +1067,17 @@ Observed WACK context from this cycle:
 
 These are not necessarily blockers, but a new engineer should know them.
 
-1. Rust crate version and embedded Win32 manifest are still `0.1.0`/`0.1.0.0`, while MSIX is `1.0.0.0`.
-2. The tray checkbox labels show source encoding corruption and should be made UTF-8 clean or ASCII-safe.
+1. Resolved 2026-06-11: Rust crate version and embedded Win32 manifest are aligned to `1.0.0`/`1.0.0.0`, matching the MSIX `1.0.0.0`.
+2. Resolved 2026-06-11: tray checkbox labels are valid UTF-8; the reported corruption was an editor encoding artifact, not a source defect.
 3. UIA/content-region detection was deliberately removed. Do not re-add it casually; it caused lag and bad sidebar/app-panel selections.
 4. `WEB_EXPORT_ENABLED` is false. Native export is the path that matters.
 5. Web UI is embedded with `include_str!`, so after JS changes always run `npm run build:web` before Rust build/package.
 6. WebView2 runtime is assumed available through Microsoft Edge WebView2.
 7. Test MSIX is not trusted-signed until Store signing.
-8. Some README text may still mention older details such as BMP/default folder spelling; align README before final public release.
+8. Resolved 2026-06-11: README no longer mentions BMP or the old default folder; save output is PNG and auto-save defaults to `%USERPROFILE%\Pictures\Screen Cap'n`.
 9. The current git working tree may contain release-candidate changes not yet committed. Always inspect `git status` before editing or tagging.
+10. Startup failures of hotkey registration and tray icon creation are logged instead of fatal. If both ever fail at once, the app runs with no way to invoke or exit it except Task Manager; acceptable for v1 but worth revisiting.
+11. The `1.0.0.0` MSIX in `target\store-msix` predates the version alignment above and the final release-candidate commits; rebuild and re-run WACK before submission. The staged manifest identity/publisher must be replaced with the exact values Partner Center assigns after app-name reservation.
 
 ## 19. Manual QA Checklist Before Final Store Submission
 
@@ -1166,11 +1168,11 @@ Release:
 
 ## 20. Suggested First Tasks for the Next Engineer
 
-1. Run `git status` and identify all uncommitted release-candidate files.
-2. Align crate/app manifest versions with `1.0.0.0`.
-3. Fix tray checkbox label encoding.
-4. Update README if it still says BMP or old save folder paths.
-5. Re-run full release validation and WACK from a clean tree.
-6. Create a signed Store submission package through Partner Center.
+1. Done 2026-06-11: release-candidate files were committed and pushed.
+2. Done 2026-06-11: crate version is `1.0.0`, app.manifest is `1.0.0.0`.
+3. Done 2026-06-11: tray checkbox labels confirmed valid UTF-8; no fix was needed.
+4. Done 2026-06-11: README updated to PNG output and `%USERPROFILE%\Pictures\Screen Cap'n` auto-save default.
+5. Re-run full release validation and WACK from a clean tree. (`store-release-check.ps1` re-run 2026-06-11; MSIX rebuild + WACK still pending because package identity is account-specific.)
+6. Reserve the app name in Partner Center, copy the assigned Identity Name/Publisher into the staged manifest, rebuild the MSIX, and create the signed Store submission. (Blocked: Partner Center identity not finalized.)
 7. Tag the final release commit once the submitted package hash/version is known.
 
