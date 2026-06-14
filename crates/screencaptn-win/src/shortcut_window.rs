@@ -1,3 +1,4 @@
+use crate::hotkey::reserved_hotkey_reason;
 use crate::settings::HotkeySettings;
 use crate::util::{colorref, rect_to_rect, SelectedPen, SelectedStockObject};
 use screencaptn_core::{Color, Point, Rect};
@@ -29,6 +30,7 @@ struct ShortcutWindowState {
     current: HotkeySettings,
     original: HotkeySettings,
     result: Option<Option<HotkeySettings>>,
+    validation_message: Option<String>,
     save_rect: Rect,
     reset_rect: Rect,
     cancel_rect: Rect,
@@ -66,6 +68,7 @@ pub fn edit_hotkey(initial: HotkeySettings) -> Result<Option<HotkeySettings>> {
             current: initial.clone(),
             original: initial,
             result: None,
+            validation_message: None,
             save_rect: Rect::new(424.0, 292.0, 150.0, 42.0),
             reset_rect: Rect::new(254.0, 292.0, 150.0, 42.0),
             cancel_rect: Rect::new(84.0, 292.0, 150.0, 42.0),
@@ -145,6 +148,7 @@ unsafe extern "system" fn shortcut_wnd_proc(
             if let Some(state) = shortcut_state(hwnd) {
                 if let Some(next) = hotkey_from_key(wparam.0 as u32) {
                     state.current = next;
+                    state.validation_message = hotkey_validation_message(&state.current);
                     let _ = InvalidateRect(hwnd, None, false);
                 }
             }
@@ -156,10 +160,16 @@ unsafe extern "system" fn shortcut_wnd_proc(
                 ((lparam.0 as u32 >> 16) & 0xffff) as i16 as f32,
             );
             if let Some(state) = shortcut_state(hwnd) {
-                if state.save_rect.contains(point) && state.current.is_valid() {
-                    state.result = Some(Some(state.current.clone()));
+                if state.save_rect.contains(point) {
+                    state.validation_message = hotkey_validation_message(&state.current);
+                    if state.validation_message.is_none() {
+                        state.result = Some(Some(state.current.clone()));
+                    } else {
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
                 } else if state.reset_rect.contains(point) {
                     state.current = HotkeySettings::default();
+                    state.validation_message = None;
                     let _ = InvalidateRect(hwnd, None, false);
                 } else if state.cancel_rect.contains(point) {
                     state.result = Some(None);
@@ -213,7 +223,9 @@ unsafe fn draw_shortcut_window(hdc: HDC, state: &ShortcutWindowState) {
         x += 86.0;
     }
 
-    if !state.current.is_valid() {
+    if let Some(message) = &state.validation_message {
+        draw_text(hdc, 44, 244, message, 14, Color::rgb(255, 99, 0), false);
+    } else if !state.current.is_valid() {
         draw_text(
             hdc,
             44,
@@ -249,7 +261,7 @@ unsafe fn draw_shortcut_window(hdc: HDC, state: &ShortcutWindowState) {
         Color::rgb(28, 28, 28),
         Color::WHITE,
     );
-    let save_color = if state.current.is_valid() {
+    let save_color = if hotkey_validation_message(&state.current).is_none() {
         Color::rgb(0, 96, 120)
     } else {
         Color::rgb(45, 45, 45)
@@ -385,6 +397,13 @@ fn hotkey_from_key(key_code: u32) -> Option<HotkeySettings> {
     })
 }
 
+fn hotkey_validation_message(hotkey: &HotkeySettings) -> Option<String> {
+    if !hotkey.is_valid() {
+        return Some("Choose a modifier plus one key.".to_string());
+    }
+    reserved_hotkey_reason(hotkey).map(str::to_string)
+}
+
 fn key_label(key_code: u32) -> String {
     match key_code {
         0x30..=0x39 | 0x41..=0x5A => char::from_u32(key_code).unwrap_or('?').to_string(),
@@ -402,6 +421,8 @@ fn key_label(key_code: u32) -> String {
         0x20 => "Space".to_string(),
         0x0D => "Enter".to_string(),
         0x09 => "Tab".to_string(),
+        0x1B => "Esc".to_string(),
+        0x2C => "Print Screen".to_string(),
         _ => format!("VK {}", key_code),
     }
 }

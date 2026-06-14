@@ -315,14 +315,12 @@
     return true;
   }
 
-  function adjustSliderFromWheel(slider, event) {
-    if (!event || event.ctrlKey) {
+  function forwardRegionWheel(event) {
+    if (!event || !state || !state.captureRegion || !state.regionControls || state.regionControls.aspectRatio === "custom") {
       return false;
     }
-    const direction = event.deltaY < 0 ? 1 : -1;
-    if (!adjustSlider(slider, direction, event.shiftKey)) {
-      return false;
-    }
+    const delta = event.deltaY < 0 ? 120 : -120;
+    command("regionWheel", { value: delta, shiftKey: !!event.shiftKey, ctrlKey: !!event.ctrlKey });
     event.preventDefault();
     if (event.stopPropagation) {
       event.stopPropagation();
@@ -1390,7 +1388,12 @@
         const iconSize = 24 * s;
         hoverEffect = drawHoverableToolbarIcon(button, item.icon, (w - iconSize) / 2, (rect.height - iconSize) / 2, iconSize, p.icon, activeColor(), selected, s);
         if (item.tool) {
-          button.on("click tap", () => command("selectTool", { tool: item.tool }));
+          button.on("click tap", () => {
+            if (textEditorSession) {
+              commitTextEditor(false);
+            }
+            command("selectTool", { tool: item.tool });
+          });
         } else {
           button.on("click tap", () => command(item.action));
         }
@@ -2162,10 +2165,6 @@
         stage.off(".slider");
       });
     });
-    hit.on("wheel", (evt) => {
-      evt.cancelBubble = true;
-      adjustSliderFromWheel(sliderInfo, evt.evt);
-    });
     hit.on("mouseenter", () => {
       hoveredSlider = sliderInfo;
       container.style.cursor = "pointer";
@@ -2388,7 +2387,7 @@
       return false;
     }
     const region = physicalToCssRect(state.captureRegion);
-    const hit = 10 * scale();
+    const hit = 24 * scale();
     const onFrame =
       pointInRect(point, region, 0) &&
       (point.x <= region.x + hit ||
@@ -3757,8 +3756,7 @@
   window.addEventListener(
     "wheel",
     (event) => {
-      const slider = sliderAtStagePoint(eventStagePoint(event)) || hoveredSlider;
-      if (adjustSliderFromWheel(slider, event)) {
+      if (forwardRegionWheel(event)) {
         return;
       }
       if (event.ctrlKey) {
@@ -3769,9 +3767,7 @@
   );
 
   stage.on("wheel", (evt) => {
-    const point = pointerPosition() || (evt.evt ? eventStagePoint(evt.evt) : null);
-    const slider = sliderAtStagePoint(point) || hoveredSlider;
-    if (adjustSliderFromWheel(slider, evt.evt)) {
+    if (forwardRegionWheel(evt.evt)) {
       evt.cancelBubble = true;
     }
   });

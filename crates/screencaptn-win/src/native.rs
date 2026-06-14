@@ -1,6 +1,7 @@
 use crate::diagnostics;
+use crate::hotkey::reserved_hotkey_reason;
 use crate::overlay::{open_capture_overlay, AppTheme};
-use crate::settings::{load_settings, save_settings, AppSettings};
+use crate::settings::{load_settings, save_settings, AppSettings, HotkeySettings};
 use crate::shortcut_window::edit_hotkey;
 use crate::theme::{load_theme, save_theme, toggled_theme};
 use crate::tray::{
@@ -27,11 +28,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, LoadCursorW, PostQuitMessage, RegisterClassW, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU,
-    IDC_ARROW, MSG, SIZE_MINIMIZED, SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SIZE, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, LoadCursorW, MessageBoxW, PostQuitMessage, RegisterClassW,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, MB_ICONWARNING, MB_OK, MSG, SIZE_MINIMIZED,
+    SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
+    WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 const APP_CLASS: windows::core::PCWSTR = w!("ScreenCaptnHiddenWindow");
@@ -219,10 +220,22 @@ unsafe fn edit_shortcut(hwnd: HWND) {
         return;
     };
     if let Ok(Some(hotkey)) = edit_hotkey(state.settings.hotkey.clone()) {
-        state.settings.hotkey = hotkey;
-        if register_configured_hotkey(hwnd, state).is_ok() {
+        if let Some(reason) = reserved_hotkey_reason(&hotkey) {
+            show_hotkey_error(hwnd, reason);
+            return;
+        }
+
+        let previous = state.settings.hotkey.clone();
+        if apply_user_hotkey(hwnd, state, hotkey).is_ok() {
             save_settings(&state.settings);
             update_tray_icon(hwnd, &state.settings);
+        } else {
+            state.settings.hotkey = previous;
+            let _ = register_configured_hotkey(hwnd, state);
+            show_hotkey_error(
+                hwnd,
+                "This shortcut is already used by Windows or another app. Choose a different one.",
+            );
         }
     }
 }
@@ -256,12 +269,39 @@ unsafe fn open_donation_page(hwnd: HWND) {
     );
 }
 
+unsafe fn apply_user_hotkey(
+    hwnd: HWND,
+    state: &mut AppState,
+    hotkey: HotkeySettings,
+) -> Result<()> {
+    if state.hotkey_registered {
+        let _ = UnregisterHotKey(hwnd, HOTKEY_ID);
+        state.hotkey_registered = false;
+    }
+    let modifiers = hotkey_modifiers_for_hotkey(&hotkey);
+    RegisterHotKey(hwnd, HOTKEY_ID, modifiers, hotkey.key_code)?;
+    state.settings.hotkey = hotkey;
+    state.hotkey_registered = true;
+    Ok(())
+}
+
+unsafe fn show_hotkey_error(hwnd: HWND, message: &str) {
+    let message = wide_null(message);
+    let title = wide_null("Screen Cap'n Shortcut");
+    let _ = MessageBoxW(
+        hwnd,
+        windows::core::PCWSTR(message.as_ptr()),
+        windows::core::PCWSTR(title.as_ptr()),
+        MB_OK | MB_ICONWARNING,
+    );
+}
+
 unsafe fn register_configured_hotkey(hwnd: HWND, state: &mut AppState) -> Result<()> {
     if state.hotkey_registered {
         let _ = UnregisterHotKey(hwnd, HOTKEY_ID);
         state.hotkey_registered = false;
     }
-    let modifiers = hotkey_modifiers(&state.settings);
+    let modifiers = hotkey_modifiers_for_hotkey(&state.settings.hotkey);
     match RegisterHotKey(hwnd, HOTKEY_ID, modifiers, state.settings.hotkey.key_code) {
         Ok(()) => {
             state.hotkey_registered = true;
@@ -282,23 +322,27 @@ unsafe fn register_configured_hotkey(hwnd: HWND, state: &mut AppState) -> Result
     }
 }
 
-fn hotkey_modifiers(
-    settings: &AppSettings,
+fn hotkey_modifiers_for_hotkey(
+    hotkey: &HotkeySettings,
 ) -> windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS {
     let mut modifiers = windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(0);
-    if settings.hotkey.ctrl {
+    if hotkey.ctrl {
         modifiers |= MOD_CONTROL;
     }
-    if settings.hotkey.shift {
+    if hotkey.shift {
         modifiers |= MOD_SHIFT;
     }
-    if settings.hotkey.alt {
+    if hotkey.alt {
         modifiers |= MOD_ALT;
     }
-    if settings.hotkey.win {
+    if hotkey.win {
         modifiers |= MOD_WIN;
     }
     modifiers
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 unsafe fn show_folder_picker(owner: HWND) -> Option<PathBuf> {

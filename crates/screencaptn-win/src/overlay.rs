@@ -60,11 +60,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const OVERLAY_CLASS: windows::core::PCWSTR = w!("ScreenCaptnCaptureOverlay");
 const CF_BITMAP_FORMAT: u32 = 2;
 const HANDLE_RADIUS: f32 = 6.0;
-const REGION_RESIZE_HIT_RADIUS: f32 = 26.0;
+const REGION_RESIZE_HIT_RADIUS: f32 = 38.0;
 const MIN_REGION_SIZE: f32 = 24.0;
 const TOOLBAR_BUTTON: f32 = 36.0;
 const TOOLBAR_HEIGHT: f32 = 36.0;
-const FRAME_HIT_WIDTH: f32 = 22.0;
+const FRAME_HIT_WIDTH: f32 = 32.0;
 const CLICK_DRAG_THRESHOLD: f32 = 5.0;
 const ALL_SCREENS_TOP_EDGE_THRESHOLD_PX: f32 = 4.0;
 const CURRENT_SCREEN_TOP_THRESHOLD_PX: f32 = 32.0;
@@ -380,6 +380,8 @@ struct WebUiMessage {
     caret_index: Option<usize>,
     #[serde(rename = "shiftKey")]
     shift_key: Option<bool>,
+    #[serde(rename = "ctrlKey")]
+    ctrl_key: Option<bool>,
     reason: Option<String>,
     level: Option<String>,
     message: Option<String>,
@@ -774,6 +776,23 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                     || state.editing_step_number_id.is_some();
                 handle_key_down(state, key, message.shift_key.unwrap_or(false));
                 !(!was_text_editing && (key == 0x1B || key == VK_RETURN.0 as u32))
+            } else {
+                false
+            }
+        }
+        "regionWheel" => {
+            if let Some(delta) = message.value {
+                if handle_mouse_wheel(
+                    state,
+                    delta.round() as i16,
+                    message.shift_key.unwrap_or(false),
+                    message.ctrl_key.unwrap_or(false),
+                ) {
+                    state.mark_static_dirty();
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }
@@ -1731,6 +1750,13 @@ enum DragState {
         edit: AnnotationEdit,
         original: Annotation,
     },
+    PendingTextInteraction {
+        start: Point,
+        id: AnnotationId,
+        original: Annotation,
+        caret_index: Option<usize>,
+        moved: bool,
+    },
     DrawingAnnotation {
         start: Point,
         current: Point,
@@ -1826,7 +1852,7 @@ unsafe extern "system" fn overlay_wnd_proc(
                 return LRESULT(0);
             }
             let delta = ((wparam.0 >> 16) & 0xffff) as i16;
-            if handle_mouse_wheel(state, delta) {
+            if handle_mouse_wheel(state, delta, shift_key_down(), ctrl_key_down()) {
                 state.mark_static_dirty();
                 let _ = InvalidateRect(hwnd, None, false);
             }
@@ -1992,20 +2018,11 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: O
 
         let screen_point = state.overlay_to_screen(point);
         if let Some(id) = select_annotation_at(state, screen_point) {
-            if editable_text_annotation(state, id) {
-                state.editing_text_id = Some(id);
-                state.editing_text_caret = text_caret_index
-                    .or_else(|| text_caret_index_for_point(state, id, screen_point))
-                    .unwrap_or_else(|| annotation_text_len(state, id));
-            } else {
-                state.editing_text_id = None;
-                state.editing_text_caret = 0;
-            }
             state.editing_step_number_id = None;
             state.editing_step_number_replace = false;
             if let Some(original) = state.document.annotation(id).cloned() {
-                state.checkpoint();
                 if let Some(edit) = hit_annotation_edit_handle(state, &original, screen_point) {
+                    state.checkpoint();
                     state.editing_text_id = None;
                     state.editing_text_caret = 0;
                     state.editing_step_number_id = None;
@@ -2017,9 +2034,21 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: O
                     original.kind,
                     AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
                 ) {
-                    state.editing_text_id = Some(id);
+                    state.editing_text_id = None;
+                    state.editing_text_caret = 0;
+                    state.drag = Some(DragState::PendingTextInteraction {
+                        start: screen_point,
+                        id,
+                        original,
+                        caret_index: text_caret_index
+                            .or_else(|| text_caret_index_for_point(state, id, screen_point)),
+                        moved: false,
+                    });
                     return;
                 }
+                state.checkpoint();
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
                 state.drag = Some(DragState::MovingAnnotation {
                     start: screen_point,
                     id,
@@ -2085,6 +2114,7 @@ fn has_active_annotation_state(state: &OverlayState) -> bool {
             Some(
                 DragState::MovingAnnotation { .. }
                     | DragState::EditingAnnotation { .. }
+                    | DragState::PendingTextInteraction { .. }
                     | DragState::DrawingAnnotation { .. }
             )
         )
@@ -2198,13 +2228,8 @@ fn annotation_hit_test(annotation: &Annotation, screen_point: Point) -> bool {
             font_size,
             framed,
             ..
-        } => {
-            if *framed {
-                annotation.bounds.contains(screen_point)
-            } else {
-                inline_text_hit_bounds(annotation.bounds, text, *font_size).contains(screen_point)
-            }
-        }
+        } => text_annotation_hit_bounds(annotation.bounds, text, *font_size, *framed)
+            .contains(screen_point),
         AnnotationKind::Line { start, end } | AnnotationKind::Arrow { start, end } => near_segment(
             screen_point,
             *start,
@@ -2243,6 +2268,14 @@ fn annotation_hit_test(annotation: &Annotation, screen_point: Point) -> bool {
                 || tag_pointer_hit(annotation.bounds, *anchor, screen_point)
         }
         _ => annotation.bounds.contains(screen_point),
+    }
+}
+
+fn text_annotation_hit_bounds(bounds: Rect, text: &str, font_size: f32, framed: bool) -> Rect {
+    if framed {
+        bounds
+    } else {
+        inline_text_hit_bounds(bounds, text, font_size)
     }
 }
 
@@ -2790,7 +2823,12 @@ fn clamp_region_to_bounds(region: Rect, bounds: Rect) -> Rect {
     )
 }
 
-fn handle_mouse_wheel(state: &mut OverlayState, delta: i16) -> bool {
+fn handle_mouse_wheel(
+    state: &mut OverlayState,
+    delta: i16,
+    shift_down: bool,
+    ctrl_down: bool,
+) -> bool {
     if !state.ratio_placement_mode || state.settings.aspect_ratio == AspectRatioMode::Custom {
         return false;
     }
@@ -2801,7 +2839,14 @@ fn handle_mouse_wheel(state: &mut OverlayState, delta: i16) -> bool {
         return false;
     };
     let monitor = unsafe { monitor_full_region_at(region.center()) }.unwrap_or(state.screen_bounds);
-    let scale = if delta >= 0 { 1.08 } else { 1.0 / 1.08 };
+    let step = if ctrl_down {
+        1.005
+    } else if shift_down {
+        1.02
+    } else {
+        1.08
+    };
+    let scale = if delta >= 0 { step } else { 1.0 / step };
     let mut width = (region.width * scale).clamp(MIN_REGION_SIZE, monitor.width);
     let mut height = width / ratio;
     if height > monitor.height {
@@ -2999,6 +3044,26 @@ fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
         Some(DragState::EditingAnnotation { id, edit, original }) => {
             if let Some(annotation) = state.document.annotation_mut(*id) {
                 *annotation = edited_annotation(original, *edit, screen_point);
+                state.document.selected_annotation_id = Some(*id);
+                state.mark_static_dirty();
+            }
+            true
+        }
+        Some(DragState::PendingTextInteraction {
+            start,
+            id,
+            original,
+            moved,
+            ..
+        }) => {
+            let dx = screen_point.x - start.x;
+            let dy = screen_point.y - start.y;
+            if (dx * dx + dy * dy).sqrt() <= CLICK_DRAG_THRESHOLD {
+                return false;
+            }
+            *moved = true;
+            if let Some(annotation) = state.document.annotation_mut(*id) {
+                *annotation = original.translated(dx, dy);
                 state.document.selected_annotation_id = Some(*id);
                 state.mark_static_dirty();
             }
@@ -3258,9 +3323,9 @@ fn hit_annotation_edit_handle(
             end,
             ..
         } => {
-            if near_point(screen_point, *start, HANDLE_RADIUS + 4.0) {
+            if near_point(screen_point, *start, HANDLE_RADIUS + 14.0) {
                 Some(AnnotationEdit::LineStart)
-            } else if near_point(screen_point, *end, HANDLE_RADIUS + 4.0) {
+            } else if near_point(screen_point, *end, HANDLE_RADIUS + 14.0) {
                 Some(AnnotationEdit::LineEnd)
             } else {
                 None
@@ -3268,16 +3333,24 @@ fn hit_annotation_edit_handle(
         }
         AnnotationKind::Tag { anchor, .. } => annotation
             .bounds
-            .hit_resize_handle(screen_point, HANDLE_RADIUS + 10.0)
+            .hit_resize_handle(screen_point, HANDLE_RADIUS + 20.0)
             .map(AnnotationEdit::BoxResize)
             .or_else(|| {
-                near_point(screen_point, *anchor, HANDLE_RADIUS + 8.0)
+                near_point(screen_point, *anchor, HANDLE_RADIUS + 18.0)
                     .then_some(AnnotationEdit::TagAnchor)
             }),
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            ..
+        } => text_annotation_hit_bounds(annotation.bounds, text, *font_size, *framed)
+            .hit_resize_handle(screen_point, HANDLE_RADIUS + 20.0)
+            .map(AnnotationEdit::BoxResize),
         AnnotationKind::Pen { .. } | AnnotationKind::PenArrow { .. } => None,
         _ => annotation
             .bounds
-            .hit_resize_handle(screen_point, HANDLE_RADIUS + 4.0)
+            .hit_resize_handle(screen_point, HANDLE_RADIUS + 14.0)
             .map(AnnotationEdit::BoxResize),
     }
 }
@@ -3287,7 +3360,7 @@ fn near_point(point: Point, target: Point, radius: f32) -> bool {
 }
 
 fn line_hit_radius(width: f32) -> f32 {
-    (width / 2.0 + 6.0).max(8.0)
+    (width / 2.0 + 10.0).max(12.0)
 }
 
 fn near_segment(point: Point, start: Point, end: Point, radius: f32) -> bool {
@@ -3334,6 +3407,28 @@ fn edited_annotation(original: &Annotation, edit: AnnotationEdit, to: Point) -> 
         ) => {
             *end = to;
             next.bounds = line_bounds(&next.kind);
+        }
+        (
+            AnnotationKind::Text {
+                text,
+                font_size,
+                framed: false,
+                ..
+            },
+            AnnotationEdit::BoxResize(handle),
+        ) => {
+            let original_frame = inline_text_hit_bounds(original.bounds, text, *font_size);
+            let resized_frame = original_frame.resize_from_handle(handle, to, MIN_REGION_SIZE);
+            let line_count = text.lines().count().max(1) as f32;
+            let next_font_size =
+                ((resized_frame.height - 16.0) / (1.55 * line_count)).clamp(8.0, 160.0);
+            *font_size = next_font_size;
+            next.bounds = Rect::new(
+                resized_frame.x + 8.0,
+                resized_frame.y + next_font_size * 1.12 + 8.0,
+                resized_frame.width,
+                resized_frame.height,
+            );
         }
         (_, AnnotationEdit::BoxResize(handle)) => {
             next.bounds = original
@@ -3414,6 +3509,22 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
         | DragState::MovingAnnotation { .. }
         | DragState::EditingAnnotation { .. }
         | DragState::AdjustingSubmenuSlider { .. } => {}
+        DragState::PendingTextInteraction {
+            id,
+            caret_index,
+            moved,
+            ..
+        } => {
+            if !moved && editable_text_annotation(state, id) {
+                state.document.selected_annotation_id = Some(id);
+                state.editing_text_id = Some(id);
+                state.editing_text_caret =
+                    caret_index.unwrap_or_else(|| annotation_text_len(state, id));
+                state.editing_step_number_id = None;
+                state.editing_step_number_replace = false;
+                state.editing_watermark_text = false;
+            }
+        }
         DragState::DrawingAnnotation {
             start,
             current,
@@ -3457,6 +3568,10 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
 
 fn shift_key_down() -> bool {
     unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
+}
+
+fn ctrl_key_down() -> bool {
+    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
 }
 
 fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
@@ -3859,7 +3974,6 @@ fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
         }
         ToolbarAction::Tool(tool) => {
             finish_text_editing(state);
-            state.document.selected_annotation_id = None;
             if state.active_tool == ToolKind::Highlighter && tool != ToolKind::Highlighter {
                 state.current_stroke.color = state.normal_stroke_color;
             } else if state.active_tool != ToolKind::Highlighter && tool == ToolKind::Highlighter {
@@ -4621,23 +4735,12 @@ unsafe fn draw_region_control_backdrop(hdc: HDC, state: &OverlayState, region: R
     if height <= 0.0 {
         return;
     }
-    let steps = 18;
-    for step in 0..steps {
-        let t0 = step as f32 / steps as f32;
-        let t1 = (step + 1) as f32 / steps as f32;
-        let alpha = (0.85 * 255.0 * (1.0 - t0).powf(1.65)).round() as u8;
-        if alpha == 0 {
-            continue;
-        }
-        let y = region.y + height * t0;
-        let h = (height * (t1 - t0)).ceil().max(1.0);
-        alpha_fill_rect(
-            hdc,
-            Rect::new(region.x, y, region.width, h),
-            Color::BLACK,
-            alpha,
-        );
-    }
+    alpha_gradient_rect(
+        hdc,
+        Rect::new(region.x, region.y, region.width, height),
+        0.85,
+        1.65,
+    );
 }
 
 unsafe fn draw_region_gradient_border(hdc: HDC, state: &OverlayState, region: Rect) {
@@ -4844,6 +4947,38 @@ unsafe fn alpha_fill_rect(hdc: HDC, rect: Rect, color: Color, alpha: u8) {
     let _ = SelectObject(mem_dc, old);
     let _ = DeleteObject(bitmap);
     let _ = DeleteDC(mem_dc);
+}
+
+unsafe fn alpha_gradient_rect(hdc: HDC, rect: Rect, max_opacity: f32, exponent: f32) {
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for y in 0..height {
+        let t = (y as f32 + 0.5) / height as f32;
+        let alpha = (max_opacity.clamp(0.0, 1.0) * 255.0 * (1.0 - t).powf(exponent))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let row = (y * width * 4) as usize;
+        for x in 0..width {
+            let offset = row + (x * 4) as usize;
+            bgra[offset] = 0;
+            bgra[offset + 1] = 0;
+            bgra[offset + 2] = 0;
+            bgra[offset + 3] = alpha;
+        }
+    }
+
+    let _ = alpha_blend_bgra(
+        hdc,
+        Rect::new(rect.x.round(), rect.y.round(), width as f32, height as f32),
+        width,
+        height,
+        &bgra,
+    );
 }
 
 unsafe fn capture_screen_bitmap(screen_bounds: Rect) -> HBITMAP {
@@ -6438,20 +6573,17 @@ fn fill_mosaic_tile_bgra(
 }
 
 fn mosaic_sample_color(sampled: Color, row: i32, col: i32) -> Color {
-    let noise = (((row * 37 + col * 19 + row * col * 7) % 61) - 30) as i16;
-    let luma = ((sampled.r as u16 * 30 + sampled.g as u16 * 59 + sampled.b as u16 * 11) / 100)
-        as i16
-        + noise;
-    let quantized = if luma < 76 {
-        44
-    } else if luma < 144 {
-        118
-    } else if luma < 210 {
-        176
-    } else {
-        226
-    };
-    Color::rgb(quantized, quantized, quantized)
+    let noise = (((row * 37 + col * 19 + row * col * 7) % 17) - 8) as i16;
+    Color::rgb(
+        quantized_mosaic_channel(sampled.r, noise),
+        quantized_mosaic_channel(sampled.g, noise),
+        quantized_mosaic_channel(sampled.b, noise),
+    )
+}
+
+fn quantized_mosaic_channel(value: u8, noise: i16) -> u8 {
+    let adjusted = (value as i16 + noise).clamp(0, 255);
+    ((adjusted + 8) / 16 * 16).clamp(0, 255) as u8
 }
 
 fn path_surface_for_rect(rect: Rect, stroke_width: f32) -> Rect {

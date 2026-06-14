@@ -2,6 +2,7 @@
 
 mod app_icon;
 mod diagnostics;
+mod hotkey;
 mod native;
 mod overlay;
 mod settings;
