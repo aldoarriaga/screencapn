@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html, body, #stage {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+      user-select: none;
+      touch-action: none;
+    }
+
+    body {
+      cursor: crosshair;
+      font-family: "Segoe UI", Arial, sans-serif;
+    }
+
+    #watermark-input {
+      position: absolute;
+      z-index: 5;
+      display: none;
+      box-sizing: border-box;
+      height: 24px;
+      padding: 0 8px;
+      border: 2px solid #c7c7c7;
+      border-radius: 3px;
+      outline: none;
+      background: #fff;
+      color: #4d4d4d;
+      font: 15px "Segoe UI", Arial, sans-serif;
+    }
+
+    .lexical-text-editor {
+      position: absolute;
+      z-index: 6;
+      display: none;
+      box-sizing: border-box;
+      min-width: 2px;
+      min-height: 1em;
+      margin: 0;
+      border: none;
+      outline: none;
+      background: transparent;
+      box-shadow: none;
+      resize: none;
+      overflow: hidden;
+      white-space: pre-wrap;
+      overflow-wrap: break-word;
+      cursor: text;
+      user-select: text;
+      touch-action: auto;
+      caret-color: currentColor;
+    }
+
+    .lexical-text-editor p {
+      margin: 0;
+      padding: 0;
+    }
+
+    .lexical-text-editor br {
+      margin: 0;
+      padding: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <textarea id="watermark-input" spellcheck="false" placeholder="Type text..."></textarea>
+  <script>
+    window.SCREEN_CAPTN_ICONS = __ICONS_JSON__;
+  </script>
+  <script>
+/*__KONVA__*/
+  </script>
+  <script>
+/*__APP__*/
+  </script>
+</body>
+</html>

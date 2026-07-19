@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="Layer_1" data-name="Layer 1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 16 16">
+  <defs>
+    <style>
+      .cls-1 {
+        font-family: CakeMono-Bold, 'Cake Mono';
+        font-size: 7px;
+        font-weight: 700;
+      }
+
+      .cls-1, .cls-2 {
+        fill: #4d4d4d;
+      }
+
+      .cls-3 {
+        fill: none;
+        stroke: #4d4d4d;
+        stroke-miterlimit: 10;
+      }
+
+      .cls-2 {
+        stroke-width: 0px;
+      }
+    </style>
+  </defs>
+  <text class="cls-1" transform="translate(7.23 10.72)"><tspan x="0" y="0">#</tspan></text>
+  <rect class="cls-3" x="3.5" y="3.5" width="9" height="9" rx="1" ry="1"/>
+  <circle class="cls-2" cx="6.6" cy="10.28" r=".52"/>
+  <circle class="cls-2" cx="5.31" cy="10.28" r=".52"/>
+  <circle class="cls-2" cx="4.02" cy="10.28" r=".52"/>
+</svg>

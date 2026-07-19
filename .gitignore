@@ -1,0 +1,11 @@
+/target/
+/.cargo-target*/
+/build-test-dir/
+/node_modules/
+crates/screencaptn-win/web-ui-vendor-temp/
+/.vs/
+/.idea/
+*.user
+*.suo
+*.pdb
+*.log

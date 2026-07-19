@@ -1,0 +1,44 @@
+[package]
+name = "screencaptn-win"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "screencaptn"
+path = "src/main.rs"
+
+[dependencies]
+screencaptn-core = { path = "../screencaptn-core" }
+png = "0.17"
+resvg = "0.45"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+webview2-com = "0.34"
+windows = { version = "0.58", features = [
+  "ApplicationModel",
+  "Foundation",
+  "Foundation_Collections",
+  "Services_Store",
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Globalization",
+  "Win32_Security",
+  "Win32_System_DataExchange",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_System_WinRT",
+  "Win32_Networking_WinHttp",
+  "Win32_UI_Controls_Dialogs",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_WindowsAndMessaging",
+] }

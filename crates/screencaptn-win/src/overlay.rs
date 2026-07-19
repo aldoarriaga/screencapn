@@ -1,0 +1,9735 @@
+use crate::diagnostics;
+use crate::settings::{save_settings, AppSettings, AspectRatioMode};
+use crate::theme::ToolbarPalette;
+use crate::util::{point_from_lparam, rect_to_rect, SelectedPen, SelectedStockObject};
+use screencaptn_core::{
+    Annotation, AnnotationId, AnnotationKind, CaptureSession, Color, HighlightShape, MosaicMode,
+    Point, Rect, ResizeHandle, StrokeStyle, ToolKind,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::ffi::c_void;
+use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
+use std::io::{BufReader, Write};
+use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use windows::core::{w, Result, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Globalization::{GetDateFormatEx, DATE_SHORTDATE};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Gdi::{
+    AlphaBlend, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, FrameRect, GetDC,
+    GetDIBits, GetMonitorInfoW, GetPixel, GetTextExtentPoint32W, InvalidateRect, LineTo,
+    MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetStretchBltMode,
+    SetTextColor, StretchBlt, TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, BLENDFUNCTION, COLORONCOLOR, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE,
+    DT_VCENTER, DT_WORDBREAK, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    SRCCOPY, TRANSPARENT,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetSaveFileNameW, OFN_EXPLORER, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DOWN, VK_LEFT, VK_RETURN,
+    VK_RIGHT, VK_SHIFT, VK_UP,
+};
+use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{
+    FileOpenDialog, IFileOpenDialog, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+    SIGDN_FILESYSPATH,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetAncestor,
+    GetCursorPos, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindow, GetWindowLongW,
+    GetWindowRect, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, MessageBoxW, PostMessageW,
+    RegisterClassW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
+    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_USERDATA, GWL_EXSTYLE,
+    GWL_STYLE, GW_OWNER, HMENU, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW,
+    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MB_ICONERROR, MB_ICONWARNING, MB_OK, MSG,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW,
+    WM_APP, WM_CHAR, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+};
+
+const OVERLAY_CLASS: windows::core::PCWSTR = w!("ScreenCaptnCaptureOverlay");
+const WM_OVERLAY_CLOSE_REQUEST: u32 = WM_APP + 0x40;
+const CF_BITMAP_FORMAT: u32 = 2;
+const HANDLE_RADIUS: f32 = 6.0;
+const REGION_RESIZE_HIT_RADIUS: f32 = 38.0;
+const MIN_REGION_SIZE: f32 = 24.0;
+const TOOLBAR_BUTTON: f32 = 36.0;
+const TOOLBAR_HEIGHT: f32 = 36.0;
+const FRAME_HIT_WIDTH: f32 = 32.0;
+const CLICK_DRAG_THRESHOLD: f32 = 5.0;
+const ALL_SCREENS_TOP_EDGE_THRESHOLD_PX: f32 = 4.0;
+const CURRENT_SCREEN_TOP_THRESHOLD_PX: f32 = 32.0;
+const WINDOW_CHROME_MAX_HEIGHT_PX: f32 = 120.0;
+const WINDOW_CHROME_HEIGHT_RATIO: f32 = 0.18;
+const WINDOW_OVERLAP_TOLERANCE: f32 = 4.0;
+const HOVER_STABILITY_MS: u64 = 80;
+const MIN_RECT_CHANGE_PX: f32 = 16.0;
+const CONFIDENCE_SWITCH_DELTA: f32 = 0.15;
+const TOOLBAR_RADIUS: f32 = 5.0;
+const TOOL_ICON_SIZE: f32 = 24.0;
+const TOOL_ICON_SELECTED_RADIUS: f32 = 3.0;
+const HIGHLIGHTER_RADIUS: f32 = 4.0;
+const PEN_POINT_SPACING: f32 = 5.5;
+const DEFAULT_TEXT_FONT_SIZE: f32 = 27.0;
+const INLINE_TEXT_PADDING: f32 = 8.0;
+const INLINE_TEXT_ASCENT: f32 = 1.12;
+const INLINE_TEXT_LINE_HEIGHT: f32 = 1.22;
+const INLINE_TEXT_WIDTH_CACHE_LIMIT: usize = 256;
+const TAG_DEFAULT_WIDTH: f32 = 146.0;
+const TAG_DEFAULT_HEIGHT: f32 = 55.0;
+const TAG_FRAME: f32 = 14.0;
+const TAG_RADIUS: f32 = 5.0;
+const CARET_TIMER_ID: usize = 1;
+const NUMBERING_TOGGLE_TIMER_ID: usize = 2;
+const REGION_BORDER_TIMER_ID: usize = 3;
+const SUBMENU_HEIGHT: f32 = 24.0;
+const SUBMENU_RADIUS: f32 = 4.0;
+const SUBMENU_NOTCH: f32 = 10.0;
+const SUBMENU_SWATCH: f32 = 16.0;
+const SUBMENU_GAP: f32 = 6.0;
+const SUBMENU_DIVIDER: f32 = 10.0;
+const SUBMENU_EDGE_PAD: f32 = 6.0;
+const MIN_STROKE_WIDTH: f32 = 1.0;
+const MAX_STROKE_WIDTH: f32 = 24.0;
+const MIN_TAG_STROKE_WIDTH: f32 = 6.0;
+const MIN_FONT_SIZE: f32 = 27.0;
+const MAX_FONT_SIZE: f32 = 56.0;
+const MIN_WATERMARK_FONT_SIZE: f32 = 8.0;
+const WATERMARK_OPACITY: f32 = 0.5;
+const WATERMARK_ROTATION_DEGREES: f32 = -20.0;
+const WEB_EXPORT_ENABLED: bool = false;
+const REGION_CONTROL_ICON_SIZE: f32 = 16.0;
+const REGION_CONTROL_GAP: f32 = 11.0;
+const REGION_CONTROL_MARGIN: f32 = 18.0;
+const REGION_CONTROL_DIVIDER_HEIGHT: f32 = 22.0;
+const MAGNIFIER_SIZE: f32 = 104.0;
+const MAGNIFIER_SAMPLE_SIZE: f32 = 18.0;
+
+pub use crate::theme::AppTheme;
+
+pub fn open_capture_overlay(theme: AppTheme, settings: AppSettings) -> Result<()> {
+    unsafe {
+        let instance = GetModuleHandleW(None)?;
+        let class = WNDCLASSW {
+            hCursor: LoadCursorW(None, IDC_CROSS)?,
+            hInstance: instance.into(),
+            lpszClassName: OVERLAY_CLASS,
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(overlay_wnd_proc),
+            ..Default::default()
+        };
+        RegisterClassW(&class);
+
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        let screen_bounds = Rect::new(x as f32, y as f32, width as f32, height as f32);
+        let detected_regions = collect_detected_regions(screen_bounds);
+        let background_bitmap = capture_screen_bitmap(screen_bounds);
+        let mut cursor = POINT::default();
+        let cursor_screen = if GetCursorPos(&mut cursor).is_ok() {
+            Point::new(cursor.x as f32, cursor.y as f32)
+        } else {
+            screen_bounds.center()
+        };
+        let initial_candidate = current_screen_candidate(cursor_screen, screen_bounds);
+        let initial_monitor = initial_candidate
+            .as_ref()
+            .map(|candidate| candidate.rect)
+            .unwrap_or(screen_bounds);
+        let mut state = Box::new(OverlayState::new(
+            screen_bounds,
+            background_bitmap,
+            detected_regions,
+            theme,
+            settings,
+        ));
+        state.ui_scale = ui_scale_for_screen(initial_monitor);
+        state.ui_scale_monitor_id = Some(monitor_id(initial_monitor));
+        state.cursor_position = state.screen_to_overlay(cursor_screen);
+        state.smart_region = initial_candidate;
+        apply_locked_region_on_launch(&mut state, cursor_screen);
+        let state_ptr = state.as_mut() as *mut OverlayState;
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            OVERLAY_CLASS,
+            w!("Screen Captn Capture"),
+            WS_POPUP,
+            x,
+            y,
+            width,
+            height,
+            None,
+            HMENU::default(),
+            instance,
+            Some(state_ptr.cast()),
+        )?;
+        state.hwnd = hwnd;
+        match crate::web_ui::WebUi::create(hwnd, state_ptr.cast::<c_void>(), overlay_web_message) {
+            Ok(web_ui) => {
+                state.web_ui = Some(web_ui);
+            }
+            Err(error) => {
+                write_web_ui_debug(&format!("webui-create-error: {error:?}"));
+            }
+        }
+        sync_web_full_snapshot(&mut state);
+        Box::leak(state);
+
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(hwnd);
+
+        let mut msg = MSG::default();
+        while BOOL::from(GetMessageW(&mut msg, None, 0, 0)).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if !windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct OverlayState {
+    hwnd: HWND,
+    screen_bounds: Rect,
+    background_bitmap: HBITMAP,
+    detected_regions: Vec<DetectedRegion>,
+    smart_region: Option<SmartRegionCandidate>,
+    pending_smart_region: Option<PendingSmartRegion>,
+    ratio_placement_mode: bool,
+    cursor_position: Point,
+    session: CaptureSession,
+    active_tool: ToolKind,
+    numbering_enabled: bool,
+    numbering_toggle_progress: f32,
+    current_stroke: StrokeStyle,
+    tool_stroke_widths: [f32; 11],
+    normal_stroke_color: Color,
+    highlighter_opacity: f32,
+    mosaic_brush_size: f32,
+    font_size: f32,
+    watermark_font_size: f32,
+    next_step_number: u32,
+    editing_text_id: Option<AnnotationId>,
+    editing_text_caret: usize,
+    editing_step_number_id: Option<AnnotationId>,
+    editing_step_number_replace: bool,
+    style_edit_in_progress: bool,
+    toolbar_origin: Option<Point>,
+    drag: Option<DragState>,
+    toolbar_buttons: Vec<ToolbarButton>,
+    submenu_buttons: Vec<SubmenuButton>,
+    submenu_sliders: Vec<SubmenuSlider>,
+    submenu_rect: Option<Rect>,
+    active_submenu: Option<ToolKind>,
+    pen_mode: PenMode,
+    highlighter_shape: HighlightShape,
+    text_filled: bool,
+    watermark_mode: WatermarkMode,
+    watermark_date_enabled: bool,
+    watermark_text: String,
+    watermark_color: Color,
+    watermark_image_path: Option<PathBuf>,
+    watermark_image_bitmap: Option<WatermarkBitmap>,
+    watermark_image_data_url: Option<String>,
+    editing_watermark_text: bool,
+    ui_scale: f32,
+    ui_scale_monitor_id: Option<String>,
+    theme: AppTheme,
+    web_ui: Option<crate::web_ui::WebUi>,
+    web_ui_failed: bool,
+    web_toolbar_ready: bool,
+    web_toolbar_waiting_for_revision: Option<u64>,
+    close_requested: bool,
+    web_pointer_raw_mode: bool,
+    web_revision: u64,
+    web_sync_baseline: Option<WebSyncBaseline>,
+    force_web_full_snapshot: bool,
+    render_cache: Option<RenderCache>,
+    static_layer_dirty: bool,
+    defer_watermark_static_redraw_once: bool,
+    settings: AppSettings,
+    region_control_buttons: Vec<RegionControlButton>,
+    region_control_bounds: Option<Rect>,
+    hovered_region_control: Option<RegionControlKind>,
+}
+
+impl OverlayState {
+    fn new(
+        screen_bounds: Rect,
+        background_bitmap: HBITMAP,
+        detected_regions: Vec<DetectedRegion>,
+        theme: AppTheme,
+        mut settings: AppSettings,
+    ) -> Self {
+        settings.aspect_ratio = AspectRatioMode::Custom;
+        let ui_scale = ui_scale_for_screen(screen_bounds);
+        let current_stroke = StrokeStyle::default();
+        Self {
+            hwnd: HWND::default(),
+            screen_bounds,
+            background_bitmap,
+            detected_regions,
+            smart_region: None,
+            pending_smart_region: None,
+            ratio_placement_mode: false,
+            cursor_position: Point::new(0.0, 0.0),
+            session: CaptureSession::with_history_limit(100, 64 * 1024 * 1024),
+            active_tool: ToolKind::Rectangle,
+            numbering_enabled: false,
+            numbering_toggle_progress: 0.0,
+            normal_stroke_color: current_stroke.color,
+            current_stroke,
+            tool_stroke_widths: [current_stroke.width; 11],
+            highlighter_opacity: 0.30,
+            mosaic_brush_size: 16.0,
+            font_size: DEFAULT_TEXT_FONT_SIZE,
+            watermark_font_size: DEFAULT_TEXT_FONT_SIZE,
+            next_step_number: 1,
+            editing_text_id: None,
+            editing_text_caret: 0,
+            editing_step_number_id: None,
+            editing_step_number_replace: false,
+            style_edit_in_progress: false,
+            toolbar_origin: None,
+            drag: None,
+            toolbar_buttons: Vec::new(),
+            submenu_buttons: Vec::new(),
+            submenu_sliders: Vec::new(),
+            submenu_rect: None,
+            active_submenu: Some(ToolKind::Rectangle),
+            pen_mode: PenMode::Free,
+            highlighter_shape: HighlightShape::Rectangle,
+            text_filled: false,
+            watermark_mode: WatermarkMode::Text,
+            watermark_date_enabled: false,
+            watermark_text: String::new(),
+            watermark_color: current_stroke.color,
+            watermark_image_path: None,
+            watermark_image_bitmap: None,
+            watermark_image_data_url: None,
+            editing_watermark_text: false,
+            ui_scale,
+            ui_scale_monitor_id: None,
+            theme,
+            web_ui: None,
+            web_ui_failed: false,
+            web_toolbar_ready: false,
+            web_toolbar_waiting_for_revision: None,
+            close_requested: false,
+            web_pointer_raw_mode: false,
+            web_revision: 0,
+            web_sync_baseline: None,
+            force_web_full_snapshot: true,
+            render_cache: None,
+            static_layer_dirty: true,
+            defer_watermark_static_redraw_once: false,
+            settings,
+            region_control_buttons: Vec::new(),
+            region_control_bounds: None,
+            hovered_region_control: None,
+        }
+    }
+
+    fn checkpoint(&mut self) {
+        self.session.checkpoint();
+    }
+
+    fn screen_to_overlay(&self, point: Point) -> Point {
+        point.translate(-self.screen_bounds.x, -self.screen_bounds.y)
+    }
+
+    fn overlay_to_screen(&self, point: Point) -> Point {
+        point.translate(self.screen_bounds.x, self.screen_bounds.y)
+    }
+
+    fn region_overlay(&self) -> Option<Rect> {
+        self.session
+            .document
+            .capture_region
+            .map(|region| region.translate(-self.screen_bounds.x, -self.screen_bounds.y))
+    }
+
+    fn mark_static_dirty(&mut self) {
+        self.static_layer_dirty = true;
+    }
+}
+
+#[derive(Deserialize)]
+struct WebUiMessage {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "requestId")]
+    request_id: Option<u64>,
+    revision: Option<u64>,
+    x: Option<f32>,
+    y: Option<f32>,
+    #[serde(rename = "rawX")]
+    raw_x: Option<f32>,
+    #[serde(rename = "rawY")]
+    raw_y: Option<f32>,
+    tool: Option<String>,
+    color: Option<String>,
+    value: Option<f32>,
+    mode: Option<String>,
+    shape: Option<String>,
+    filled: Option<bool>,
+    text: Option<String>,
+    id: Option<AnnotationId>,
+    format: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    #[serde(rename = "keyCode")]
+    key_code: Option<u32>,
+    #[serde(rename = "charCode")]
+    char_code: Option<u32>,
+    #[serde(rename = "caretIndex")]
+    caret_index: Option<usize>,
+    #[serde(rename = "editHandle")]
+    edit_handle: Option<String>,
+    #[serde(rename = "preserveEmpty")]
+    preserve_empty: Option<bool>,
+    #[serde(rename = "shiftKey")]
+    shift_key: Option<bool>,
+    #[serde(rename = "ctrlKey")]
+    ctrl_key: Option<bool>,
+    reason: Option<String>,
+    level: Option<String>,
+    message: Option<String>,
+    details: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy)]
+enum ExportTarget {
+    Clipboard,
+    Save,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct WebColor {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+impl From<Color> for WebColor {
+    fn from(color: Color) -> Self {
+        Self {
+            r: color.r,
+            g: color.g,
+            b: color.b,
+            a: color.a,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RenderStyle {
+    corner_radius: f32,
+    tag_radius: f32,
+    tag_frame: f32,
+    tag_inner_pad: f32,
+    arrow_min_head: f32,
+    arrow_head_width_factor: f32,
+    arrow_head_length_factor: f32,
+    pen_tension: f32,
+    highlighter_opacity: f32,
+    highlighter_line_base: f32,
+    highlighter_line_width_factor: f32,
+    mosaic_cell: f32,
+    selection_color: WebColor,
+    selection_handle_size: f32,
+    step_badge_size: f32,
+    step_badge_font_size: f32,
+}
+
+impl RenderStyle {
+    fn for_state(state: &OverlayState) -> Self {
+        Self {
+            corner_radius: scaled(state, HIGHLIGHTER_RADIUS),
+            tag_radius: scaled(state, TAG_RADIUS),
+            tag_frame: scaled(state, TAG_FRAME),
+            tag_inner_pad: scaled(state, 8.0),
+            arrow_min_head: 12.0,
+            arrow_head_width_factor: 3.0,
+            arrow_head_length_factor: 3.0,
+            pen_tension: 0.35,
+            highlighter_opacity: state.highlighter_opacity,
+            highlighter_line_base: 12.0,
+            highlighter_line_width_factor: 1.5,
+            mosaic_cell: scaled(state, 10.8),
+            selection_color: Color::BLUE.into(),
+            selection_handle_size: scaled(state, 8.0),
+            step_badge_size: scaled(state, 24.0),
+            step_badge_font_size: scaled(state, 14.0),
+        }
+    }
+}
+
+unsafe fn overlay_web_message(context: *mut c_void, message: String) {
+    if context.is_null() {
+        return;
+    }
+    let state = &mut *(context as *mut OverlayState);
+    let needs_static_redraw = web_message_needs_static_redraw(state, &message);
+    let should_sync = handle_web_ui_message(state, &message);
+    if should_sync && !state.close_requested {
+        if needs_static_redraw {
+            state.mark_static_dirty();
+        }
+        let _ = InvalidateRect(state.hwnd, None, false);
+        sync_web_after_change(state);
+    }
+}
+
+fn web_message_needs_static_redraw(state: &OverlayState, message: &str) -> bool {
+    let Ok(message) = serde_json::from_str::<WebUiMessage>(message) else {
+        return false;
+    };
+    match message.kind.as_str() {
+        "webviewProcessFailed" => true,
+        "ready" => true,
+        "pointerUp" => matches!(
+            state.drag,
+            Some(
+                DragState::DrawingAnnotation { .. }
+                    | DragState::MovingRegion { .. }
+                    | DragState::ResizingRegion { .. }
+                    | DragState::MovingAnnotation { .. }
+                    | DragState::EditingAnnotation { .. }
+            )
+        ),
+        "pointerMove" => matches!(
+            state.drag,
+            Some(
+                DragState::MovingRegion { .. }
+                    | DragState::ResizingRegion { .. }
+                    | DragState::MovingAnnotation { .. }
+                    | DragState::EditingAnnotation { .. }
+            )
+        ),
+        "commitText" | "cancelText" | "setTextDraft" | "char" | "keyDown" | "setTextCaret" => true,
+        "setWatermarkMode" | "clearWatermark" | "focusWatermarkText" | "blurWatermarkText"
+        | "setWatermarkText" => true,
+        "setColor" => state.active_submenu == Some(ToolKind::Watermark),
+        "setFontSize" => {
+            state.active_submenu == Some(ToolKind::Watermark)
+                || state.editing_watermark_text
+                || state
+                    .session
+                    .document
+                    .selected_annotation_id
+                    .and_then(|id| state.session.document.annotation(id))
+                    .is_some_and(|annotation| {
+                        is_mosaic_annotation(annotation) || is_watermark_annotation(annotation)
+                    })
+        }
+        _ => false,
+    }
+}
+
+fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
+    let Ok(message) = serde_json::from_str::<WebUiMessage>(message) else {
+        return false;
+    };
+
+    match message.kind.as_str() {
+        "webviewProcessFailed" => {
+            state.web_ui_failed = true;
+            state.web_pointer_raw_mode = false;
+            if let Some(web_ui) = &state.web_ui {
+                web_ui.set_visible(false);
+            }
+            state.mark_static_dirty();
+            true
+        }
+        "ready" => {
+            state.web_ui_failed = false;
+            state.force_web_full_snapshot = true;
+            true
+        }
+        "rendered" => {
+            if state.web_toolbar_waiting_for_revision == message.revision {
+                state.web_toolbar_waiting_for_revision = None;
+                state.web_toolbar_ready = true;
+                // The native toolbar was the instant visual fallback. Remove it only
+                // after WebView has painted the matching revision.
+                unsafe {
+                    let _ = InvalidateRect(state.hwnd, None, false);
+                }
+            }
+            false
+        }
+        "pointerDown" => {
+            if state.drag.is_some() {
+                return false;
+            }
+            if let Some(point) = web_pointer_down_point(state, &message) {
+                handle_mouse_down(state, point, message.caret_index);
+                true
+            } else {
+                false
+            }
+        }
+        "beginAnnotationEdit" => begin_web_annotation_edit(state, &message),
+        "pointerDownAnnotation" => begin_web_annotation_interaction(state, &message),
+        "pointerMove" => {
+            if let Some(point) = web_pointer_point(state, &message) {
+                state.cursor_position = point;
+                let drawing_annotation =
+                    matches!(state.drag, Some(DragState::DrawingAnnotation { .. }));
+                let changed = handle_mouse_move(state, point);
+                if drawing_annotation {
+                    if state.active_tool == ToolKind::Mosaic {
+                        unsafe {
+                            let _ = InvalidateRect(state.hwnd, None, false);
+                        }
+                    }
+                    false
+                } else {
+                    changed
+                }
+            } else {
+                false
+            }
+        }
+        "pointerUp" => {
+            if let Some(point) = web_pointer_point(state, &message) {
+                handle_mouse_up(state, point);
+                state.web_pointer_raw_mode = false;
+                true
+            } else {
+                false
+            }
+        }
+        "setToolbarOrigin" => {
+            if let Some(point) = message_point(&message) {
+                state.toolbar_origin = Some(point);
+                true
+            } else {
+                false
+            }
+        }
+        "toggleRegionLock" => {
+            handle_region_control_action(state, RegionControlKind::Lock);
+            true
+        }
+        "cycleAspectRatio" => {
+            handle_region_control_action(state, RegionControlKind::Ratio);
+            true
+        }
+        "selectTool" => {
+            if let Some(tool) = message.tool.as_deref().and_then(tool_from_web_name) {
+                handle_toolbar_action(state, ToolbarAction::Tool(tool));
+                true
+            } else {
+                false
+            }
+        }
+        "toggleNumbering" => {
+            handle_toolbar_action(state, ToolbarAction::Numbering);
+            true
+        }
+        "setNumberingMode" => {
+            if let Some(mode) = message.mode.as_deref() {
+                handle_numbering_mode(state, mode);
+                true
+            } else {
+                false
+            }
+        }
+        "editStepNumber" => {
+            if let Some(id) = message.id {
+                start_step_number_editing(state, id);
+                true
+            } else {
+                false
+            }
+        }
+        "toggleTheme" => {
+            state.theme = crate::theme::toggled_theme(state.theme);
+            crate::theme::save_theme(state.theme);
+            true
+        }
+        "undo" => {
+            handle_toolbar_action(state, ToolbarAction::Undo);
+            true
+        }
+        "copy" => {
+            handle_toolbar_action(state, ToolbarAction::Copy);
+            false
+        }
+        "save" => {
+            handle_toolbar_action(state, ToolbarAction::Save);
+            !state.close_requested
+        }
+        "cancel" => {
+            handle_toolbar_action(state, ToolbarAction::Cancel);
+            false
+        }
+        "deselect" => {
+            deselect_all(state);
+            true
+        }
+        "beginStyleEdit" => {
+            if state.session.document.selected_annotation_id.is_some() {
+                state.checkpoint();
+                state.style_edit_in_progress = true;
+            }
+            false
+        }
+        "endStyleEdit" => {
+            state.style_edit_in_progress = false;
+            false
+        }
+        "setColor" => {
+            if let Some(color) = message.color.as_deref().and_then(color_from_hex) {
+                handle_submenu_action(state, SubmenuAction::Color(color));
+                true
+            } else {
+                false
+            }
+        }
+        "setStrokeWidth" => {
+            if let Some(value) = message.value {
+                handle_submenu_action(state, SubmenuAction::StrokeWidth(value));
+                true
+            } else {
+                false
+            }
+        }
+        "setFontSize" => {
+            if let Some(value) = message.value {
+                handle_submenu_action(state, SubmenuAction::FontSize(value));
+                true
+            } else {
+                false
+            }
+        }
+        "setPenMode" => {
+            if let Some(mode) = message.mode.as_deref().and_then(pen_mode_from_web_name) {
+                handle_submenu_action(state, SubmenuAction::PenMode(mode));
+                true
+            } else {
+                false
+            }
+        }
+        "setHighlighterShape" => {
+            if let Some(shape) = message
+                .shape
+                .as_deref()
+                .and_then(highlighter_shape_from_web_name)
+            {
+                handle_submenu_action(state, SubmenuAction::HighlighterShape(shape));
+                true
+            } else {
+                false
+            }
+        }
+        "setTextFilled" => {
+            if let Some(filled) = message.filled {
+                handle_submenu_action(state, SubmenuAction::TextFilled(filled));
+                true
+            } else {
+                false
+            }
+        }
+        "setTextDraft" => {
+            if let (Some(id), Some(text)) = (message.id, message.text) {
+                update_text_annotation(state, id, text);
+                true
+            } else {
+                false
+            }
+        }
+        "commitText" => {
+            if let (Some(id), Some(text)) = (message.id, message.text) {
+                if text.is_empty()
+                    && !message.preserve_empty.unwrap_or(false)
+                    && should_remove_empty_text_annotation(state, id)
+                {
+                    state.session.select_annotation(Some(id));
+                    let _ = state.session.remove_selected_annotation();
+                    state.mark_static_dirty();
+                } else {
+                    update_text_annotation(state, id, text);
+                }
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
+                true
+            } else {
+                false
+            }
+        }
+        "cancelText" => {
+            if let (Some(id), Some(text)) = (message.id, message.text) {
+                if text.is_empty() && should_remove_empty_text_annotation(state, id) {
+                    state.session.select_annotation(Some(id));
+                    let _ = state.session.remove_selected_annotation();
+                } else {
+                    update_text_annotation(state, id, text);
+                }
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
+                true
+            } else {
+                false
+            }
+        }
+        "setWatermarkMode" => {
+            if let Some(mode) = message
+                .mode
+                .as_deref()
+                .and_then(watermark_mode_from_web_name)
+            {
+                handle_submenu_action(state, SubmenuAction::WatermarkMode(mode));
+                true
+            } else {
+                false
+            }
+        }
+        "clearWatermark" => {
+            clear_watermark(state);
+            true
+        }
+        "focusWatermarkText" => {
+            state.watermark_mode = WatermarkMode::Text;
+            state.editing_watermark_text = true;
+            state.editing_text_id = None;
+            state.editing_text_caret = 0;
+            state.editing_step_number_id = None;
+            true
+        }
+        "blurWatermarkText" => {
+            state.editing_watermark_text = false;
+            true
+        }
+        "setWatermarkText" => {
+            if let Some(text) = message.text {
+                state.watermark_mode = WatermarkMode::Text;
+                state.watermark_text = text;
+                state.editing_watermark_text = true;
+                state.mark_static_dirty();
+                true
+            } else {
+                false
+            }
+        }
+        "keyDown" => {
+            if let Some(key) = message.key_code {
+                let was_text_editing = state.editing_text_id.is_some()
+                    || state.editing_watermark_text
+                    || state.editing_step_number_id.is_some();
+                let had_active_annotation = has_active_annotation_state(state);
+                handle_key_down(state, key, message.shift_key.unwrap_or(false));
+                was_text_editing
+                    || had_active_annotation
+                    || (key != 0x1B && key != VK_RETURN.0 as u32)
+            } else {
+                false
+            }
+        }
+        "regionWheel" => {
+            if let Some(delta) = message.value {
+                if handle_mouse_wheel(
+                    state,
+                    delta.round() as i16,
+                    message.shift_key.unwrap_or(false),
+                    message.ctrl_key.unwrap_or(false),
+                ) {
+                    state.mark_static_dirty();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        "char" => {
+            if let Some(code) = message.char_code {
+                handle_char(state, code);
+                true
+            } else {
+                false
+            }
+        }
+        "setTextCaret" => {
+            if let Some(caret) = message.caret_index {
+                set_text_caret(state, caret);
+                true
+            } else {
+                false
+            }
+        }
+        "diagnostic" => {
+            handle_web_diagnostic(&message);
+            false
+        }
+        "exportReady" => {
+            handle_web_export_ready(&message);
+            false
+        }
+        "exportFailed" => {
+            handle_web_export_failed(&message);
+            false
+        }
+        _ => false,
+    }
+}
+
+fn handle_web_diagnostic(message: &WebUiMessage) {
+    diagnostics::log_event(
+        "web-js",
+        &format!(
+            "level={} message={} details={}",
+            message.level.as_deref().unwrap_or("unknown"),
+            message.message.as_deref().unwrap_or(""),
+            message
+                .details
+                .as_ref()
+                .map(serde_json::Value::to_string)
+                .unwrap_or_else(|| "null".to_string())
+        ),
+    );
+}
+fn handle_web_export_ready(message: &WebUiMessage) {
+    write_web_ui_debug(&format!(
+        "web-export-ready: request={:?} format={:?} size={:?}x{:?}",
+        message.request_id, message.format, message.width, message.height
+    ));
+}
+
+#[derive(Clone, Debug, Default)]
+struct WebSyncBaseline {
+    state_patch_signature: String,
+    annotations: Vec<(AnnotationId, u64)>,
+}
+
+fn handle_web_export_failed(message: &WebUiMessage) {
+    write_web_ui_debug(&format!(
+        "web-export-failed: request={:?} reason={}",
+        message.request_id,
+        message.reason.as_deref().unwrap_or("unknown")
+    ));
+}
+
+fn write_web_ui_debug(message: &str) {
+    if !diagnostics::enabled() {
+        return;
+    }
+    let path = std::env::temp_dir().join("screencaptn-web-ui-debug.log");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn web_ui_owns_pointer_input(state: &OverlayState) -> bool {
+    state.web_ui.is_some()
+        && !state.web_ui_failed
+        && state.session.document.capture_region.is_some()
+}
+
+fn sync_web_full_snapshot(state: &mut OverlayState) {
+    if state.web_ui_failed {
+        return;
+    }
+    let Some(web_ui) = &state.web_ui else {
+        return;
+    };
+    web_ui.set_visible(state.session.document.capture_region.is_some());
+    state.web_revision = state.web_revision.saturating_add(1);
+    if state.session.document.capture_region.is_some() && !state.web_toolbar_ready {
+        state.web_toolbar_waiting_for_revision = Some(state.web_revision);
+    }
+    let payload = serde_json::json!({
+        "type": "state",
+        "revision": state.web_revision,
+        "state": web_ui_state(state),
+    })
+    .to_string();
+    web_ui.post_json(&payload);
+    state.web_sync_baseline = Some(capture_web_sync_baseline(state));
+    state.force_web_full_snapshot = false;
+}
+
+fn sync_web_after_change(state: &mut OverlayState) {
+    refresh_ui_scale(state);
+    if state.force_web_full_snapshot || state.web_sync_baseline.is_none() {
+        sync_web_full_snapshot(state);
+    } else {
+        sync_web_render_diff(state);
+    }
+}
+
+fn sync_web_render_diff(state: &mut OverlayState) {
+    if state.web_ui_failed {
+        return;
+    }
+    let Some(web_ui) = &state.web_ui else {
+        return;
+    };
+    web_ui.set_visible(state.session.document.capture_region.is_some());
+
+    let previous = state.web_sync_baseline.clone().unwrap_or_default();
+    let next = capture_web_sync_baseline(state);
+    let (removed, added, updated) = web_annotation_diff_payloads(state, &previous, &next);
+    let state_patch_changed = previous.state_patch_signature != next.state_patch_signature;
+
+    if !state_patch_changed && added.is_empty() && updated.is_empty() && removed.is_empty() {
+        state.web_sync_baseline = Some(next);
+        return;
+    }
+
+    state.web_revision = state.web_revision.saturating_add(1);
+    if state.session.document.capture_region.is_some() && !state.web_toolbar_ready {
+        state.web_toolbar_waiting_for_revision = Some(state.web_revision);
+    }
+    let payload = serde_json::json!({
+        "type": "renderDiff",
+        "revision": state.web_revision,
+        "state": if state_patch_changed { web_ui_state_patch(state) } else { serde_json::Value::Null },
+        "added": added,
+        "updated": updated,
+        "removed": removed,
+    })
+    .to_string();
+    web_ui.post_json(&payload);
+    state.web_sync_baseline = Some(next);
+}
+
+fn capture_web_sync_baseline(state: &OverlayState) -> WebSyncBaseline {
+    WebSyncBaseline {
+        state_patch_signature: web_ui_state_patch(state).to_string(),
+        annotations: web_annotation_signatures(state),
+    }
+}
+
+fn web_annotation_signatures(state: &OverlayState) -> Vec<(AnnotationId, u64)> {
+    let mut signatures: Vec<(AnnotationId, u64)> = state
+        .session
+        .document
+        .annotations
+        .iter()
+        .map(|annotation| (annotation.id, web_annotation_signature(state, annotation)))
+        .collect();
+    signatures.sort_unstable_by_key(|(id, _)| *id);
+    signatures
+}
+
+fn web_annotation_diff_payloads(
+    state: &OverlayState,
+    previous: &WebSyncBaseline,
+    next: &WebSyncBaseline,
+) -> (
+    Vec<AnnotationId>,
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+) {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut previous_index = 0;
+    let mut next_index = 0;
+
+    while previous_index < previous.annotations.len() || next_index < next.annotations.len() {
+        match (
+            previous.annotations.get(previous_index),
+            next.annotations.get(next_index),
+        ) {
+            (Some((previous_id, previous_signature)), Some((next_id, next_signature)))
+                if previous_id == next_id =>
+            {
+                if previous_signature != next_signature {
+                    if let Some(annotation) = web_annotation_json_by_id(state, *next_id) {
+                        updated.push(annotation);
+                    }
+                }
+                previous_index += 1;
+                next_index += 1;
+            }
+            (Some((previous_id, _)), Some((next_id, _))) if previous_id < next_id => {
+                removed.push(*previous_id);
+                previous_index += 1;
+            }
+            (Some(_), Some((next_id, _))) => {
+                if let Some(annotation) = web_annotation_json_by_id(state, *next_id) {
+                    added.push(annotation);
+                }
+                next_index += 1;
+            }
+            (Some((previous_id, _)), None) => {
+                removed.push(*previous_id);
+                previous_index += 1;
+            }
+            (None, Some((next_id, _))) => {
+                if let Some(annotation) = web_annotation_json_by_id(state, *next_id) {
+                    added.push(annotation);
+                }
+                next_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    (removed, added, updated)
+}
+
+fn web_annotation_signature(state: &OverlayState, annotation: &Annotation) -> u64 {
+    let origin = Point::new(state.screen_bounds.x, state.screen_bounds.y);
+    let mut hasher = DefaultHasher::new();
+    annotation.id.hash(&mut hasher);
+    hash_rect(
+        annotation.bounds.translate(-origin.x, -origin.y),
+        &mut hasher,
+    );
+    hash_stroke(annotation.stroke, &mut hasher);
+    annotation.step_number.hash(&mut hasher);
+    hash_annotation_kind(&annotation.kind, origin, &mut hasher);
+    hasher.finish()
+}
+
+fn hash_annotation_kind(kind: &AnnotationKind, origin: Point, hasher: &mut DefaultHasher) {
+    match kind {
+        AnnotationKind::Rectangle => "rectangle".hash(hasher),
+        AnnotationKind::Oval => "oval".hash(hasher),
+        AnnotationKind::Line { start, end } => {
+            "line".hash(hasher);
+            hash_point(start.translate(-origin.x, -origin.y), hasher);
+            hash_point(end.translate(-origin.x, -origin.y), hasher);
+        }
+        AnnotationKind::Arrow { start, end } => {
+            "arrow".hash(hasher);
+            hash_point(start.translate(-origin.x, -origin.y), hasher);
+            hash_point(end.translate(-origin.x, -origin.y), hasher);
+        }
+        AnnotationKind::StepNumber { number } => {
+            "step".hash(hasher);
+            number.hash(hasher);
+        }
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            filled,
+        } => {
+            "text".hash(hasher);
+            text.hash(hasher);
+            hash_f32(*font_size, hasher);
+            framed.hash(hasher);
+            filled.hash(hasher);
+        }
+        AnnotationKind::Tag {
+            label,
+            anchor,
+            font_size,
+        } => {
+            "tag".hash(hasher);
+            label.hash(hasher);
+            hash_point(anchor.translate(-origin.x, -origin.y), hasher);
+            hash_f32(*font_size, hasher);
+        }
+        AnnotationKind::Mosaic { mode, brush_size } => {
+            "mosaic".hash(hasher);
+            mosaic_mode_web_name(*mode).hash(hasher);
+            hash_f32(*brush_size, hasher);
+        }
+        AnnotationKind::Highlighter {
+            shape,
+            opacity,
+            start,
+            end,
+        } => {
+            "highlighter".hash(hasher);
+            highlighter_shape_web_name(*shape).hash(hasher);
+            hash_f32(*opacity, hasher);
+            hash_point(start.translate(-origin.x, -origin.y), hasher);
+            hash_point(end.translate(-origin.x, -origin.y), hasher);
+        }
+        AnnotationKind::Pen { points } => {
+            "pen".hash(hasher);
+            hash_points(points, origin, hasher);
+        }
+        AnnotationKind::PenArrow { points } => {
+            "penArrow".hash(hasher);
+            hash_points(points, origin, hasher);
+        }
+        AnnotationKind::Watermark { text, opacity } => {
+            "watermark".hash(hasher);
+            text.hash(hasher);
+            hash_f32(*opacity, hasher);
+        }
+    }
+}
+
+fn hash_points(points: &[Point], origin: Point, hasher: &mut DefaultHasher) {
+    points.len().hash(hasher);
+    for point in points {
+        hash_point(point.translate(-origin.x, -origin.y), hasher);
+    }
+}
+
+fn hash_stroke(stroke: StrokeStyle, hasher: &mut DefaultHasher) {
+    hash_f32(stroke.width, hasher);
+    hash_color(stroke.color, hasher);
+    hash_f32(stroke.opacity, hasher);
+}
+
+fn hash_rect(rect: Rect, hasher: &mut DefaultHasher) {
+    hash_f32(rect.x, hasher);
+    hash_f32(rect.y, hasher);
+    hash_f32(rect.width, hasher);
+    hash_f32(rect.height, hasher);
+}
+
+fn hash_point(point: Point, hasher: &mut DefaultHasher) {
+    hash_f32(point.x, hasher);
+    hash_f32(point.y, hasher);
+}
+
+fn hash_color(color: Color, hasher: &mut DefaultHasher) {
+    color.r.hash(hasher);
+    color.g.hash(hasher);
+    color.b.hash(hasher);
+    color.a.hash(hasher);
+}
+
+fn hash_f32(value: f32, hasher: &mut DefaultHasher) {
+    value.to_bits().hash(hasher);
+}
+
+fn web_annotation_json_by_id(state: &OverlayState, id: AnnotationId) -> Option<serde_json::Value> {
+    state
+        .session
+        .document
+        .annotations
+        .iter()
+        .find(|annotation| annotation.id == id)
+        .map(|annotation| web_annotation_json(state, annotation))
+}
+
+fn maybe_request_web_export(state: &OverlayState, target: ExportTarget) -> bool {
+    if !WEB_EXPORT_ENABLED {
+        return false;
+    }
+    request_web_export(state, target)
+}
+
+fn request_web_export(state: &OverlayState, target: ExportTarget) -> bool {
+    let Some(web_ui) = &state.web_ui else {
+        return false;
+    };
+    let Some(region) = state.session.document.capture_region else {
+        return false;
+    };
+    let request_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "type": "exportRequest",
+        "requestId": request_id,
+        "target": export_target_name(target),
+        "format": "png",
+        "region": rect_json(Rect::new(0.0, 0.0, region.width, region.height)),
+        "background": serde_json::Value::Null,
+        "backgroundRequired": true,
+        "annotations": web_export_annotations_json(state, region),
+        "watermark": {
+            "text": state.watermark_text,
+            "dateEnabled": state.watermark_date_enabled,
+            "mode": watermark_mode_web_name(state.watermark_mode),
+            "opacity": WATERMARK_OPACITY,
+        },
+        "renderStyle": web_render_style_json(state),
+    })
+    .to_string();
+    web_ui.post_json(&payload);
+    true
+}
+
+fn export_target_name(target: ExportTarget) -> &'static str {
+    match target {
+        ExportTarget::Clipboard => "clipboard",
+        ExportTarget::Save => "save",
+    }
+}
+
+fn web_ui_state(state: &OverlayState) -> serde_json::Value {
+    let mut value = web_ui_state_patch(state);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("annotations".to_string(), web_annotations_json(state));
+    }
+    value
+}
+
+fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
+    let region = state.region_overlay();
+    let region_locked = current_region_monitor(state)
+        .map(|(monitor_id, _)| state.settings.is_region_locked(&monitor_id))
+        .unwrap_or(false);
+    let toolbar = region.map(|region| {
+        let origin = state
+            .toolbar_origin
+            .unwrap_or_else(|| default_toolbar_origin(state, region));
+        rect_json(Rect::new(
+            origin.x,
+            origin.y,
+            toolbar_width(state),
+            scaled(state, TOOLBAR_HEIGHT),
+        ))
+    });
+    serde_json::json!({
+        "theme": theme_name(state.theme),
+        "uiScale": state.ui_scale,
+        "screen": {
+            "x": state.screen_bounds.x,
+            "y": state.screen_bounds.y,
+            "width": state.screen_bounds.width,
+            "height": state.screen_bounds.height,
+        },
+        "captureRegion": region.map(rect_json),
+        "regionControls": {
+            "locked": region_locked,
+            "aspectRatio": aspect_ratio_web_name(state.settings.aspect_ratio),
+        },
+        "toolbar": toolbar,
+        "activeTool": tool_web_name(state.active_tool),
+        "activeSubmenu": state.active_submenu.map(tool_web_name),
+        "numberingEnabled": state.numbering_enabled,
+        "nextStepNumber": state.next_step_number,
+        "currentStroke": {
+            "width": state.current_stroke.width,
+            "color": color_json(state.current_stroke.color),
+            "opacity": state.current_stroke.opacity,
+        },
+        "fontSize": state.font_size,
+        "watermarkFontSize": state.watermark_font_size,
+        "penMode": pen_mode_web_name(state.pen_mode),
+        "highlighterShape": highlighter_shape_web_name(state.highlighter_shape),
+        "textFilled": state.text_filled,
+        "watermarkMode": watermark_mode_web_name(state.watermark_mode),
+        "watermarkDateEnabled": state.watermark_date_enabled,
+        "watermarkText": state.watermark_text,
+        "watermarkColor": color_json(state.watermark_color),
+        "watermarkImageUrl": state.watermark_image_path.as_ref().map(watermark_file_url),
+        "watermarkImageDataUrl": state.watermark_image_data_url,
+        "editingWatermarkText": state.editing_watermark_text,
+        "selectedAnnotationId": state.session.document.selected_annotation_id,
+        "editingTextId": state.editing_text_id,
+        "editingTextCaret": state.editing_text_caret,
+        "editingStepNumberId": state.editing_step_number_id,
+        "renderStyle": web_render_style_json(state),
+    })
+}
+
+fn aspect_ratio_web_name(mode: AspectRatioMode) -> &'static str {
+    match mode {
+        AspectRatioMode::Custom => "custom",
+        AspectRatioMode::Ratio9x16 => "9x16",
+        AspectRatioMode::Ratio16x9 => "16x9",
+        AspectRatioMode::Ratio1x1 => "1x1",
+        AspectRatioMode::Ratio4x5 => "4x5",
+    }
+}
+
+fn watermark_file_url(path: &PathBuf) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut encoded = String::from("file:///");
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'.' | b'_' | b'-' => {
+                encoded.push(*byte as char)
+            }
+            byte => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+fn web_render_style_json(state: &OverlayState) -> serde_json::Value {
+    serde_json::to_value(RenderStyle::for_state(state)).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+fn web_annotations_json(state: &OverlayState) -> serde_json::Value {
+    let annotations: Vec<serde_json::Value> = state
+        .session
+        .document
+        .annotations
+        .iter()
+        .map(|annotation| web_annotation_json(state, annotation))
+        .collect();
+    serde_json::Value::Array(annotations)
+}
+
+fn web_export_annotations_json(state: &OverlayState, region: Rect) -> serde_json::Value {
+    let annotations: Vec<serde_json::Value> = state
+        .session
+        .document
+        .annotations
+        .iter()
+        .map(|annotation| {
+            web_annotation_json_with_origin(state, annotation, Point::new(region.x, region.y))
+        })
+        .collect();
+    serde_json::Value::Array(annotations)
+}
+
+fn web_annotation_json(state: &OverlayState, annotation: &Annotation) -> serde_json::Value {
+    web_annotation_json_with_origin(
+        state,
+        annotation,
+        Point::new(state.screen_bounds.x, state.screen_bounds.y),
+    )
+}
+
+fn web_annotation_json_with_origin(
+    _state: &OverlayState,
+    annotation: &Annotation,
+    origin: Point,
+) -> serde_json::Value {
+    let bounds = annotation.bounds.translate(-origin.x, -origin.y);
+    let mut value = serde_json::json!({
+        "id": annotation.id,
+        "bounds": rect_json(bounds),
+        "stroke": {
+            "width": annotation.stroke.width,
+            "color": color_json(annotation.stroke.color),
+            "opacity": annotation.stroke.opacity,
+        },
+        "stepNumber": annotation.step_number,
+    });
+    let kind = match &annotation.kind {
+        AnnotationKind::Rectangle => serde_json::json!({
+            "type": "rectangle",
+        }),
+        AnnotationKind::Oval => serde_json::json!({
+            "type": "oval",
+        }),
+        AnnotationKind::Line { start, end } => serde_json::json!({
+            "type": "line",
+            "start": point_json(start.translate(-origin.x, -origin.y)),
+            "end": point_json(end.translate(-origin.x, -origin.y)),
+        }),
+        AnnotationKind::Arrow { start, end } => serde_json::json!({
+            "type": "arrow",
+            "start": point_json(start.translate(-origin.x, -origin.y)),
+            "end": point_json(end.translate(-origin.x, -origin.y)),
+        }),
+        AnnotationKind::StepNumber { number } => serde_json::json!({
+            "type": "step",
+            "number": number,
+        }),
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            filled,
+        } => serde_json::json!({
+            "type": "text",
+            "text": text,
+            "fontSize": font_size,
+            "framed": framed,
+            "filled": filled,
+        }),
+        AnnotationKind::Tag {
+            label,
+            anchor,
+            font_size,
+        } => serde_json::json!({
+            "type": "tag",
+            "label": label,
+            "anchor": point_json(anchor.translate(-origin.x, -origin.y)),
+            "fontSize": font_size,
+        }),
+        AnnotationKind::Mosaic { mode, brush_size } => serde_json::json!({
+            "type": "mosaic",
+            "mode": mosaic_mode_web_name(*mode),
+            "brushSize": brush_size,
+        }),
+        AnnotationKind::Highlighter {
+            shape,
+            opacity,
+            start,
+            end,
+        } => serde_json::json!({
+            "type": "highlighter",
+            "shape": highlighter_shape_web_name(*shape),
+            "opacity": opacity,
+            "start": point_json(start.translate(-origin.x, -origin.y)),
+            "end": point_json(end.translate(-origin.x, -origin.y)),
+        }),
+        AnnotationKind::Pen { points } => serde_json::json!({
+            "type": "pen",
+            "points": points_json_with_origin(points, origin),
+        }),
+        AnnotationKind::PenArrow { points } => serde_json::json!({
+            "type": "penArrow",
+            "points": points_json_with_origin(points, origin),
+        }),
+        AnnotationKind::Watermark { text, opacity } => serde_json::json!({
+            "type": "watermark",
+            "text": text,
+            "opacity": opacity,
+        }),
+    };
+    value["kind"] = kind;
+    value
+}
+
+fn point_json(point: Point) -> serde_json::Value {
+    serde_json::json!({
+        "x": point.x,
+        "y": point.y,
+    })
+}
+
+fn points_json_with_origin(points: &[Point], origin: Point) -> serde_json::Value {
+    let points: Vec<serde_json::Value> = points
+        .iter()
+        .copied()
+        .map(|point| point_json(point.translate(-origin.x, -origin.y)))
+        .collect();
+    serde_json::Value::Array(points)
+}
+
+fn mosaic_mode_web_name(mode: MosaicMode) -> &'static str {
+    match mode {
+        MosaicMode::Area => "area",
+        MosaicMode::Brush => "brush",
+    }
+}
+
+fn message_point(message: &WebUiMessage) -> Option<Point> {
+    Some(Point::new(message.x?, message.y?))
+}
+
+fn message_raw_point(message: &WebUiMessage) -> Option<Point> {
+    Some(Point::new(message.raw_x?, message.raw_y?))
+}
+
+fn web_pointer_down_point(state: &mut OverlayState, message: &WebUiMessage) -> Option<Point> {
+    let scaled = message_point(message)?;
+    state.web_pointer_raw_mode = false;
+
+    let Some(raw) = message_raw_point(message) else {
+        return Some(scaled);
+    };
+    let Some(region) = state.region_overlay() else {
+        return Some(scaled);
+    };
+
+    if !region.contains(scaled) && region.contains(raw) {
+        state.web_pointer_raw_mode = true;
+        Some(raw)
+    } else {
+        Some(scaled)
+    }
+}
+
+fn web_pointer_point(state: &OverlayState, message: &WebUiMessage) -> Option<Point> {
+    if state.web_pointer_raw_mode {
+        message_raw_point(message).or_else(|| message_point(message))
+    } else {
+        message_point(message)
+    }
+}
+
+fn begin_web_annotation_edit(state: &mut OverlayState, message: &WebUiMessage) -> bool {
+    let Some(point) = web_pointer_down_point(state, message) else {
+        return false;
+    };
+    let Some(id) = message.id else {
+        return false;
+    };
+    let Some(edit) = message
+        .edit_handle
+        .as_deref()
+        .and_then(annotation_edit_from_web_name)
+    else {
+        return false;
+    };
+    let Some(original) = state.session.document.annotation(id).cloned() else {
+        return false;
+    };
+    if !annotation_supports_edit(&original, edit) {
+        return false;
+    }
+
+    state.cursor_position = point;
+    state.session.select_annotation(Some(id));
+    sync_selected_annotation_controls(state, id);
+    state.checkpoint();
+    state.editing_text_id = None;
+    state.editing_text_caret = 0;
+    state.editing_step_number_id = None;
+    state.editing_step_number_replace = false;
+    state.drag = Some(DragState::EditingAnnotation { id, edit, original });
+    true
+}
+
+fn begin_web_annotation_interaction(state: &mut OverlayState, message: &WebUiMessage) -> bool {
+    let Some(point) = web_pointer_down_point(state, message) else {
+        return false;
+    };
+    let Some(id) = message.id else {
+        return false;
+    };
+    let Some(original) = state.session.document.annotation(id).cloned() else {
+        return false;
+    };
+    let screen_point = state.overlay_to_screen(point);
+
+    state.cursor_position = point;
+    state.session.select_annotation(Some(id));
+    sync_selected_annotation_controls(state, id);
+    state.editing_step_number_id = None;
+    state.editing_step_number_replace = false;
+    if matches!(
+        original.kind,
+        AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+    ) {
+        state.editing_text_id = None;
+        state.editing_text_caret = 0;
+        state.drag = Some(DragState::PendingTextInteraction {
+            start: screen_point,
+            id,
+            original,
+            caret_index: message
+                .caret_index
+                .or_else(|| text_caret_index_for_point(state, id, screen_point)),
+            moved: false,
+        });
+    } else {
+        state.checkpoint();
+        state.editing_text_id = None;
+        state.editing_text_caret = 0;
+        state.drag = Some(DragState::MovingAnnotation {
+            start: screen_point,
+            id,
+            original,
+        });
+    }
+    true
+}
+
+fn annotation_edit_from_web_name(name: &str) -> Option<AnnotationEdit> {
+    match name {
+        "northWest" => Some(AnnotationEdit::BoxResize(ResizeHandle::NorthWest)),
+        "north" => Some(AnnotationEdit::BoxResize(ResizeHandle::North)),
+        "northEast" => Some(AnnotationEdit::BoxResize(ResizeHandle::NorthEast)),
+        "east" => Some(AnnotationEdit::BoxResize(ResizeHandle::East)),
+        "southEast" => Some(AnnotationEdit::BoxResize(ResizeHandle::SouthEast)),
+        "south" => Some(AnnotationEdit::BoxResize(ResizeHandle::South)),
+        "southWest" => Some(AnnotationEdit::BoxResize(ResizeHandle::SouthWest)),
+        "west" => Some(AnnotationEdit::BoxResize(ResizeHandle::West)),
+        "lineStart" => Some(AnnotationEdit::LineStart),
+        "lineEnd" => Some(AnnotationEdit::LineEnd),
+        "tagAnchor" => Some(AnnotationEdit::TagAnchor),
+        _ => None,
+    }
+}
+
+fn annotation_supports_edit(annotation: &Annotation, edit: AnnotationEdit) -> bool {
+    match edit {
+        AnnotationEdit::LineStart | AnnotationEdit::LineEnd => matches!(
+            annotation.kind,
+            AnnotationKind::Line { .. }
+                | AnnotationKind::Arrow { .. }
+                | AnnotationKind::Highlighter {
+                    shape: HighlightShape::Rectangle,
+                    ..
+                }
+        ),
+        AnnotationEdit::TagAnchor => matches!(annotation.kind, AnnotationKind::Tag { .. }),
+        AnnotationEdit::BoxResize(_) => !matches!(
+            annotation.kind,
+            AnnotationKind::Line { .. }
+                | AnnotationKind::Arrow { .. }
+                | AnnotationKind::Pen { .. }
+                | AnnotationKind::PenArrow { .. }
+                | AnnotationKind::Highlighter {
+                    shape: HighlightShape::Rectangle,
+                    ..
+                }
+        ),
+    }
+}
+
+fn rect_json(rect: Rect) -> serde_json::Value {
+    serde_json::json!({
+        "x": rect.x,
+        "y": rect.y,
+        "width": rect.width,
+        "height": rect.height,
+    })
+}
+
+fn color_json(color: Color) -> serde_json::Value {
+    serde_json::json!({
+        "r": color.r,
+        "g": color.g,
+        "b": color.b,
+        "a": color.a,
+    })
+}
+
+fn color_from_hex(hex: &str) -> Option<Color> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let value = u32::from_str_radix(hex, 16).ok()?;
+    Some(Color::rgb(
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 8) & 0xff) as u8,
+        (value & 0xff) as u8,
+    ))
+}
+
+fn theme_name(theme: AppTheme) -> &'static str {
+    match theme {
+        AppTheme::Light => "light",
+        AppTheme::Dark => "dark",
+    }
+}
+
+fn tool_web_name(tool: ToolKind) -> &'static str {
+    match tool {
+        ToolKind::StepNumber => "step",
+        ToolKind::Rectangle => "rectangle",
+        ToolKind::Oval => "oval",
+        ToolKind::Line => "line",
+        ToolKind::Arrow => "arrow",
+        ToolKind::Pen => "pen",
+        ToolKind::Text => "text",
+        ToolKind::Tag => "tag",
+        ToolKind::Mosaic => "mosaic",
+        ToolKind::Highlighter => "highlighter",
+        ToolKind::Watermark => "watermark",
+    }
+}
+
+fn tool_from_web_name(name: &str) -> Option<ToolKind> {
+    match name {
+        "rectangle" => Some(ToolKind::Rectangle),
+        "oval" => Some(ToolKind::Oval),
+        "line" => Some(ToolKind::Line),
+        "arrow" => Some(ToolKind::Arrow),
+        "pen" => Some(ToolKind::Pen),
+        "text" => Some(ToolKind::Text),
+        "tag" => Some(ToolKind::Tag),
+        "mosaic" => Some(ToolKind::Mosaic),
+        "highlighter" => Some(ToolKind::Highlighter),
+        "watermark" => Some(ToolKind::Watermark),
+        "step" => Some(ToolKind::StepNumber),
+        _ => None,
+    }
+}
+
+fn pen_mode_web_name(mode: PenMode) -> &'static str {
+    match mode {
+        PenMode::Free => "free",
+        PenMode::Arrow => "arrow",
+    }
+}
+
+fn pen_mode_from_web_name(name: &str) -> Option<PenMode> {
+    match name {
+        "free" => Some(PenMode::Free),
+        "arrow" => Some(PenMode::Arrow),
+        _ => None,
+    }
+}
+
+fn highlighter_shape_web_name(shape: HighlightShape) -> &'static str {
+    match shape {
+        HighlightShape::Rectangle => "line",
+        HighlightShape::RoundedRectangle => "area",
+        HighlightShape::Oval => "area",
+    }
+}
+
+fn highlighter_shape_from_web_name(name: &str) -> Option<HighlightShape> {
+    match name {
+        "line" => Some(HighlightShape::Rectangle),
+        "area" => Some(HighlightShape::RoundedRectangle),
+        _ => None,
+    }
+}
+
+fn watermark_mode_web_name(mode: WatermarkMode) -> &'static str {
+    match mode {
+        WatermarkMode::Date => "date",
+        WatermarkMode::Text => "text",
+        WatermarkMode::Image => "image",
+    }
+}
+
+fn watermark_mode_from_web_name(name: &str) -> Option<WatermarkMode> {
+    match name {
+        "date" => Some(WatermarkMode::Date),
+        "text" => Some(WatermarkMode::Text),
+        "image" => Some(WatermarkMode::Image),
+        _ => None,
+    }
+}
+
+struct RenderCache {
+    width: i32,
+    height: i32,
+    back_dc: HDC,
+    back_bitmap: HBITMAP,
+    back_old: HGDIOBJ,
+    static_dc: HDC,
+    static_bitmap: HBITMAP,
+    static_old: HGDIOBJ,
+}
+
+fn ui_scale_for_screen(screen_bounds: Rect) -> f32 {
+    ((screen_bounds.height / 1080.0) * 1.38).clamp(1.38, 2.76)
+}
+
+fn refresh_ui_scale(state: &mut OverlayState) {
+    let anchor = active_region_rect(state)
+        .map(|region| region.center())
+        .unwrap_or_else(|| state.overlay_to_screen(state.cursor_position));
+    let Some(monitor) = (unsafe { monitor_full_region_at(anchor) }) else {
+        return;
+    };
+    let id = monitor_id(monitor);
+    if state.ui_scale_monitor_id.as_deref() == Some(id.as_str()) {
+        return;
+    }
+    state.ui_scale = ui_scale_for_screen(monitor);
+    state.ui_scale_monitor_id = Some(id);
+    if let Some(region) = state.region_overlay() {
+        state.toolbar_origin = Some(default_toolbar_origin(state, region));
+    }
+    state.force_web_full_snapshot = true;
+    state.mark_static_dirty();
+}
+
+fn scaled(state: &OverlayState, value: f32) -> f32 {
+    value * state.ui_scale
+}
+
+fn top_chrome_height(window: Rect) -> f32 {
+    (window.height * WINDOW_CHROME_HEIGHT_RATIO).min(WINDOW_CHROME_MAX_HEIGHT_PX)
+}
+
+#[derive(Clone, Debug)]
+struct DetectedRegion {
+    hwnd: HWND,
+    window: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmartRegionKind {
+    AllScreens,
+    CurrentScreen,
+    Window,
+    Manual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmartRegionSource {
+    Monitor,
+    Win32,
+    Manual,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SmartRegionCandidate {
+    id: String,
+    kind: SmartRegionKind,
+    rect: Rect,
+    confidence: f32,
+    source: SmartRegionSource,
+    related_window_id: Option<isize>,
+    monitor_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSmartRegion {
+    candidate: SmartRegionCandidate,
+    since: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ToolbarButton {
+    rect: Rect,
+    tool: ToolbarAction,
+}
+
+#[derive(Clone, Copy)]
+struct SubmenuButton {
+    rect: Rect,
+    action: SubmenuAction,
+}
+
+#[derive(Clone, Copy)]
+struct SubmenuSlider {
+    rect: Rect,
+    start_x: f32,
+    end_x: f32,
+    min: f32,
+    max: f32,
+    kind: SubmenuSliderKind,
+}
+
+#[derive(Clone, Copy)]
+struct RegionControlButton {
+    rect: Rect,
+    kind: RegionControlKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegionControlKind {
+    Lock,
+    Ratio,
+}
+
+#[derive(Clone, Copy)]
+enum SubmenuSliderKind {
+    StrokeWidth,
+    FontSize,
+}
+
+#[derive(Clone, Copy)]
+enum ToolbarAction {
+    Grip,
+    Numbering,
+    Tool(ToolKind),
+    Divider,
+    Undo,
+    Copy,
+    Save,
+    Cancel,
+}
+
+#[derive(Clone, Copy)]
+enum SubmenuAction {
+    StrokeWidth(f32),
+    Color(Color),
+    PenMode(PenMode),
+    HighlighterShape(HighlightShape),
+    TextFilled(bool),
+    FontSize(f32),
+    WatermarkMode(WatermarkMode),
+    WatermarkTextInput,
+    ClearWatermark,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PenMode {
+    Free,
+    Arrow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatermarkMode {
+    Date,
+    Text,
+    Image,
+}
+
+enum DragState {
+    Selecting {
+        start: Point,
+        current: Point,
+    },
+    MovingRegion {
+        start: Point,
+        original: Rect,
+    },
+    MovingToolbar {
+        start: Point,
+        original: Point,
+    },
+    ResizingRegion {
+        handle: ResizeHandle,
+        original: Rect,
+    },
+    MovingAnnotation {
+        start: Point,
+        id: AnnotationId,
+        original: Annotation,
+    },
+    EditingAnnotation {
+        id: AnnotationId,
+        edit: AnnotationEdit,
+        original: Annotation,
+    },
+    PendingTextInteraction {
+        start: Point,
+        id: AnnotationId,
+        original: Annotation,
+        caret_index: Option<usize>,
+        moved: bool,
+    },
+    DrawingAnnotation {
+        start: Point,
+        current: Point,
+        points: Vec<Point>,
+    },
+    AdjustingSubmenuSlider {
+        slider: SubmenuSlider,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AnnotationEdit {
+    BoxResize(ResizeHandle),
+    LineStart,
+    LineEnd,
+    TagAnchor,
+}
+
+unsafe extern "system" fn overlay_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        let create = lparam.0 as *const CREATESTRUCTW;
+        let state_ptr = (*create).lpCreateParams as *mut OverlayState;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+        let _ = SetTimer(hwnd, CARET_TIMER_ID, 500, None);
+        let _ = SetTimer(hwnd, REGION_BORDER_TIMER_ID, 80, None);
+        return LRESULT(0);
+    }
+
+    let state_ptr = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA)
+        as *mut OverlayState;
+    if state_ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let state = &mut *state_ptr;
+
+    match msg {
+        WM_OVERLAY_CLOSE_REQUEST => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            paint_overlay(state);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == CARET_TIMER_ID
+                && (state.editing_watermark_text || state.editing_text_id.is_some())
+            {
+                let _ = InvalidateRect(hwnd, None, false);
+            } else if wparam.0 == NUMBERING_TOGGLE_TIMER_ID {
+                if step_numbering_toggle_animation(state) {
+                    let _ = InvalidateRect(hwnd, None, false);
+                } else {
+                    let _ = KillTimer(hwnd, NUMBERING_TOGGLE_TIMER_ID);
+                }
+            } else if wparam.0 == REGION_BORDER_TIMER_ID
+                && (state.session.document.capture_region.is_some()
+                    || state.smart_region.is_some()
+                    || matches!(state.drag, Some(DragState::Selecting { .. })))
+            {
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            if web_ui_owns_pointer_input(state) {
+                return LRESULT(0);
+            }
+            let point = point_from_lparam(lparam);
+            handle_mouse_down(state, point, None);
+            SetCapture(hwnd);
+            let _ = InvalidateRect(hwnd, None, false);
+            sync_web_after_change(state);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if web_ui_owns_pointer_input(state) {
+                return LRESULT(0);
+            }
+            let point = point_from_lparam(lparam);
+            state.cursor_position = point;
+            if handle_mouse_move(state, point) {
+                let _ = InvalidateRect(hwnd, None, false);
+                if state.session.document.capture_region.is_some() {
+                    sync_web_after_change(state);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            if web_ui_owns_pointer_input(state) {
+                return LRESULT(0);
+            }
+            let delta = ((wparam.0 >> 16) & 0xffff) as i16;
+            if handle_mouse_wheel(state, delta, shift_key_down(), ctrl_key_down()) {
+                state.mark_static_dirty();
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            if web_ui_owns_pointer_input(state) {
+                return LRESULT(1);
+            }
+            let mut cursor = POINT::default();
+            if GetCursorPos(&mut cursor).is_ok() {
+                update_cursor_for_hover(
+                    state,
+                    Point::new(
+                        cursor.x as f32 - state.screen_bounds.x,
+                        cursor.y as f32 - state.screen_bounds.y,
+                    ),
+                );
+            }
+            LRESULT(1)
+        }
+        WM_LBUTTONUP => {
+            if web_ui_owns_pointer_input(state) {
+                return LRESULT(0);
+            }
+            let point = point_from_lparam(lparam);
+            let had_region = state.session.document.capture_region.is_some();
+            handle_mouse_up(state, point);
+            if !had_region && state.session.document.capture_region.is_some() {
+                state.defer_watermark_static_redraw_once = true;
+            }
+            state.mark_static_dirty();
+            let _ = ReleaseCapture();
+            let _ = InvalidateRect(hwnd, None, false);
+            sync_web_after_change(state);
+            LRESULT(0)
+        }
+        WM_RBUTTONDOWN => {
+            deselect_all(state);
+            let _ = InvalidateRect(hwnd, None, false);
+            sync_web_after_change(state);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            let key = wparam.0 as u32;
+            let was_text_editing = state.editing_text_id.is_some() || state.editing_watermark_text;
+            let had_active_annotation = has_active_annotation_state(state);
+            handle_key_down(state, key, shift_key_down());
+            if was_text_editing
+                || had_active_annotation
+                || (key != 0x1B && key != VK_RETURN.0 as u32)
+            {
+                state.mark_static_dirty();
+                let _ = InvalidateRect(hwnd, None, false);
+                sync_web_after_change(state);
+            }
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            handle_char(state, wparam.0 as u32);
+            let _ = InvalidateRect(hwnd, None, false);
+            sync_web_after_change(state);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            let _ = DeleteObject(state.background_bitmap);
+            destroy_render_cache(state);
+            let _ = Box::from_raw(state_ptr);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: Option<usize>) {
+    if let Some(action) = state
+        .region_control_buttons
+        .iter()
+        .find(|button| button.rect.contains(point))
+        .map(|button| button.kind)
+    {
+        handle_region_control_action(state, action);
+        return;
+    }
+
+    if state.ratio_placement_mode && state.settings.aspect_ratio != AspectRatioMode::Custom {
+        if state
+            .region_control_bounds
+            .is_some_and(|rect| rect.contains(point))
+        {
+            return;
+        }
+        state.ratio_placement_mode = false;
+        persist_locked_region_if_needed(state);
+        state.mark_static_dirty();
+        return;
+    }
+
+    if let Some(slider) = state
+        .submenu_sliders
+        .iter()
+        .copied()
+        .find(|slider| slider.rect.contains(point))
+    {
+        if state.session.document.selected_annotation_id.is_some() {
+            state.checkpoint();
+            state.style_edit_in_progress = true;
+        }
+        apply_submenu_slider_at(state, slider, point);
+        state.drag = Some(DragState::AdjustingSubmenuSlider { slider });
+        return;
+    }
+
+    if let Some(action) = state
+        .submenu_buttons
+        .iter()
+        .find(|button| button.rect.contains(point))
+        .map(|button| button.action)
+    {
+        handle_submenu_action(state, action);
+        return;
+    }
+
+    if let Some(action) = state
+        .toolbar_buttons
+        .iter()
+        .find(|button| button.rect.contains(point))
+        .map(|b| b.tool)
+    {
+        if matches!(action, ToolbarAction::Grip) {
+            let original = state
+                .toolbar_origin
+                .or_else(|| {
+                    state
+                        .region_overlay()
+                        .map(|region| default_toolbar_origin(state, region))
+                })
+                .unwrap_or(point);
+            state.drag = Some(DragState::MovingToolbar {
+                start: point,
+                original,
+            });
+            return;
+        }
+        handle_toolbar_action(state, action);
+        return;
+    }
+
+    if let Some(region) = state.region_overlay() {
+        if let Some(handle) = region.hit_resize_handle(point, REGION_RESIZE_HIT_RADIUS) {
+            finish_text_editing(state);
+            state.checkpoint();
+            if state.settings.aspect_ratio != AspectRatioMode::Custom
+                && !is_corner_resize_handle(handle)
+            {
+                state.settings.aspect_ratio = AspectRatioMode::Custom;
+            }
+            state.drag = Some(DragState::ResizingRegion {
+                handle,
+                original: state
+                    .session
+                    .document
+                    .capture_region
+                    .expect("overlay region maps from document region"),
+            });
+            return;
+        }
+
+        let screen_point = state.overlay_to_screen(point);
+        if let Some(id) = state.session.document.selected_annotation_id {
+            if let Some(original) = state.session.document.annotation(id).cloned() {
+                if let Some(edit) = hit_annotation_edit_handle(state, &original, screen_point) {
+                    state.checkpoint();
+                    state.editing_text_id = None;
+                    state.editing_text_caret = 0;
+                    state.editing_step_number_id = None;
+                    state.editing_step_number_replace = false;
+                    state.drag = Some(DragState::EditingAnnotation { id, edit, original });
+                    return;
+                }
+            }
+        }
+        if let Some(id) = select_annotation_at(state, screen_point) {
+            state.editing_step_number_id = None;
+            state.editing_step_number_replace = false;
+            if let Some(original) = state.session.document.annotation(id).cloned() {
+                if let Some(edit) = hit_annotation_edit_handle(state, &original, screen_point) {
+                    state.checkpoint();
+                    state.editing_text_id = None;
+                    state.editing_text_caret = 0;
+                    state.editing_step_number_id = None;
+                    state.editing_step_number_replace = false;
+                    state.drag = Some(DragState::EditingAnnotation { id, edit, original });
+                    return;
+                }
+                if matches!(
+                    original.kind,
+                    AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+                ) {
+                    state.editing_text_id = None;
+                    state.editing_text_caret = 0;
+                    state.drag = Some(DragState::PendingTextInteraction {
+                        start: screen_point,
+                        id,
+                        original,
+                        caret_index: text_caret_index
+                            .or_else(|| text_caret_index_for_point(state, id, screen_point)),
+                        moved: false,
+                    });
+                    return;
+                }
+                state.checkpoint();
+                state.editing_text_id = None;
+                state.editing_text_caret = 0;
+                state.drag = Some(DragState::MovingAnnotation {
+                    start: screen_point,
+                    id,
+                    original,
+                });
+                return;
+            }
+        }
+
+        if region_frame_contains(region, point) {
+            finish_text_editing(state);
+            state.checkpoint();
+            state.drag = Some(DragState::MovingRegion {
+                start: point,
+                original: state
+                    .session
+                    .document
+                    .capture_region
+                    .expect("overlay region maps from document region"),
+            });
+            return;
+        }
+
+        if region.contains(point) {
+            if state.active_tool == ToolKind::Watermark {
+                return;
+            }
+            finish_text_editing(state);
+            let start = state.overlay_to_screen(point);
+            state.drag = Some(DragState::DrawingAnnotation {
+                start,
+                current: start,
+                points: vec![start],
+            });
+            return;
+        }
+    }
+
+    state.checkpoint();
+    state.drag = Some(DragState::Selecting {
+        start: point,
+        current: point,
+    });
+}
+
+fn deselect_all(state: &mut OverlayState) {
+    state.session.deselect_annotation();
+    state.editing_text_id = None;
+    state.editing_text_caret = 0;
+    state.editing_step_number_id = None;
+    state.editing_step_number_replace = false;
+    state.editing_watermark_text = false;
+    state.drag = None;
+    state.mark_static_dirty();
+}
+
+fn has_active_annotation_state(state: &OverlayState) -> bool {
+    state.session.document.selected_annotation_id.is_some()
+        || state.editing_text_id.is_some()
+        || state.editing_step_number_id.is_some()
+        || state.editing_watermark_text
+        || matches!(
+            state.drag,
+            Some(
+                DragState::MovingAnnotation { .. }
+                    | DragState::EditingAnnotation { .. }
+                    | DragState::PendingTextInteraction { .. }
+                    | DragState::DrawingAnnotation { .. }
+            )
+        )
+}
+
+fn region_frame_contains(region: Rect, point: Point) -> bool {
+    if !region.contains(point) {
+        return false;
+    }
+    point.x <= region.x + FRAME_HIT_WIDTH
+        || point.x >= region.right() - FRAME_HIT_WIDTH
+        || point.y <= region.y + FRAME_HIT_WIDTH
+        || point.y >= region.bottom() - FRAME_HIT_WIDTH
+}
+
+fn is_corner_resize_handle(handle: ResizeHandle) -> bool {
+    matches!(
+        handle,
+        ResizeHandle::NorthWest
+            | ResizeHandle::NorthEast
+            | ResizeHandle::SouthEast
+            | ResizeHandle::SouthWest
+    )
+}
+
+fn has_user_annotations(state: &OverlayState) -> bool {
+    state
+        .session
+        .document
+        .annotations
+        .iter()
+        .any(|annotation| !matches!(annotation.kind, AnnotationKind::Watermark { .. }))
+}
+
+fn region_control_chrome_hidden(state: &OverlayState) -> bool {
+    has_user_annotations(state) || matches!(state.drag, Some(DragState::DrawingAnnotation { .. }))
+}
+
+fn select_annotation_at(state: &mut OverlayState, screen_point: Point) -> Option<AnnotationId> {
+    let hit = state
+        .session
+        .document
+        .annotations
+        .iter()
+        .rev()
+        .find(|annotation| annotation_hit_test(annotation, screen_point))
+        .map(|annotation| annotation.id);
+    state.session.select_annotation(hit);
+    if let Some(id) = hit {
+        sync_selected_annotation_controls(state, id);
+    }
+    hit
+}
+
+fn sync_selected_annotation_controls(state: &mut OverlayState, id: AnnotationId) {
+    let Some(annotation) = state.session.document.annotation(id).cloned() else {
+        return;
+    };
+    let tool = tool_for_annotation(&annotation);
+    state.active_tool = tool;
+    state.active_submenu = Some(tool);
+    state.current_stroke = annotation.stroke;
+    remember_tool_stroke_width(state, tool, annotation.stroke.width);
+    match &annotation.kind {
+        AnnotationKind::Pen { .. } => state.pen_mode = PenMode::Free,
+        AnnotationKind::PenArrow { .. } => state.pen_mode = PenMode::Arrow,
+        AnnotationKind::Highlighter { shape, .. } => state.highlighter_shape = *shape,
+        AnnotationKind::Text {
+            font_size, filled, ..
+        } => {
+            state.font_size = *font_size;
+            state.text_filled = *filled;
+        }
+        AnnotationKind::Tag { font_size, .. } => state.font_size = *font_size,
+        AnnotationKind::Watermark { .. } => {
+            state.watermark_color = annotation.stroke.color;
+            state.editing_watermark_text = true;
+        }
+        _ => {}
+    }
+}
+
+fn tool_for_annotation(annotation: &Annotation) -> ToolKind {
+    match &annotation.kind {
+        AnnotationKind::Rectangle => ToolKind::Rectangle,
+        AnnotationKind::Oval => ToolKind::Oval,
+        AnnotationKind::Line { .. } => ToolKind::Line,
+        AnnotationKind::Arrow { .. } => ToolKind::Arrow,
+        AnnotationKind::StepNumber { .. } => ToolKind::StepNumber,
+        AnnotationKind::Text { .. } => ToolKind::Text,
+        AnnotationKind::Tag { .. } => ToolKind::Tag,
+        AnnotationKind::Mosaic { .. } => ToolKind::Mosaic,
+        AnnotationKind::Highlighter { .. } => ToolKind::Highlighter,
+        AnnotationKind::Pen { .. } | AnnotationKind::PenArrow { .. } => ToolKind::Pen,
+        AnnotationKind::Watermark { .. } => ToolKind::Watermark,
+    }
+}
+
+fn annotation_hit_test(annotation: &Annotation, screen_point: Point) -> bool {
+    match &annotation.kind {
+        AnnotationKind::Rectangle => rect_stroke_hit(
+            annotation.bounds,
+            screen_point,
+            line_hit_radius(annotation.stroke.width),
+        ),
+        AnnotationKind::Oval => oval_stroke_hit(
+            annotation.bounds,
+            screen_point,
+            line_hit_radius(annotation.stroke.width),
+        ),
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            ..
+        } => {
+            let bounds = text_annotation_hit_bounds(annotation.bounds, text, *font_size, *framed);
+            expand_rect(bounds, if *framed { 14.0 } else { 10.0 }).contains(screen_point)
+        }
+        AnnotationKind::Line { start, end } | AnnotationKind::Arrow { start, end } => near_segment(
+            screen_point,
+            *start,
+            *end,
+            line_hit_radius(annotation.stroke.width),
+        ),
+        AnnotationKind::Highlighter {
+            shape: HighlightShape::Rectangle,
+            start,
+            end,
+            ..
+        } => near_segment(
+            screen_point,
+            *start,
+            *end,
+            line_hit_radius(highlighter_line_width(annotation.stroke.width)),
+        ),
+        AnnotationKind::Pen { points } | AnnotationKind::PenArrow { points } => {
+            points.windows(2).any(|pair| {
+                near_segment(
+                    screen_point,
+                    pair[0],
+                    pair[1],
+                    line_hit_radius(annotation.stroke.width),
+                )
+            })
+        }
+        AnnotationKind::Tag { anchor, .. } => {
+            annotation.bounds.contains(screen_point)
+                || rect_stroke_hit(
+                    annotation.bounds,
+                    screen_point,
+                    line_hit_radius(tag_frame_for_width(annotation.stroke.width)),
+                )
+                || near_point(screen_point, *anchor, HANDLE_RADIUS + 12.0)
+                || tag_pointer_hit(annotation.bounds, *anchor, screen_point)
+        }
+        _ => annotation.bounds.contains(screen_point),
+    }
+}
+
+fn text_annotation_hit_bounds(bounds: Rect, text: &str, font_size: f32, framed: bool) -> Rect {
+    if framed {
+        bounds
+    } else {
+        inline_text_hit_bounds(bounds, text, font_size)
+    }
+}
+
+fn rect_stroke_hit(rect: Rect, point: Point, radius: f32) -> bool {
+    expand_rect(rect, radius).contains(point) && !shrink_rect(rect, radius).contains(point)
+}
+
+fn shrink_rect(rect: Rect, amount: f32) -> Rect {
+    let width = (rect.width - amount * 2.0).max(0.0);
+    let height = (rect.height - amount * 2.0).max(0.0);
+    Rect::new(rect.x + amount, rect.y + amount, width, height)
+}
+
+fn oval_stroke_hit(rect: Rect, point: Point, radius: f32) -> bool {
+    if !expand_rect(rect, radius).contains(point) {
+        return false;
+    }
+    let rx = (rect.width / 2.0).max(1.0);
+    let ry = (rect.height / 2.0).max(1.0);
+    let center = rect.center();
+    let normalized =
+        (((point.x - center.x) / rx).powi(2) + ((point.y - center.y) / ry).powi(2)).sqrt();
+    let tolerance = (radius / rx.min(ry)).max(0.05);
+    (normalized - 1.0).abs() <= tolerance
+}
+
+fn inline_text_hit_bounds(bounds: Rect, text: &str, font_size: f32) -> Rect {
+    let text_width = inline_text_width(text, font_size).max(font_size);
+    let line_count = inline_text_lines(text).count().max(1) as f32;
+    Rect::new(
+        bounds.x - INLINE_TEXT_PADDING,
+        bounds.y - font_size * INLINE_TEXT_ASCENT - INLINE_TEXT_PADDING,
+        text_width + INLINE_TEXT_PADDING * 2.0,
+        font_size * INLINE_TEXT_LINE_HEIGHT * line_count + INLINE_TEXT_PADDING * 2.0,
+    )
+}
+
+fn tag_pointer_hit(bounds: Rect, anchor: Point, point: Point) -> bool {
+    let target = Point::new(
+        anchor.x.clamp(bounds.x, bounds.right()),
+        anchor.y.clamp(bounds.y, bounds.bottom()),
+    );
+    near_segment(point, anchor, target, line_hit_radius(TAG_FRAME))
+}
+
+fn editable_text_annotation(state: &OverlayState, id: AnnotationId) -> bool {
+    state
+        .session
+        .document
+        .annotation(id)
+        .is_some_and(|annotation| {
+            matches!(
+                annotation.kind,
+                AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+            )
+        })
+}
+
+fn detect_smart_region_candidate(
+    state: &mut OverlayState,
+    screen_point: Point,
+) -> Option<SmartRegionCandidate> {
+    if screen_point.y <= state.screen_bounds.y + ALL_SCREENS_TOP_EDGE_THRESHOLD_PX {
+        return Some(SmartRegionCandidate::new(
+            SmartRegionKind::AllScreens,
+            state.screen_bounds,
+            1.0,
+            SmartRegionSource::Monitor,
+            None,
+            Some("virtual-desktop".to_string()),
+        ));
+    }
+
+    if let Some(monitor) = unsafe { monitor_full_region_at(screen_point) } {
+        if screen_point.y <= monitor.y + CURRENT_SCREEN_TOP_THRESHOLD_PX {
+            return Some(SmartRegionCandidate::new(
+                SmartRegionKind::CurrentScreen,
+                monitor,
+                0.98,
+                SmartRegionSource::Monitor,
+                None,
+                Some(monitor_id(monitor)),
+            ));
+        }
+    }
+
+    if let Some((index, detected)) = top_app_window_at_point(state, screen_point) {
+        let detected = detected.clone();
+        let covered = state.detected_regions[..index].iter().any(|higher| {
+            overlaps_with_tolerance(higher.window, detected.window, WINDOW_OVERLAP_TOLERANCE)
+        });
+
+        if !covered {
+            let window_id = Some(detected.hwnd.0 as isize);
+            let confidence = if is_in_window_chrome_zone(detected.window, screen_point) {
+                0.94
+            } else {
+                0.86
+            };
+            return Some(SmartRegionCandidate::new(
+                SmartRegionKind::Window,
+                detected.window,
+                confidence,
+                SmartRegionSource::Win32,
+                window_id,
+                None,
+            ));
+        }
+    }
+
+    current_screen_candidate(screen_point, state.screen_bounds)
+}
+
+fn top_app_window_at_point(
+    state: &OverlayState,
+    screen_point: Point,
+) -> Option<(usize, &DetectedRegion)> {
+    state
+        .detected_regions
+        .iter()
+        .enumerate()
+        .find(|(_, detected)| detected.window.contains(screen_point))
+}
+
+fn current_screen_candidate(screen_point: Point, fallback: Rect) -> Option<SmartRegionCandidate> {
+    let monitor = unsafe { monitor_full_region_at(screen_point) }.unwrap_or(fallback);
+    Some(SmartRegionCandidate::new(
+        SmartRegionKind::CurrentScreen,
+        monitor,
+        0.6,
+        SmartRegionSource::Monitor,
+        None,
+        Some(monitor_id(monitor)),
+    ))
+}
+
+fn is_in_window_chrome_zone(window: Rect, screen_point: Point) -> bool {
+    screen_point.y <= window.y + top_chrome_height(window)
+}
+
+fn rect_delta(a: Rect, b: Rect) -> f32 {
+    (a.x - b.x)
+        .abs()
+        .max((a.y - b.y).abs())
+        .max((a.width - b.width).abs())
+        .max((a.height - b.height).abs())
+}
+
+fn commit_smart_region_candidate(
+    state: &mut OverlayState,
+    next: Option<SmartRegionCandidate>,
+) -> bool {
+    let Some(next) = next else {
+        let changed = state.smart_region.take().is_some();
+        state.pending_smart_region = None;
+        return changed;
+    };
+
+    if smart_region_switches_immediately(&next) {
+        let changed = state.smart_region.as_ref() != Some(&next);
+        state.smart_region = Some(next);
+        state.pending_smart_region = None;
+        return changed;
+    }
+
+    if let Some(current) = &state.smart_region {
+        if current.kind == next.kind && rect_delta(current.rect, next.rect) < MIN_RECT_CHANGE_PX {
+            state.pending_smart_region = None;
+            return false;
+        }
+
+        if smart_region_replaces_current_immediately(current, &next) {
+            let changed = state.smart_region.as_ref() != Some(&next);
+            state.smart_region = Some(next);
+            state.pending_smart_region = None;
+            return changed;
+        }
+
+        if next.confidence < current.confidence + CONFIDENCE_SWITCH_DELTA {
+            let now = Instant::now();
+            let stable = match &state.pending_smart_region {
+                Some(pending) if pending.candidate == next => {
+                    now.duration_since(pending.since) >= Duration::from_millis(HOVER_STABILITY_MS)
+                }
+                _ => {
+                    state.pending_smart_region = Some(PendingSmartRegion {
+                        candidate: next.clone(),
+                        since: now,
+                    });
+                    false
+                }
+            };
+            if !stable {
+                return false;
+            }
+        }
+    }
+
+    let changed = state.smart_region.as_ref() != Some(&next);
+    state.smart_region = Some(next);
+    state.pending_smart_region = None;
+    changed
+}
+
+fn smart_region_switches_immediately(candidate: &SmartRegionCandidate) -> bool {
+    matches!(
+        candidate.kind,
+        SmartRegionKind::AllScreens | SmartRegionKind::CurrentScreen | SmartRegionKind::Manual
+    )
+}
+
+fn smart_region_replaces_current_immediately(
+    current: &SmartRegionCandidate,
+    next: &SmartRegionCandidate,
+) -> bool {
+    matches!(current.kind, SmartRegionKind::CurrentScreen)
+        && matches!(next.kind, SmartRegionKind::Window)
+}
+
+unsafe fn collect_detected_regions(screen_bounds: Rect) -> Vec<DetectedRegion> {
+    let mut context = WindowDetectionContext {
+        regions: Vec::new(),
+    };
+    let context_ptr = &mut context as *mut WindowDetectionContext;
+    let _ = EnumWindows(Some(enum_detected_window), LPARAM(context_ptr as isize));
+    context
+        .regions
+        .into_iter()
+        .filter(|region| {
+            region.window.is_visible()
+                && region.window.width > 48.0
+                && region.window.height > 48.0
+                && overlaps(region.window, screen_bounds)
+        })
+        .collect()
+}
+
+struct WindowDetectionContext {
+    regions: Vec<DetectedRegion>,
+}
+
+impl SmartRegionCandidate {
+    fn new(
+        kind: SmartRegionKind,
+        rect: Rect,
+        confidence: f32,
+        source: SmartRegionSource,
+        related_window_id: Option<isize>,
+        monitor_id: Option<String>,
+    ) -> Self {
+        Self {
+            id: smart_region_id(
+                kind,
+                rect,
+                source,
+                related_window_id.as_ref(),
+                monitor_id.as_deref(),
+            ),
+            kind,
+            rect,
+            confidence,
+            source,
+            related_window_id,
+            monitor_id,
+        }
+    }
+}
+
+fn smart_region_id(
+    kind: SmartRegionKind,
+    rect: Rect,
+    source: SmartRegionSource,
+    related_window_id: Option<&isize>,
+    monitor_id: Option<&str>,
+) -> String {
+    format!(
+        "{kind:?}:{source:?}:{:.0}:{:.0}:{:.0}:{:.0}:{}:{}",
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        related_window_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        monitor_id.unwrap_or("-")
+    )
+}
+
+fn monitor_id(rect: Rect) -> String {
+    format!(
+        "{:.0},{:.0},{:.0},{:.0}",
+        rect.x, rect.y, rect.width, rect.height
+    )
+}
+
+fn apply_locked_region_on_launch(state: &mut OverlayState, cursor_screen: Point) {
+    let Some(monitor) = (unsafe { monitor_full_region_at(cursor_screen) }) else {
+        return;
+    };
+    let id = monitor_id(monitor);
+    let Some(region) = state.settings.locked_region_for_monitor(&id, monitor) else {
+        return;
+    };
+    state.session.set_capture_region(region);
+    state.smart_region = Some(SmartRegionCandidate::new(
+        SmartRegionKind::Manual,
+        region,
+        1.0,
+        SmartRegionSource::Manual,
+        None,
+        Some(id),
+    ));
+    let overlay_region = region.translate(-state.screen_bounds.x, -state.screen_bounds.y);
+    state.toolbar_origin = Some(default_toolbar_origin(state, overlay_region));
+}
+
+fn current_region_monitor(state: &OverlayState) -> Option<(String, Rect)> {
+    let region = state.session.document.capture_region?;
+    monitor_for_region(region)
+}
+
+fn active_region_rect(state: &OverlayState) -> Option<Rect> {
+    state
+        .session
+        .document
+        .capture_region
+        .or_else(|| state.smart_region.as_ref().map(|candidate| candidate.rect))
+}
+
+fn monitor_for_region(region: Rect) -> Option<(String, Rect)> {
+    let monitor = unsafe { monitor_full_region_at(region.center()) }?;
+    Some((monitor_id(monitor), monitor))
+}
+
+fn update_locked_region_if_needed(state: &mut OverlayState) {
+    let Some(region) = state.session.document.capture_region else {
+        return;
+    };
+    let Some((monitor_id, monitor)) = current_region_monitor(state) else {
+        return;
+    };
+    if state.settings.is_region_locked(&monitor_id) {
+        state
+            .settings
+            .set_locked_region(monitor_id, monitor, region);
+    }
+}
+
+fn persist_locked_region_if_needed(state: &mut OverlayState) {
+    let previous = state.settings.clone();
+    update_locked_region_if_needed(state);
+    if let Err(error) = save_settings(&state.settings) {
+        state.settings = previous;
+        unsafe {
+            show_capture_message(
+                state.hwnd,
+                "Screen Cap'n Settings",
+                &format!("The locked region could not be saved.\n\n{error}"),
+                MB_ICONWARNING,
+            );
+        }
+    }
+}
+
+fn toggle_region_lock(state: &mut OverlayState) {
+    let Some(region) = active_region_rect(state) else {
+        return;
+    };
+    let Some((monitor_id, monitor)) = monitor_for_region(region) else {
+        return;
+    };
+    let previous = state.settings.clone();
+    let unlocking = state.settings.is_region_locked(&monitor_id);
+    if unlocking {
+        state.settings.remove_locked_region(&monitor_id);
+    } else {
+        state
+            .settings
+            .set_locked_region(monitor_id, monitor, region);
+    }
+    if let Err(error) = save_settings(&state.settings) {
+        state.settings = previous;
+        unsafe {
+            show_capture_message(
+                state.hwnd,
+                "Screen Cap'n Settings",
+                &format!("The region lock could not be changed.\n\n{error}"),
+                MB_ICONWARNING,
+            );
+        }
+        return;
+    }
+    if unlocking {
+        reset_to_auto_region_selection(state);
+    }
+}
+
+fn reset_to_auto_region_selection(state: &mut OverlayState) {
+    state.session.clear_capture_region();
+    state.web_toolbar_ready = false;
+    state.web_toolbar_waiting_for_revision = None;
+    state.toolbar_origin = None;
+    state.drag = None;
+    state.ratio_placement_mode = false;
+    state.settings.aspect_ratio = AspectRatioMode::Custom;
+    let cursor = state.overlay_to_screen(state.cursor_position);
+    state.smart_region = detect_smart_region_candidate(state, cursor);
+    state.pending_smart_region = None;
+    state.force_web_full_snapshot = true;
+    state.mark_static_dirty();
+}
+
+fn handle_region_control_action(state: &mut OverlayState, action: RegionControlKind) {
+    match action {
+        RegionControlKind::Lock => toggle_region_lock(state),
+        RegionControlKind::Ratio => {
+            state.settings.aspect_ratio = state.settings.aspect_ratio.next();
+            if state.settings.aspect_ratio == AspectRatioMode::Custom {
+                state.ratio_placement_mode = false;
+                apply_custom_full_screen_region(state);
+            } else {
+                state.ratio_placement_mode = true;
+                apply_aspect_ratio_to_current_region(state);
+            }
+        }
+    }
+}
+
+fn apply_custom_full_screen_region(state: &mut OverlayState) {
+    let anchor = active_region_rect(state)
+        .map(|region| region.center())
+        .unwrap_or_else(|| state.overlay_to_screen(state.cursor_position));
+    let monitor = unsafe { monitor_full_region_at(anchor) }.unwrap_or(state.screen_bounds);
+    set_active_ratio_region(state, monitor);
+    state.pending_smart_region = None;
+    state.mark_static_dirty();
+}
+
+fn apply_aspect_ratio_to_current_region(state: &mut OverlayState) {
+    let Some(ratio) = state.settings.aspect_ratio.value() else {
+        return;
+    };
+    let Some(region) = active_region_rect(state) else {
+        return;
+    };
+    let bounds = monitor_full_region_for_rect(state, region).unwrap_or(state.screen_bounds);
+    let mut width = region.width.max(MIN_REGION_SIZE);
+    let mut height = width / ratio;
+    if height > bounds.height {
+        height = bounds.height;
+        width = height * ratio;
+    }
+    if width > bounds.width {
+        width = bounds.width;
+        height = width / ratio;
+    }
+    let center = region.center();
+    let x = (center.x - width / 2.0)
+        .max(bounds.x)
+        .min((bounds.right() - width).max(bounds.x));
+    let y = (center.y - height / 2.0)
+        .max(bounds.y)
+        .min((bounds.bottom() - height).max(bounds.y));
+    let next = Rect::new(x, y, width, height);
+    if state.session.document.capture_region.is_some() {
+        state.session.set_capture_region(next);
+        state.smart_region = Some(SmartRegionCandidate::new(
+            SmartRegionKind::Manual,
+            next,
+            1.0,
+            SmartRegionSource::Manual,
+            None,
+            None,
+        ));
+        state.toolbar_origin = Some(default_toolbar_origin(
+            state,
+            next.translate(-state.screen_bounds.x, -state.screen_bounds.y),
+        ));
+        update_locked_region_if_needed(state);
+    } else if let Some(candidate) = &mut state.smart_region {
+        candidate.rect = next;
+        candidate.id = smart_region_id(
+            candidate.kind,
+            candidate.rect,
+            candidate.source,
+            candidate.related_window_id.as_ref(),
+            candidate.monitor_id.as_deref(),
+        );
+        state.pending_smart_region = None;
+    } else if state.ratio_placement_mode {
+        set_ratio_smart_region(state, next);
+    }
+    state.mark_static_dirty();
+}
+
+fn set_active_ratio_region(state: &mut OverlayState, rect: Rect) {
+    if state.session.document.capture_region.is_some() {
+        state.session.set_capture_region(rect);
+        state.smart_region = Some(SmartRegionCandidate::new(
+            SmartRegionKind::Manual,
+            rect,
+            1.0,
+            SmartRegionSource::Manual,
+            None,
+            unsafe { monitor_full_region_at(rect.center()) }.map(monitor_id),
+        ));
+        state.pending_smart_region = None;
+        state.toolbar_origin = Some(default_toolbar_origin(
+            state,
+            rect.translate(-state.screen_bounds.x, -state.screen_bounds.y),
+        ));
+        update_locked_region_if_needed(state);
+        state.mark_static_dirty();
+    } else {
+        set_ratio_smart_region(state, rect);
+    }
+}
+
+fn set_ratio_smart_region(state: &mut OverlayState, rect: Rect) {
+    let monitor = unsafe { monitor_full_region_at(rect.center()) };
+    state.smart_region = Some(SmartRegionCandidate::new(
+        SmartRegionKind::Manual,
+        rect,
+        1.0,
+        SmartRegionSource::Manual,
+        None,
+        monitor.map(monitor_id),
+    ));
+    state.pending_smart_region = None;
+}
+
+fn position_ratio_region_at_cursor(state: &mut OverlayState, cursor: Point) {
+    let Some(ratio) = state.settings.aspect_ratio.value() else {
+        return;
+    };
+    let monitor = unsafe { monitor_full_region_at(cursor) }.unwrap_or(state.screen_bounds);
+    let base = active_region_rect(state)
+        .unwrap_or_else(|| default_ratio_rect_for_monitor(monitor, ratio).unwrap_or(monitor));
+    let width = base.width.min(monitor.width).max(MIN_REGION_SIZE);
+    let height = (width / ratio).min(monitor.height).max(MIN_REGION_SIZE);
+    let rect = clamp_region_to_bounds(
+        Rect::new(
+            cursor.x - width / 2.0,
+            cursor.y - height / 2.0,
+            width,
+            height,
+        ),
+        monitor,
+    );
+    set_active_ratio_region(state, rect);
+}
+
+fn default_ratio_rect_for_monitor(bounds: Rect, ratio: f32) -> Option<Rect> {
+    if ratio <= 0.0 || !bounds.is_visible() {
+        return None;
+    }
+    let mut width = bounds.width * 0.72;
+    let mut height = width / ratio;
+    if height > bounds.height * 0.72 {
+        height = bounds.height * 0.72;
+        width = height * ratio;
+    }
+    Some(Rect::new(
+        bounds.center().x - width / 2.0,
+        bounds.center().y - height / 2.0,
+        width.max(MIN_REGION_SIZE),
+        height.max(MIN_REGION_SIZE),
+    ))
+}
+
+fn clamp_region_to_bounds(region: Rect, bounds: Rect) -> Rect {
+    let width = region
+        .width
+        .min(bounds.width)
+        .max(MIN_REGION_SIZE.min(bounds.width));
+    let height = region
+        .height
+        .min(bounds.height)
+        .max(MIN_REGION_SIZE.min(bounds.height));
+    Rect::new(
+        region
+            .x
+            .max(bounds.x)
+            .min((bounds.right() - width).max(bounds.x)),
+        region
+            .y
+            .max(bounds.y)
+            .min((bounds.bottom() - height).max(bounds.y)),
+        width,
+        height,
+    )
+}
+
+fn handle_mouse_wheel(
+    state: &mut OverlayState,
+    delta: i16,
+    shift_down: bool,
+    ctrl_down: bool,
+) -> bool {
+    if !state.ratio_placement_mode || state.settings.aspect_ratio == AspectRatioMode::Custom {
+        return false;
+    }
+    let Some(ratio) = state.settings.aspect_ratio.value() else {
+        return false;
+    };
+    let Some(region) = active_region_rect(state) else {
+        return false;
+    };
+    let monitor = unsafe { monitor_full_region_at(region.center()) }.unwrap_or(state.screen_bounds);
+    let step = if ctrl_down {
+        1.005
+    } else if shift_down {
+        1.02
+    } else {
+        1.08
+    };
+    let scale = if delta >= 0 { step } else { 1.0 / step };
+    let mut width = (region.width * scale).clamp(MIN_REGION_SIZE, monitor.width);
+    let mut height = width / ratio;
+    if height > monitor.height {
+        height = monitor.height;
+        width = height * ratio;
+    }
+    let next = clamp_region_to_bounds(
+        Rect::new(
+            region.center().x - width / 2.0,
+            region.center().y - height / 2.0,
+            width,
+            height,
+        ),
+        monitor,
+    );
+    set_active_ratio_region(state, next);
+    true
+}
+
+fn monitor_full_region_for_rect(state: &OverlayState, region: Rect) -> Option<Rect> {
+    unsafe { monitor_full_region_at(region.center()) }.or_else(|| Some(state.screen_bounds))
+}
+
+unsafe extern "system" fn enum_detected_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let context = &mut *(lparam.0 as *mut WindowDetectionContext);
+    if !is_app_root_window(hwnd) {
+        return BOOL(1);
+    }
+
+    let Some(region) = detected_region_from_hwnd(hwnd) else {
+        return BOOL(1);
+    };
+    context.regions.push(region);
+    BOOL(1)
+}
+
+unsafe fn is_app_root_window(hwnd: HWND) -> bool {
+    if hwnd == GetShellWindow() || IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+        return false;
+    }
+
+    if GetAncestor(hwnd, GA_ROOT) != hwnd {
+        return false;
+    }
+
+    if GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| owner.0 != std::ptr::null_mut()) {
+        return false;
+    }
+
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+        return false;
+    }
+
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    style & (WS_CAPTION.0 | WS_THICKFRAME.0) != 0
+}
+
+unsafe fn detected_region_from_hwnd(hwnd: HWND) -> Option<DetectedRegion> {
+    let Some(window) = frame_rect_for_window(hwnd) else {
+        return None;
+    };
+    if !window.is_visible() {
+        return None;
+    }
+
+    Some(DetectedRegion { hwnd, window })
+}
+
+unsafe fn frame_rect_for_window(hwnd: HWND) -> Option<Rect> {
+    let mut rect = RECT::default();
+    if DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        &mut rect as *mut RECT as *mut _,
+        std::mem::size_of::<RECT>() as u32,
+    )
+    .is_ok()
+    {
+        let frame = rect_from_win32(rect);
+        if frame.is_visible() {
+            return Some(frame);
+        }
+    }
+
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return None;
+    }
+    Some(rect_from_win32(rect))
+}
+
+unsafe fn monitor_full_region_at(screen_point: Point) -> Option<Rect> {
+    let monitor = MonitorFromPoint(
+        POINT {
+            x: screen_point.x.round() as i32,
+            y: screen_point.y.round() as i32,
+        },
+        MONITOR_DEFAULTTONEAREST,
+    );
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+        return None;
+    }
+    Some(rect_from_win32(info.rcMonitor))
+}
+
+fn rect_from_win32(rect: RECT) -> Rect {
+    Rect::new(
+        rect.left as f32,
+        rect.top as f32,
+        (rect.right - rect.left) as f32,
+        (rect.bottom - rect.top) as f32,
+    )
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.x < b.right() && a.right() > b.x && a.y < b.bottom() && a.bottom() > b.y
+}
+
+fn overlaps_with_tolerance(a: Rect, b: Rect, tolerance: f32) -> bool {
+    a.x + tolerance < b.right()
+        && a.right() - tolerance > b.x
+        && a.y + tolerance < b.bottom()
+        && a.bottom() - tolerance > b.y
+}
+
+fn handle_mouse_move(state: &mut OverlayState, point: Point) -> bool {
+    let over_region_control_hud = state
+        .region_control_bounds
+        .is_some_and(|rect| rect.contains(point));
+    let hovered_region_control = state
+        .region_control_buttons
+        .iter()
+        .find(|button| button.rect.contains(point))
+        .map(|button| button.kind);
+    let region_control_hover_changed = state.hovered_region_control != hovered_region_control;
+    state.hovered_region_control = hovered_region_control;
+
+    if let Some(DragState::AdjustingSubmenuSlider { slider }) = &state.drag {
+        apply_submenu_slider_at(state, *slider, point);
+        return true;
+    }
+
+    let screen_point = state.overlay_to_screen(point);
+    let text_move_started = matches!(
+        &state.drag,
+        Some(DragState::PendingTextInteraction {
+            start,
+            moved: false,
+            ..
+        }) if ((screen_point.x - start.x).powi(2) + (screen_point.y - start.y).powi(2)).sqrt()
+            > CLICK_DRAG_THRESHOLD
+    );
+    if text_move_started {
+        state.checkpoint();
+    }
+    match &mut state.drag {
+        Some(DragState::Selecting { start, current }) => {
+            *current = constrained_selection_point(*start, point, state.settings.aspect_ratio);
+            true
+        }
+        Some(DragState::MovingRegion { start, original }) => {
+            let dx = point.x - start.x;
+            let dy = point.y - start.y;
+            state.session.set_capture_region(original.translate(dx, dy));
+            update_locked_region_if_needed(state);
+            state.mark_static_dirty();
+            true
+        }
+        Some(DragState::MovingToolbar { start, original }) => {
+            let dx = point.x - start.x;
+            let dy = point.y - start.y;
+            state.toolbar_origin = Some(original.translate(dx, dy));
+            true
+        }
+        Some(DragState::ResizingRegion { handle, original }) => {
+            let region = resize_region_with_aspect(
+                *original,
+                *handle,
+                screen_point,
+                state.settings.aspect_ratio,
+            );
+            state.session.set_capture_region(region);
+            update_locked_region_if_needed(state);
+            state.mark_static_dirty();
+            true
+        }
+        Some(DragState::MovingAnnotation {
+            start,
+            id,
+            original,
+        }) => {
+            let dx = screen_point.x - start.x;
+            let dy = screen_point.y - start.y;
+            if let Some(annotation) = state.session.document.annotation_mut(*id) {
+                *annotation = original.translated(dx, dy);
+                state.session.select_annotation(Some(*id));
+                state.mark_static_dirty();
+            }
+            true
+        }
+        Some(DragState::EditingAnnotation { id, edit, original }) => {
+            if let Some(annotation) = state.session.document.annotation_mut(*id) {
+                *annotation = edited_annotation(original, *edit, screen_point);
+                state.session.select_annotation(Some(*id));
+                state.mark_static_dirty();
+            }
+            true
+        }
+        Some(DragState::PendingTextInteraction {
+            start,
+            id,
+            original,
+            moved,
+            ..
+        }) => {
+            let dx = screen_point.x - start.x;
+            let dy = screen_point.y - start.y;
+            if (dx * dx + dy * dy).sqrt() <= CLICK_DRAG_THRESHOLD {
+                return false;
+            }
+            *moved = true;
+            if let Some(annotation) = state.session.document.annotation_mut(*id) {
+                *annotation = original.translated(dx, dy);
+                state.session.select_annotation(Some(*id));
+                state.mark_static_dirty();
+            }
+            true
+        }
+        Some(DragState::DrawingAnnotation {
+            start,
+            current,
+            points,
+        }) => {
+            *current = constrained_drawing_point(state.active_tool, *start, screen_point);
+            if state.active_tool == ToolKind::Pen {
+                if points.last().is_none_or(|last| {
+                    ((screen_point.x - last.x).powi(2) + (screen_point.y - last.y).powi(2)).sqrt()
+                        >= PEN_POINT_SPACING
+                }) {
+                    points.push(screen_point);
+                }
+            } else if state.active_tool == ToolKind::Mosaic {
+                points.push(screen_point);
+            }
+            true
+        }
+        Some(DragState::AdjustingSubmenuSlider { .. }) => true,
+        None => {
+            update_cursor_for_hover(state, point);
+            if state.ratio_placement_mode && state.settings.aspect_ratio != AspectRatioMode::Custom
+            {
+                if over_region_control_hud {
+                    return region_control_hover_changed;
+                }
+                position_ratio_region_at_cursor(state, screen_point);
+                return true;
+            }
+            if state.session.document.capture_region.is_none() {
+                let next = detect_smart_region_candidate(state, screen_point);
+                let _ = commit_smart_region_candidate(state, next);
+                return true;
+            }
+            region_control_hover_changed
+        }
+    }
+}
+
+fn constrained_drawing_point(tool: ToolKind, start: Point, current: Point) -> Point {
+    if tool == ToolKind::StepNumber {
+        start
+    } else if tool == ToolKind::Highlighter && unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 } {
+        let dx = current.x - start.x;
+        let dy = current.y - start.y;
+        if dx.abs() >= dy.abs() {
+            Point::new(current.x, start.y)
+        } else {
+            Point::new(start.x, current.y)
+        }
+    } else {
+        current
+    }
+}
+
+fn constrained_selection_point(start: Point, current: Point, mode: AspectRatioMode) -> Point {
+    let Some(ratio) = mode.value() else {
+        return current;
+    };
+    let dx = current.x - start.x;
+    let dy = current.y - start.y;
+    if dx.abs() < 1.0 && dy.abs() < 1.0 {
+        return current;
+    }
+    let width_from_x = dx.abs().max(MIN_REGION_SIZE);
+    let height_from_y = dy.abs().max(MIN_REGION_SIZE);
+    let width_if_height_locked = height_from_y * ratio;
+    let height_if_width_locked = width_from_x / ratio;
+    let (width, height) = if (width_if_height_locked - width_from_x).abs()
+        < (height_if_width_locked - height_from_y).abs()
+    {
+        (width_if_height_locked, height_from_y)
+    } else {
+        (width_from_x, height_if_width_locked)
+    };
+    Point::new(start.x + width.copysign(dx), start.y + height.copysign(dy))
+}
+
+fn resize_region_with_aspect(
+    original: Rect,
+    handle: ResizeHandle,
+    to: Point,
+    mode: AspectRatioMode,
+) -> Rect {
+    let Some(ratio) = mode.value() else {
+        return original.resize_from_handle(handle, to, MIN_REGION_SIZE);
+    };
+
+    let anchor = match handle {
+        ResizeHandle::NorthWest => Point::new(original.right(), original.bottom()),
+        ResizeHandle::North => Point::new(original.center().x, original.bottom()),
+        ResizeHandle::NorthEast => Point::new(original.x, original.bottom()),
+        ResizeHandle::East => Point::new(original.x, original.center().y),
+        ResizeHandle::SouthEast => Point::new(original.x, original.y),
+        ResizeHandle::South => Point::new(original.center().x, original.y),
+        ResizeHandle::SouthWest => Point::new(original.right(), original.y),
+        ResizeHandle::West => Point::new(original.right(), original.center().y),
+    };
+
+    let mut dx = to.x - anchor.x;
+    let mut dy = to.y - anchor.y;
+    match handle {
+        ResizeHandle::North | ResizeHandle::South => {
+            dy = if dy.abs() < MIN_REGION_SIZE {
+                MIN_REGION_SIZE.copysign(dy)
+            } else {
+                dy
+            };
+            dx = original
+                .width
+                .copysign(if matches!(handle, ResizeHandle::North) {
+                    original.x - anchor.x
+                } else {
+                    original.right() - anchor.x
+                });
+        }
+        ResizeHandle::East | ResizeHandle::West => {
+            dx = if dx.abs() < MIN_REGION_SIZE {
+                MIN_REGION_SIZE.copysign(dx)
+            } else {
+                dx
+            };
+            dy = original
+                .height
+                .copysign(if matches!(handle, ResizeHandle::West) {
+                    original.y - anchor.y
+                } else {
+                    original.bottom() - anchor.y
+                });
+        }
+        _ => {}
+    }
+
+    let width = dx.abs().max(MIN_REGION_SIZE);
+    let height = dy.abs().max(MIN_REGION_SIZE);
+    let height_from_width = width / ratio;
+    let width_from_height = height * ratio;
+    let (width, height) = if (height_from_width - height).abs() <= (width_from_height - width).abs()
+    {
+        (width, height_from_width)
+    } else {
+        (width_from_height, height)
+    };
+    let corner = Point::new(
+        anchor.x + width.copysign(dx),
+        anchor.y + height.copysign(dy),
+    );
+    Rect::from_points(anchor, corner)
+}
+
+fn submenu_geometry(state: &OverlayState) -> Option<(ToolKind, Rect, Rect)> {
+    let tool = state.active_submenu?;
+    let anchor = state
+        .toolbar_buttons
+        .iter()
+        .find(
+            |button| matches!(button.tool, ToolbarAction::Tool(button_tool) if button_tool == tool),
+        )?
+        .rect;
+    let height = scaled(state, SUBMENU_HEIGHT);
+    let width = submenu_width(state, tool);
+    let margin = scaled(state, 8.0);
+    let x = (anchor.center().x - width / 2.0)
+        .max(margin)
+        .min((state.screen_bounds.width - width - margin).max(margin));
+    let y = (anchor.bottom() + scaled(state, 18.0))
+        .min((state.screen_bounds.height - height - margin).max(margin));
+    Some((tool, anchor, Rect::new(x, y, width, height)))
+}
+
+fn update_cursor_for_hover(state: &OverlayState, point: Point) {
+    unsafe {
+        let cursor = if state.submenu_rect.is_some_and(|rect| rect.contains(point))
+            || state
+                .submenu_buttons
+                .iter()
+                .any(|button| button.rect.contains(point))
+            || state
+                .submenu_sliders
+                .iter()
+                .any(|slider| slider.rect.contains(point))
+            || state
+                .region_control_buttons
+                .iter()
+                .any(|button| button.rect.contains(point))
+            || state
+                .region_control_bounds
+                .is_some_and(|rect| rect.contains(point))
+        {
+            IDC_ARROW
+        } else if state
+            .toolbar_buttons
+            .iter()
+            .any(|button| matches!(button.tool, ToolbarAction::Grip) && button.rect.contains(point))
+        {
+            IDC_HAND
+        } else if state
+            .toolbar_buttons
+            .iter()
+            .any(|button| button.rect.contains(point))
+        {
+            IDC_ARROW
+        } else if let Some(region) = state.region_overlay() {
+            if let Some(handle) = region.hit_resize_handle(point, REGION_RESIZE_HIT_RADIUS) {
+                cursor_for_resize_handle(handle)
+            } else if region_frame_contains(region, point) {
+                IDC_SIZEALL
+            } else {
+                let screen_point = state.overlay_to_screen(point);
+                if let Some(annotation) = state
+                    .session
+                    .document
+                    .annotations
+                    .iter()
+                    .rev()
+                    .find(|annotation| annotation_hit_test(annotation, screen_point))
+                {
+                    if let Some(edit) = hit_annotation_edit_handle(state, annotation, screen_point)
+                    {
+                        match edit {
+                            AnnotationEdit::BoxResize(handle) => cursor_for_resize_handle(handle),
+                            AnnotationEdit::LineStart
+                            | AnnotationEdit::LineEnd
+                            | AnnotationEdit::TagAnchor => IDC_SIZEALL,
+                        }
+                    } else {
+                        IDC_SIZEALL
+                    }
+                } else if region.contains(point) {
+                    IDC_CROSS
+                } else {
+                    IDC_ARROW
+                }
+            }
+        } else {
+            IDC_CROSS
+        };
+        if let Ok(handle) = LoadCursorW(None, cursor) {
+            let _ = SetCursor(handle);
+        }
+    }
+}
+
+fn hit_annotation_edit_handle(
+    _state: &OverlayState,
+    annotation: &Annotation,
+    screen_point: Point,
+) -> Option<AnnotationEdit> {
+    match &annotation.kind {
+        AnnotationKind::Line { start, end }
+        | AnnotationKind::Arrow { start, end }
+        | AnnotationKind::Highlighter {
+            shape: HighlightShape::Rectangle,
+            start,
+            end,
+            ..
+        } => {
+            if near_point(screen_point, *start, HANDLE_RADIUS + 14.0) {
+                Some(AnnotationEdit::LineStart)
+            } else if near_point(screen_point, *end, HANDLE_RADIUS + 14.0) {
+                Some(AnnotationEdit::LineEnd)
+            } else {
+                None
+            }
+        }
+        AnnotationKind::Tag { anchor, .. } => annotation
+            .bounds
+            .hit_resize_handle(screen_point, HANDLE_RADIUS + 20.0)
+            .map(AnnotationEdit::BoxResize)
+            .or_else(|| {
+                near_point(screen_point, *anchor, HANDLE_RADIUS + 18.0)
+                    .then_some(AnnotationEdit::TagAnchor)
+            }),
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            ..
+        } => text_annotation_hit_bounds(annotation.bounds, text, *font_size, *framed)
+            .hit_resize_handle(screen_point, HANDLE_RADIUS + 20.0)
+            .map(AnnotationEdit::BoxResize),
+        AnnotationKind::Pen { .. } | AnnotationKind::PenArrow { .. } => None,
+        _ => annotation
+            .bounds
+            .hit_resize_handle(screen_point, HANDLE_RADIUS + 14.0)
+            .map(AnnotationEdit::BoxResize),
+    }
+}
+
+fn near_point(point: Point, target: Point, radius: f32) -> bool {
+    (point.x - target.x).abs() <= radius && (point.y - target.y).abs() <= radius
+}
+
+fn line_hit_radius(width: f32) -> f32 {
+    (width / 2.0 + 10.0).max(12.0)
+}
+
+fn near_segment(point: Point, start: Point, end: Point, radius: f32) -> bool {
+    distance_to_segment(point, start, end) <= radius
+}
+
+fn distance_to_segment(point: Point, start: Point, end: Point) -> f32 {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq <= f32::EPSILON {
+        return distance(point, start);
+    }
+    let t = (((point.x - start.x) * dx + (point.y - start.y) * dy) / len_sq).clamp(0.0, 1.0);
+    let closest = Point::new(start.x + dx * t, start.y + dy * t);
+    distance(point, closest)
+}
+
+fn edited_annotation(original: &Annotation, edit: AnnotationEdit, to: Point) -> Annotation {
+    if !annotation_supports_edit(original, edit) {
+        return original.clone();
+    }
+    let mut next = original.clone();
+    match (&mut next.kind, edit) {
+        (AnnotationKind::Line { start, .. }, AnnotationEdit::LineStart)
+        | (AnnotationKind::Arrow { start, .. }, AnnotationEdit::LineStart)
+        | (
+            AnnotationKind::Highlighter {
+                shape: HighlightShape::Rectangle,
+                start,
+                ..
+            },
+            AnnotationEdit::LineStart,
+        ) => {
+            *start = to;
+            next.bounds = line_bounds(&next.kind);
+        }
+        (AnnotationKind::Line { end, .. }, AnnotationEdit::LineEnd)
+        | (AnnotationKind::Arrow { end, .. }, AnnotationEdit::LineEnd)
+        | (
+            AnnotationKind::Highlighter {
+                shape: HighlightShape::Rectangle,
+                end,
+                ..
+            },
+            AnnotationEdit::LineEnd,
+        ) => {
+            *end = to;
+            next.bounds = line_bounds(&next.kind);
+        }
+        (
+            AnnotationKind::Text {
+                text,
+                font_size,
+                framed: false,
+                ..
+            },
+            AnnotationEdit::BoxResize(handle),
+        ) => {
+            let original_frame = inline_text_hit_bounds(original.bounds, text, *font_size);
+            let resized_frame = original_frame.resize_from_handle(handle, to, MIN_REGION_SIZE);
+            let line_count = inline_text_lines(text).count().max(1) as f32;
+            let next_font_size = ((resized_frame.height - INLINE_TEXT_PADDING * 2.0)
+                / (INLINE_TEXT_LINE_HEIGHT * line_count))
+                .clamp(8.0, 160.0);
+            *font_size = next_font_size;
+            next.bounds = Rect::new(
+                resized_frame.x + INLINE_TEXT_PADDING,
+                resized_frame.y + next_font_size * INLINE_TEXT_ASCENT + INLINE_TEXT_PADDING,
+                resized_frame.width,
+                resized_frame.height,
+            );
+        }
+        (_, AnnotationEdit::BoxResize(handle)) => {
+            next.bounds = original
+                .bounds
+                .resize_from_handle(handle, to, MIN_REGION_SIZE);
+        }
+        (AnnotationKind::Tag { anchor, .. }, AnnotationEdit::TagAnchor) => {
+            *anchor = to;
+        }
+        _ => {}
+    }
+    next
+}
+
+#[cfg(test)]
+mod annotation_edit_tests {
+    use super::*;
+
+    fn annotation(kind: AnnotationKind) -> Annotation {
+        Annotation::new(
+            42,
+            kind,
+            Rect::new(100.0, 100.0, 200.0, 100.0),
+            StrokeStyle::default(),
+        )
+    }
+
+    #[test]
+    fn framed_text_resize_keeps_the_same_annotation_and_content() {
+        let original = annotation(AnnotationKind::Text {
+            text: "Captain's log".to_string(),
+            font_size: 27.0,
+            framed: true,
+            filled: true,
+        });
+
+        for (handle, target) in [
+            (ResizeHandle::NorthWest, Point::new(80.0, 75.0)),
+            (ResizeHandle::North, Point::new(200.0, 75.0)),
+            (ResizeHandle::NorthEast, Point::new(330.0, 75.0)),
+            (ResizeHandle::East, Point::new(330.0, 150.0)),
+            (ResizeHandle::SouthEast, Point::new(330.0, 225.0)),
+            (ResizeHandle::South, Point::new(200.0, 225.0)),
+            (ResizeHandle::SouthWest, Point::new(80.0, 225.0)),
+            (ResizeHandle::West, Point::new(80.0, 150.0)),
+        ] {
+            let resized = edited_annotation(&original, AnnotationEdit::BoxResize(handle), target);
+
+            assert_eq!(resized.id, original.id);
+            assert!(resized.bounds.is_visible());
+            assert!(matches!(
+                resized.kind,
+                AnnotationKind::Text {
+                    ref text,
+                    font_size: 27.0,
+                    framed: true,
+                    filled: true,
+                } if text == "Captain's log"
+            ));
+        }
+    }
+
+    #[test]
+    fn box_resize_keeps_non_text_annotations_present() {
+        for kind in [AnnotationKind::Rectangle, AnnotationKind::Oval] {
+            let original = annotation(kind);
+            let resized = edited_annotation(
+                &original,
+                AnnotationEdit::BoxResize(ResizeHandle::SouthEast),
+                Point::new(360.0, 260.0),
+            );
+
+            assert_eq!(resized.id, original.id);
+            assert!(resized.bounds.is_visible());
+            assert_eq!(resized.bounds, Rect::new(100.0, 100.0, 260.0, 160.0));
+        }
+    }
+
+    #[test]
+    fn unsupported_edit_operations_do_not_mutate_annotations() {
+        let line = annotation(AnnotationKind::Line {
+            start: Point::new(100.0, 100.0),
+            end: Point::new(300.0, 200.0),
+        });
+
+        assert!(!annotation_supports_edit(
+            &line,
+            AnnotationEdit::BoxResize(ResizeHandle::SouthEast)
+        ));
+        assert_eq!(
+            edited_annotation(
+                &line,
+                AnnotationEdit::BoxResize(ResizeHandle::SouthEast),
+                Point::new(360.0, 260.0),
+            ),
+            line
+        );
+    }
+
+    #[test]
+    fn inline_text_bounds_use_measured_glyph_widths() {
+        let narrow = inline_text_width("iiiiiiii", 27.0);
+        let wide = inline_text_width("WWWWWWWW", 27.0);
+        let bounds = Rect::new(100.0, 100.0, 0.0, 0.0);
+        let measured = inline_text_width("Perfect this works wonders", 27.0);
+        let hit_bounds = inline_text_hit_bounds(bounds, "Perfect this works wonders", 27.0);
+
+        assert!(wide > narrow);
+        assert!((hit_bounds.width - (measured + INLINE_TEXT_PADDING * 2.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn inline_text_bounds_count_trailing_and_empty_lines() {
+        let bounds =
+            inline_text_hit_bounds(Rect::new(100.0, 100.0, 0.0, 0.0), "first\nsecond\n", 27.0);
+        let expected_height = 27.0 * INLINE_TEXT_LINE_HEIGHT * 3.0 + INLINE_TEXT_PADDING * 2.0;
+
+        assert!((bounds.height - expected_height).abs() < 0.01);
+    }
+
+    #[test]
+    fn submenu_widths_are_derived_from_their_control_layouts() {
+        assert_eq!(MIN_WATERMARK_FONT_SIZE, 8.0);
+        assert_eq!(submenu_content_width(ToolKind::Rectangle), 270.0);
+        assert_eq!(submenu_content_width(ToolKind::Pen), 342.0);
+        assert_eq!(submenu_content_width(ToolKind::Text), 370.0);
+        assert_eq!(submenu_content_width(ToolKind::Tag), 436.0);
+        assert_eq!(submenu_content_width(ToolKind::Watermark), 516.0);
+    }
+}
+
+fn line_bounds(kind: &AnnotationKind) -> Rect {
+    match kind {
+        AnnotationKind::Line { start, end }
+        | AnnotationKind::Arrow { start, end }
+        | AnnotationKind::Highlighter {
+            shape: HighlightShape::Rectangle,
+            start,
+            end,
+            ..
+        } => Rect::from_points(*start, *end),
+        _ => Rect::default(),
+    }
+}
+
+fn cursor_for_resize_handle(handle: ResizeHandle) -> windows::core::PCWSTR {
+    match handle {
+        ResizeHandle::North | ResizeHandle::South => IDC_SIZENS,
+        ResizeHandle::East | ResizeHandle::West => IDC_SIZEWE,
+        ResizeHandle::NorthWest | ResizeHandle::SouthEast => IDC_SIZENWSE,
+        ResizeHandle::NorthEast | ResizeHandle::SouthWest => IDC_SIZENESW,
+    }
+}
+
+fn handle_mouse_up(state: &mut OverlayState, point: Point) {
+    let Some(drag) = state.drag.take() else {
+        return;
+    };
+
+    match drag {
+        DragState::Selecting { start, current } => {
+            let rect = Rect::from_points(
+                state.overlay_to_screen(start),
+                state.overlay_to_screen(current),
+            );
+            let drag_distance =
+                ((current.x - start.x).powi(2) + (current.y - start.y).powi(2)).sqrt();
+            if drag_distance <= CLICK_DRAG_THRESHOLD {
+                if let Some(region) = state.smart_region.as_ref().map(|candidate| candidate.rect) {
+                    state.session.set_capture_region(region);
+                    state.toolbar_origin = Some(toolbar_origin_near_point(state, point, region));
+                }
+            } else if rect.is_visible() {
+                state.session.set_capture_region(rect);
+                state.smart_region = Some(SmartRegionCandidate::new(
+                    SmartRegionKind::Manual,
+                    rect,
+                    1.0,
+                    SmartRegionSource::Manual,
+                    None,
+                    None,
+                ));
+                state.pending_smart_region = None;
+                state.toolbar_origin = Some(toolbar_origin_near_point(
+                    state,
+                    current,
+                    rect.translate(-state.screen_bounds.x, -state.screen_bounds.y),
+                ));
+            }
+        }
+        DragState::MovingRegion { .. } | DragState::ResizingRegion { .. } => {
+            persist_locked_region_if_needed(state);
+        }
+        DragState::MovingToolbar { .. }
+        | DragState::MovingAnnotation { .. }
+        | DragState::EditingAnnotation { .. } => {}
+        DragState::AdjustingSubmenuSlider { .. } => {
+            state.style_edit_in_progress = false;
+        }
+        DragState::PendingTextInteraction {
+            id,
+            caret_index,
+            moved,
+            ..
+        } => {
+            if !moved && editable_text_annotation(state, id) {
+                state.session.select_annotation(Some(id));
+                state.editing_text_id = Some(id);
+                state.editing_text_caret =
+                    caret_index.unwrap_or_else(|| annotation_text_len(state, id));
+                state.editing_step_number_id = None;
+                state.editing_step_number_replace = false;
+                state.editing_watermark_text = false;
+            }
+        }
+        DragState::DrawingAnnotation {
+            start,
+            current,
+            points,
+        } => {
+            state.checkpoint();
+            let end = state.overlay_to_screen(point);
+            let bounds = Rect::from_points(start, end);
+            if bounds.is_visible()
+                || matches!(
+                    state.active_tool,
+                    ToolKind::Text
+                        | ToolKind::Tag
+                        | ToolKind::Watermark
+                        | ToolKind::Pen
+                        | ToolKind::Highlighter
+                        | ToolKind::StepNumber
+                )
+            {
+                let mut annotation = annotation_from_tool(state, start, current, points);
+                let is_textual = matches!(
+                    annotation.kind,
+                    AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+                );
+                let is_step = matches!(annotation.kind, AnnotationKind::StepNumber { .. });
+                if state.numbering_enabled && annotation.accepts_auto_numbering() {
+                    annotation.step_number = Some(state.next_step_number);
+                    state.next_step_number += 1;
+                }
+                let id = state.session.add_annotation(annotation);
+                if is_textual {
+                    state.editing_text_id = Some(id);
+                    state.editing_text_caret = 0;
+                }
+                if is_step {
+                    state.next_step_number += 1;
+                }
+            }
+        }
+    }
+}
+
+fn shift_key_down() -> bool {
+    unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
+}
+
+fn ctrl_key_down() -> bool {
+    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
+}
+
+fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
+    let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 };
+    if state.editing_watermark_text && !ctrl_down {
+        match key {
+            0x1B => deselect_all(state),
+            key if key == VK_RETURN.0 as u32 => {
+                state.editing_watermark_text = false;
+                unsafe {
+                    complete_copy_action(state);
+                }
+            }
+            0x08 => {
+                state.watermark_text.pop();
+            }
+            0x2E => state.watermark_text.clear(),
+            _ => {}
+        }
+        return;
+    }
+    if state.editing_text_id.is_some() && !ctrl_down {
+        match key {
+            0x1B => deselect_all(state),
+            key if key == VK_RETURN.0 as u32 => {
+                if shift_down && editing_text_accepts_line_break(state) {
+                    insert_text_at_caret(state, "\n");
+                } else {
+                    state.editing_text_id = None;
+                    state.editing_text_caret = 0;
+                }
+            }
+            0x08 => {
+                delete_text_before_caret(state);
+            }
+            0x2E => delete_text_after_caret(state),
+            key if key == VK_LEFT.0 as u32 => move_text_caret_horizontal(state, -1),
+            key if key == VK_RIGHT.0 as u32 => move_text_caret_horizontal(state, 1),
+            key if key == VK_UP.0 as u32 || key == VK_DOWN.0 as u32 => {}
+            _ => {}
+        }
+        return;
+    }
+    if state.editing_step_number_id.is_some() && !ctrl_down {
+        match key {
+            0x1B => deselect_all(state),
+            key if key == VK_RETURN.0 as u32 => {
+                state.editing_step_number_id = None;
+                state.editing_step_number_replace = false;
+            }
+            0x08 => edit_selected_step_number(state, |number| number / 10),
+            0x2E => edit_selected_step_number(state, |_| 0),
+            _ => {}
+        }
+        return;
+    }
+
+    match key {
+        0x1B => {
+            if has_active_annotation_state(state) {
+                deselect_all(state);
+            } else {
+                unsafe {
+                    request_overlay_close(state);
+                }
+            }
+        }
+        key if key == VK_RETURN.0 as u32 => {
+            if state.session.document.capture_region.is_none() {
+                if let Some(region) = state.smart_region.as_ref().map(|candidate| candidate.rect) {
+                    state.session.set_capture_region(region);
+                    let overlay_region =
+                        region.translate(-state.screen_bounds.x, -state.screen_bounds.y);
+                    state.toolbar_origin = Some(default_toolbar_origin(state, overlay_region));
+                    state.defer_watermark_static_redraw_once = true;
+                    state.mark_static_dirty();
+                    return;
+                }
+            }
+            unsafe {
+                complete_copy_action(state);
+            }
+        }
+        0x5A if ctrl_down => {
+            if state.session.undo() {
+                state.force_web_full_snapshot = true;
+                state.mark_static_dirty();
+            }
+        }
+        0x53 if ctrl_down => unsafe {
+            complete_save_action(state);
+        },
+        0x2E => {
+            state.checkpoint();
+            let _ = state.session.remove_selected_annotation();
+            state.mark_static_dirty();
+        }
+        _ => {}
+    }
+}
+
+fn handle_char(state: &mut OverlayState, char_code: u32) {
+    if char_code < 32 || char_code == 127 {
+        return;
+    }
+    let Some(ch) = char::from_u32(char_code) else {
+        return;
+    };
+    if state.editing_watermark_text {
+        state.watermark_text.push(ch);
+        state.mark_static_dirty();
+        return;
+    }
+    if state.editing_step_number_id.is_some() {
+        if let Some(digit) = ch.to_digit(10) {
+            let replace = state.editing_step_number_replace;
+            edit_selected_step_number(state, |number| {
+                if replace {
+                    digit
+                } else {
+                    number.saturating_mul(10).saturating_add(digit)
+                }
+            });
+            state.editing_step_number_replace = false;
+            state.mark_static_dirty();
+        }
+        return;
+    }
+    if state.editing_text_id.is_none() {
+        return;
+    }
+    let mut buffer = [0_u8; 4];
+    insert_text_at_caret(state, ch.encode_utf8(&mut buffer));
+    state.mark_static_dirty();
+}
+
+fn editing_text_accepts_line_break(state: &OverlayState) -> bool {
+    let Some(id) = state.editing_text_id else {
+        return false;
+    };
+    state
+        .session
+        .document
+        .annotation(id)
+        .is_some_and(|annotation| {
+            matches!(
+                annotation.kind,
+                AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+            )
+        })
+}
+
+fn edit_selected_step_number(state: &mut OverlayState, edit: impl FnOnce(u32) -> u32) {
+    let Some(id) = state.editing_step_number_id else {
+        return;
+    };
+    if let Some(annotation) = state.session.document.annotation_mut(id) {
+        let current = annotation.display_step_number().unwrap_or(0);
+        let next = edit(current);
+        match &mut annotation.kind {
+            AnnotationKind::StepNumber { number } => *number = next,
+            _ => annotation.step_number = Some(next),
+        }
+        state.next_step_number = state.next_step_number.max(next.saturating_add(1));
+        state.editing_step_number_replace = false;
+    }
+}
+
+fn edit_selected_text(state: &mut OverlayState, edit: impl FnOnce(&mut String)) {
+    let Some(id) = state.editing_text_id else {
+        return;
+    };
+    edit_text_annotation(state, id, edit);
+}
+
+fn update_text_annotation(state: &mut OverlayState, id: AnnotationId, text: String) {
+    edit_text_annotation(state, id, |current| {
+        *current = text;
+    });
+    state.mark_static_dirty();
+}
+
+fn edit_text_annotation(
+    state: &mut OverlayState,
+    id: AnnotationId,
+    edit: impl FnOnce(&mut String),
+) {
+    if let Some(annotation) = state.session.document.annotation_mut(id) {
+        let mut edited_tag = false;
+        let mut edited_framed_text_font_size = None;
+        match &mut annotation.kind {
+            AnnotationKind::Text {
+                text,
+                font_size,
+                framed,
+                ..
+            } => {
+                edit(text);
+                if *framed {
+                    edited_framed_text_font_size = Some(*font_size);
+                }
+            }
+            AnnotationKind::Tag { label, .. } => {
+                edit(label);
+                edited_tag = true;
+            }
+            _ => {}
+        }
+        if edited_tag {
+            let font_size = match &annotation.kind {
+                AnnotationKind::Tag { font_size, .. } => *font_size,
+                _ => state.font_size,
+            };
+            resize_tag_for_text(annotation, font_size);
+        }
+        if let Some(font_size) = edited_framed_text_font_size {
+            resize_framed_text_for_text(annotation, font_size);
+        }
+    }
+}
+
+fn insert_text_at_caret(state: &mut OverlayState, value: &str) {
+    let caret = state.editing_text_caret;
+    edit_selected_text(state, |text| {
+        let index = byte_index_for_char_index(text, caret);
+        text.insert_str(index, value);
+    });
+    state.editing_text_caret = state
+        .editing_text_caret
+        .saturating_add(value.chars().count());
+}
+
+fn delete_text_before_caret(state: &mut OverlayState) {
+    if state.editing_text_caret == 0 {
+        return;
+    }
+    let caret = state.editing_text_caret;
+    edit_selected_text(state, |text| {
+        let end = byte_index_for_char_index(text, caret);
+        let start = byte_index_for_char_index(text, caret.saturating_sub(1));
+        if start < end && end <= text.len() {
+            text.replace_range(start..end, "");
+        }
+    });
+    state.editing_text_caret = state.editing_text_caret.saturating_sub(1);
+}
+
+fn delete_text_after_caret(state: &mut OverlayState) {
+    let Some(id) = state.editing_text_id else {
+        return;
+    };
+    if state.editing_text_caret >= annotation_text_len(state, id) {
+        return;
+    }
+    let caret = state.editing_text_caret;
+    edit_selected_text(state, |text| {
+        let start = byte_index_for_char_index(text, caret);
+        let end = byte_index_for_char_index(text, caret.saturating_add(1));
+        if start < end && end <= text.len() {
+            text.replace_range(start..end, "");
+        }
+    });
+}
+
+fn set_text_caret(state: &mut OverlayState, caret: usize) {
+    let Some(id) = state.editing_text_id else {
+        return;
+    };
+    state.editing_text_caret = caret.min(annotation_text_len(state, id));
+}
+
+fn move_text_caret_horizontal(state: &mut OverlayState, direction: i32) {
+    let Some(id) = state.editing_text_id else {
+        return;
+    };
+    let len = annotation_text_len(state, id);
+    if direction < 0 {
+        state.editing_text_caret = state.editing_text_caret.saturating_sub(1);
+    } else if direction > 0 {
+        state.editing_text_caret = state.editing_text_caret.saturating_add(1).min(len);
+    }
+}
+
+fn byte_index_for_char_index(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn annotation_text_len(state: &OverlayState, id: AnnotationId) -> usize {
+    state
+        .session
+        .document
+        .annotation(id)
+        .map(annotation_text)
+        .unwrap_or("")
+        .chars()
+        .count()
+}
+
+fn annotation_text(annotation: &Annotation) -> &str {
+    match &annotation.kind {
+        AnnotationKind::Text { text, .. } => text,
+        AnnotationKind::Tag { label, .. } => label,
+        _ => "",
+    }
+}
+
+fn text_caret_index_for_point(
+    state: &OverlayState,
+    id: AnnotationId,
+    point: Point,
+) -> Option<usize> {
+    let annotation = state.session.document.annotation(id)?;
+    let (text, font_size, origin, line_height) = match &annotation.kind {
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            ..
+        } => {
+            if *framed {
+                (
+                    text.as_str(),
+                    *font_size,
+                    Point::new(annotation.bounds.x + 8.0, annotation.bounds.y + 8.0),
+                    *font_size * 1.22,
+                )
+            } else {
+                (
+                    text.as_str(),
+                    *font_size,
+                    Point::new(annotation.bounds.x, annotation.bounds.y - *font_size * 1.08),
+                    *font_size,
+                )
+            }
+        }
+        AnnotationKind::Tag {
+            label, font_size, ..
+        } => (
+            label.as_str(),
+            *font_size,
+            Point::new(annotation.bounds.x + 8.0, annotation.bounds.y + 8.0),
+            *font_size * 1.22,
+        ),
+        _ => return None,
+    };
+    Some(caret_index_from_text_point(
+        text,
+        font_size,
+        origin,
+        line_height,
+        point,
+    ))
+}
+
+fn caret_index_from_text_point(
+    text: &str,
+    font_size: f32,
+    origin: Point,
+    line_height: f32,
+    point: Point,
+) -> usize {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let line_count = lines.len().max(1);
+    let line_index = ((point.y - origin.y) / line_height.max(1.0))
+        .floor()
+        .clamp(0.0, (line_count - 1) as f32) as usize;
+    let approx_char = (font_size * 0.56).max(1.0);
+    let col = ((point.x - origin.x) / approx_char).round().max(0.0) as usize;
+    let mut index = 0_usize;
+    for line in lines.iter().take(line_index) {
+        index += line.chars().count() + 1;
+    }
+    index
+        + col.min(
+            lines
+                .get(line_index)
+                .map(|line| line.chars().count())
+                .unwrap_or(0),
+        )
+}
+
+fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
+    match action {
+        ToolbarAction::Grip => {}
+        ToolbarAction::Numbering => {
+            finish_text_editing(state);
+            deselect_all(state);
+            let disable = state.numbering_enabled && state.active_tool == ToolKind::StepNumber;
+            state.numbering_enabled = !disable;
+            state.numbering_toggle_progress = if state.numbering_enabled { 0.0 } else { 1.0 };
+            if state.numbering_enabled {
+                state.next_step_number = next_available_step_number(state);
+                state.active_tool = ToolKind::StepNumber;
+                set_active_tool_stroke_width(state, ToolKind::StepNumber);
+            } else {
+                state.active_tool = ToolKind::Rectangle;
+                set_active_tool_stroke_width(state, ToolKind::Rectangle);
+            }
+            state.active_submenu = Some(if state.numbering_enabled {
+                ToolKind::StepNumber
+            } else {
+                ToolKind::Rectangle
+            });
+            unsafe {
+                let _ = SetTimer(state.hwnd, NUMBERING_TOGGLE_TIMER_ID, 8, None);
+            }
+        }
+        ToolbarAction::Tool(tool) => {
+            finish_text_editing(state);
+            deselect_all(state);
+            if state.active_tool == ToolKind::Highlighter && tool != ToolKind::Highlighter {
+                state.current_stroke.color = state.normal_stroke_color;
+            } else if state.active_tool != ToolKind::Highlighter && tool == ToolKind::Highlighter {
+                state.normal_stroke_color = state.current_stroke.color;
+            }
+            state.active_tool = tool;
+            set_active_tool_stroke_width(state, tool);
+            if tool == ToolKind::Highlighter {
+                state.current_stroke.color = annotation_colors()[2];
+            }
+            if tool == ToolKind::Watermark {
+                state.editing_watermark_text = true;
+            }
+            state.active_submenu = configurable_submenu_tool(tool);
+        }
+        ToolbarAction::Divider => state.active_submenu = None,
+        ToolbarAction::Undo => {
+            state.active_submenu = None;
+            if state.session.undo() {
+                state.force_web_full_snapshot = true;
+                state.mark_static_dirty();
+            }
+        }
+        ToolbarAction::Copy => {
+            state.active_submenu = None;
+            unsafe {
+                complete_copy_action(state);
+            }
+        }
+        ToolbarAction::Save => {
+            state.active_submenu = None;
+            unsafe {
+                complete_save_action(state);
+            }
+        }
+        ToolbarAction::Cancel => unsafe {
+            request_overlay_close(state);
+        },
+    }
+}
+
+fn step_numbering_toggle_animation(state: &mut OverlayState) -> bool {
+    let target = if state.numbering_enabled { 1.0 } else { 0.0 };
+    let delta = target - state.numbering_toggle_progress;
+    let step = 0.55;
+    if delta.abs() <= step {
+        state.numbering_toggle_progress = target;
+        return false;
+    }
+    state.numbering_toggle_progress += delta.signum() * step;
+    true
+}
+
+fn tool_width_index(tool: ToolKind) -> usize {
+    match tool {
+        ToolKind::StepNumber => 0,
+        ToolKind::Rectangle => 1,
+        ToolKind::Oval => 2,
+        ToolKind::Line => 3,
+        ToolKind::Arrow => 4,
+        ToolKind::Pen => 5,
+        ToolKind::Text => 6,
+        ToolKind::Tag => 7,
+        ToolKind::Mosaic => 8,
+        ToolKind::Highlighter => 9,
+        ToolKind::Watermark => 10,
+    }
+}
+
+fn tool_has_stroke_width(tool: ToolKind) -> bool {
+    matches!(
+        tool,
+        ToolKind::Rectangle
+            | ToolKind::Oval
+            | ToolKind::Line
+            | ToolKind::Arrow
+            | ToolKind::Pen
+            | ToolKind::Highlighter
+            | ToolKind::Tag
+    )
+}
+
+fn set_active_tool_stroke_width(state: &mut OverlayState, tool: ToolKind) {
+    if tool_has_stroke_width(tool) {
+        state.current_stroke.width = state.tool_stroke_widths[tool_width_index(tool)];
+    }
+}
+
+fn remember_tool_stroke_width(state: &mut OverlayState, tool: ToolKind, width: f32) {
+    if tool_has_stroke_width(tool) {
+        state.tool_stroke_widths[tool_width_index(tool)] = width;
+    }
+}
+
+fn configurable_submenu_tool(tool: ToolKind) -> Option<ToolKind> {
+    matches!(
+        tool,
+        ToolKind::Rectangle
+            | ToolKind::Oval
+            | ToolKind::Line
+            | ToolKind::Arrow
+            | ToolKind::Pen
+            | ToolKind::Highlighter
+            | ToolKind::Text
+            | ToolKind::Tag
+            | ToolKind::Watermark
+    )
+    .then_some(tool)
+}
+
+fn finish_text_editing(state: &mut OverlayState) {
+    state.editing_text_id = None;
+    state.editing_text_caret = 0;
+    state.editing_watermark_text = false;
+    state.editing_step_number_id = None;
+    state.editing_step_number_replace = false;
+}
+
+fn should_remove_empty_text_annotation(state: &OverlayState, id: AnnotationId) -> bool {
+    state
+        .session
+        .document
+        .annotation(id)
+        .is_some_and(|annotation| matches!(annotation.kind, AnnotationKind::Text { .. }))
+}
+
+fn handle_numbering_mode(state: &mut OverlayState, mode: &str) {
+    match mode {
+        "restart" => {
+            state.next_step_number = 1;
+            state.numbering_enabled = true;
+        }
+        "continue" => {
+            state.next_step_number = next_available_step_number(state);
+            state.numbering_enabled = true;
+        }
+        _ => return,
+    }
+    state.numbering_toggle_progress = 1.0;
+    state.active_submenu = Some(ToolKind::StepNumber);
+}
+
+fn start_step_number_editing(state: &mut OverlayState, id: AnnotationId) {
+    if state
+        .session
+        .document
+        .annotations
+        .iter()
+        .any(|annotation| annotation.id == id && annotation.display_step_number().is_some())
+    {
+        state.checkpoint();
+        state.editing_text_id = None;
+        state.editing_watermark_text = false;
+        state.editing_step_number_id = Some(id);
+        state.editing_step_number_replace = true;
+        state.session.select_annotation(Some(id));
+    }
+}
+
+fn handle_submenu_action(state: &mut OverlayState, action: SubmenuAction) {
+    let apply_to_selected = !matches!(
+        action,
+        SubmenuAction::Color(_) if state.active_submenu == Some(ToolKind::Watermark)
+    );
+    if apply_to_selected
+        && !state.style_edit_in_progress
+        && submenu_action_changes_selected_annotation(state, action)
+    {
+        state.checkpoint();
+    }
+    match action {
+        SubmenuAction::StrokeWidth(width) => {
+            state.current_stroke.width = width;
+            if let Some(tool) = state.active_submenu {
+                remember_tool_stroke_width(state, tool, width);
+            }
+        }
+        SubmenuAction::Color(color) => {
+            if state.active_submenu == Some(ToolKind::Watermark) {
+                state.watermark_color = color;
+            } else {
+                state.current_stroke.color = color;
+                if state.active_tool != ToolKind::Highlighter {
+                    state.normal_stroke_color = color;
+                }
+            }
+        }
+        SubmenuAction::PenMode(mode) => state.pen_mode = mode,
+        SubmenuAction::HighlighterShape(shape) => state.highlighter_shape = shape,
+        SubmenuAction::TextFilled(filled) => state.text_filled = filled,
+        SubmenuAction::FontSize(size) => {
+            if state.active_submenu == Some(ToolKind::Watermark) || state.editing_watermark_text {
+                state.watermark_font_size = size.clamp(MIN_WATERMARK_FONT_SIZE, MAX_FONT_SIZE);
+            } else {
+                state.font_size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+            }
+        }
+        SubmenuAction::WatermarkMode(mode) => handle_watermark_mode_action(state, mode),
+        SubmenuAction::WatermarkTextInput => {
+            state.editing_watermark_text = true;
+            state.editing_text_id = None;
+        }
+        SubmenuAction::ClearWatermark => clear_watermark(state),
+    }
+    if apply_to_selected {
+        apply_submenu_to_selected_annotation(state, action);
+    }
+    state.mark_static_dirty();
+}
+
+fn submenu_action_changes_selected_annotation(state: &OverlayState, action: SubmenuAction) -> bool {
+    let Some(annotation) = state
+        .session
+        .document
+        .selected_annotation_id
+        .and_then(|id| state.session.document.annotation(id))
+    else {
+        return false;
+    };
+    match action {
+        SubmenuAction::Color(_) => true,
+        SubmenuAction::StrokeWidth(_) => matches!(
+            annotation.kind,
+            AnnotationKind::Rectangle
+                | AnnotationKind::Oval
+                | AnnotationKind::Line { .. }
+                | AnnotationKind::Arrow { .. }
+                | AnnotationKind::Pen { .. }
+                | AnnotationKind::PenArrow { .. }
+                | AnnotationKind::Tag { .. }
+                | AnnotationKind::Highlighter {
+                    shape: HighlightShape::Rectangle,
+                    ..
+                }
+        ),
+        SubmenuAction::FontSize(_) => matches!(
+            annotation.kind,
+            AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+        ),
+        SubmenuAction::TextFilled(_) => {
+            matches!(annotation.kind, AnnotationKind::Text { .. })
+        }
+        _ => false,
+    }
+}
+
+fn handle_watermark_mode_action(state: &mut OverlayState, mode: WatermarkMode) {
+    state.watermark_mode = mode;
+    match mode {
+        WatermarkMode::Date => state.watermark_date_enabled = !state.watermark_date_enabled,
+        WatermarkMode::Text => state.editing_watermark_text = true,
+        WatermarkMode::Image => {
+            diagnostics::log_breadcrumb("watermark-image-picker-requested");
+            if let Some(path) = unsafe { show_open_image_dialog(state.hwnd) } {
+                diagnostics::log_breadcrumb("watermark-image-selected");
+                let bitmap = load_watermark_bitmap(
+                    &path,
+                    (state.watermark_font_size.max(MIN_WATERMARK_FONT_SIZE) * 5.0)
+                        .round()
+                        .max(1.0) as u32,
+                )
+                .map(|bitmap| faded_watermark_bitmap(&bitmap, WATERMARK_OPACITY));
+                state.watermark_image_data_url =
+                    bitmap.as_ref().and_then(watermark_bitmap_data_url);
+                diagnostics::log_breadcrumb(format!(
+                    "watermark-image-decoded ok={} data_url={}",
+                    bitmap.is_some(),
+                    state.watermark_image_data_url.is_some()
+                ));
+                state.watermark_image_path = Some(path);
+                state.watermark_image_bitmap = bitmap;
+            }
+        }
+    }
+    state.mark_static_dirty();
+}
+
+fn clear_watermark(state: &mut OverlayState) {
+    state.watermark_mode = WatermarkMode::Text;
+    state.watermark_date_enabled = false;
+    state.watermark_text.clear();
+    state.watermark_image_path = None;
+    state.watermark_image_bitmap = None;
+    state.watermark_image_data_url = None;
+    state.editing_watermark_text = false;
+    state.mark_static_dirty();
+}
+
+fn apply_submenu_slider_at(state: &mut OverlayState, slider: SubmenuSlider, point: Point) {
+    let t = ((point.x - slider.start_x) / (slider.end_x - slider.start_x)).clamp(0.0, 1.0);
+    let value = slider.min + (slider.max - slider.min) * t;
+    let action = match slider.kind {
+        SubmenuSliderKind::StrokeWidth => SubmenuAction::StrokeWidth(value),
+        SubmenuSliderKind::FontSize => SubmenuAction::FontSize(value),
+    };
+    handle_submenu_action(state, action);
+}
+
+fn apply_submenu_to_selected_annotation(state: &mut OverlayState, action: SubmenuAction) {
+    let Some(id) = state.session.document.selected_annotation_id else {
+        return;
+    };
+    let Some(annotation) = state.session.document.annotation_mut(id) else {
+        return;
+    };
+    match action {
+        SubmenuAction::StrokeWidth(width) => match annotation.kind {
+            AnnotationKind::Rectangle
+            | AnnotationKind::Oval
+            | AnnotationKind::Line { .. }
+            | AnnotationKind::Arrow { .. }
+            | AnnotationKind::Pen { .. }
+            | AnnotationKind::PenArrow { .. }
+            | AnnotationKind::Tag { .. }
+            | AnnotationKind::Highlighter {
+                shape: HighlightShape::Rectangle,
+                ..
+            } => annotation.stroke.width = width,
+            _ => {}
+        },
+        SubmenuAction::Color(color) => {
+            annotation.stroke.color = color;
+        }
+        SubmenuAction::FontSize(size) => match &mut annotation.kind {
+            AnnotationKind::Text {
+                font_size, framed, ..
+            } => {
+                *font_size = size;
+                if *framed {
+                    resize_framed_text_for_text(annotation, size);
+                }
+            }
+            AnnotationKind::Tag { font_size, .. } => {
+                *font_size = size;
+                resize_tag_for_text(annotation, size);
+            }
+            _ => {}
+        },
+        SubmenuAction::TextFilled(next_filled) => {
+            if let AnnotationKind::Text { filled, .. } = &mut annotation.kind {
+                *filled = next_filled;
+            }
+        }
+        SubmenuAction::PenMode(mode) => {
+            let replacement = match (&annotation.kind, mode) {
+                (AnnotationKind::Pen { points }, PenMode::Arrow) => {
+                    Some(AnnotationKind::PenArrow {
+                        points: points.clone(),
+                    })
+                }
+                (AnnotationKind::PenArrow { points }, PenMode::Free) => Some(AnnotationKind::Pen {
+                    points: points.clone(),
+                }),
+                _ => None,
+            };
+            if let Some(kind) = replacement {
+                annotation.kind = kind;
+            }
+        }
+        SubmenuAction::HighlighterShape(_) => {}
+        _ => {}
+    }
+}
+
+fn annotation_from_tool(
+    state: &OverlayState,
+    start: Point,
+    end: Point,
+    points: Vec<Point>,
+) -> Annotation {
+    let bounds = if state.active_tool == ToolKind::StepNumber {
+        let size = RenderStyle::for_state(state).step_badge_size;
+        Rect::new(start.x - size / 2.0, start.y - size / 2.0, size, size)
+    } else if state.active_tool == ToolKind::Tag {
+        tag_bounds_from_drag(state, start, end)
+    } else {
+        Rect::from_points(start, end)
+    };
+    let stroke = state.current_stroke;
+    let kind = match state.active_tool {
+        ToolKind::StepNumber => AnnotationKind::StepNumber {
+            number: state.next_step_number,
+        },
+        ToolKind::Rectangle => AnnotationKind::Rectangle,
+        ToolKind::Oval => AnnotationKind::Oval,
+        ToolKind::Line => AnnotationKind::Line { start, end },
+        ToolKind::Arrow => AnnotationKind::Arrow { start, end },
+        ToolKind::Text => AnnotationKind::Text {
+            text: String::new(),
+            font_size: state.font_size,
+            framed: Rect::from_points(start, end).is_visible(),
+            filled: state.text_filled,
+        },
+        ToolKind::Tag => AnnotationKind::Tag {
+            label: String::new(),
+            anchor: start,
+            font_size: state.font_size,
+        },
+        ToolKind::Mosaic => AnnotationKind::Mosaic {
+            mode: if points.len() > 2 {
+                MosaicMode::Brush
+            } else {
+                MosaicMode::Area
+            },
+            brush_size: state.mosaic_brush_size,
+        },
+        ToolKind::Highlighter => AnnotationKind::Highlighter {
+            shape: state.highlighter_shape,
+            opacity: state.highlighter_opacity,
+            start,
+            end,
+        },
+        ToolKind::Pen => {
+            let points = smooth_pen_points(&points);
+            match state.pen_mode {
+                PenMode::Free => AnnotationKind::Pen { points },
+                PenMode::Arrow => AnnotationKind::PenArrow { points },
+            }
+        }
+        ToolKind::Watermark => AnnotationKind::Watermark {
+            text: String::new(),
+            opacity: 0.0,
+        },
+    };
+    Annotation::new(0, kind, bounds, stroke)
+}
+
+fn smooth_pen_points(points: &[Point]) -> Vec<Point> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+    let mut smoothed = points.to_vec();
+    for _ in 0..2 {
+        let mut next = Vec::with_capacity(smoothed.len());
+        next.push(smoothed[0]);
+        for index in 1..smoothed.len() - 1 {
+            let prev = smoothed[index - 1];
+            let current = smoothed[index];
+            let after = smoothed[index + 1];
+            next.push(Point::new(
+                prev.x * 0.22 + current.x * 0.56 + after.x * 0.22,
+                prev.y * 0.22 + current.y * 0.56 + after.y * 0.22,
+            ));
+        }
+        next.push(*smoothed.last().expect("smoothed has endpoints"));
+        smoothed = next;
+    }
+    smoothed
+}
+
+fn next_available_step_number(state: &OverlayState) -> u32 {
+    state
+        .session
+        .document
+        .annotations
+        .iter()
+        .filter_map(Annotation::display_step_number)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn tag_default_size(state: &OverlayState) -> (f32, f32) {
+    (
+        scaled(state, TAG_DEFAULT_WIDTH),
+        scaled(state, TAG_DEFAULT_HEIGHT),
+    )
+}
+
+fn tag_bounds_from_drag(state: &OverlayState, anchor: Point, release: Point) -> Rect {
+    let (width, height) = tag_default_size(state);
+    if distance(anchor, release) <= CLICK_DRAG_THRESHOLD {
+        Rect::new(
+            anchor.x + scaled(state, 28.0),
+            anchor.y - height / 2.0,
+            width,
+            height,
+        )
+    } else {
+        let dx = release.x - anchor.x;
+        let dy = release.y - anchor.y;
+        if dx.abs() > width * 0.22 && dy.abs() > height * 0.35 {
+            let x = if dx >= 0.0 {
+                release.x
+            } else {
+                release.x - width
+            };
+            let y = if dy >= 0.0 {
+                release.y
+            } else {
+                release.y - height
+            };
+            return Rect::new(x, y, width, height);
+        }
+        if dx.abs() >= dy.abs() {
+            let x = if dx >= 0.0 {
+                release.x
+            } else {
+                release.x - width
+            };
+            Rect::new(x, release.y - height / 2.0, width, height)
+        } else {
+            let y = if dy >= 0.0 {
+                release.y
+            } else {
+                release.y - height
+            };
+            Rect::new(release.x - width / 2.0, y, width, height)
+        }
+    }
+}
+
+unsafe fn paint_overlay(state: &mut OverlayState) {
+    let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+    let hdc = windows::Win32::Graphics::Gdi::BeginPaint(state.hwnd, &mut ps);
+
+    ensure_render_cache(state, hdc);
+    let width = state.screen_bounds.width.round() as i32;
+    let height = state.screen_bounds.height.round() as i32;
+
+    if state.region_overlay().is_some() {
+        if state.static_layer_dirty {
+            if let Some(cache) = state.render_cache.as_ref() {
+                paint_static_capture_surface(
+                    cache.static_dc,
+                    state,
+                    !state.defer_watermark_static_redraw_once,
+                );
+            }
+            state.static_layer_dirty = false;
+            if state.defer_watermark_static_redraw_once {
+                state.defer_watermark_static_redraw_once = false;
+                state.static_layer_dirty = true;
+                let _ = InvalidateRect(state.hwnd, None, false);
+            }
+        }
+        if let Some(cache) = state.render_cache.as_ref() {
+            let back_dc = cache.back_dc;
+            let _ = BitBlt(back_dc, 0, 0, width, height, cache.static_dc, 0, 0, SRCCOPY);
+            if let Some(region) = state.region_overlay() {
+                draw_region_gradient_border(back_dc, state, region);
+            }
+            if web_ui_owns_pointer_input(state) && state.active_tool == ToolKind::Mosaic {
+                draw_drag_preview(back_dc, state);
+            }
+            let native_ui_fallback = !web_ui_owns_pointer_input(state) || !state.web_toolbar_ready;
+            if native_ui_fallback {
+                draw_selected_annotation(back_dc, state);
+                draw_drag_preview(back_dc, state);
+                if let Some(region) = state.region_overlay() {
+                    draw_toolbar(back_dc, state, region);
+                    draw_tool_submenu(back_dc, state);
+                }
+            }
+        }
+    } else if let Some(cache) = state.render_cache.as_ref() {
+        paint_overlay_surface(cache.back_dc, state);
+    }
+
+    if let Some(cache) = state.render_cache.as_ref() {
+        let _ = BitBlt(hdc, 0, 0, width, height, cache.back_dc, 0, 0, SRCCOPY);
+    }
+
+    let _ = windows::Win32::Graphics::Gdi::EndPaint(state.hwnd, &ps);
+}
+
+unsafe fn ensure_render_cache(state: &mut OverlayState, hdc: HDC) {
+    let width = state.screen_bounds.width.round() as i32;
+    let height = state.screen_bounds.height.round() as i32;
+    let needs_rebuild = state
+        .render_cache
+        .as_ref()
+        .is_none_or(|cache| cache.width != width || cache.height != height);
+    if !needs_rebuild {
+        return;
+    }
+
+    destroy_render_cache(state);
+
+    let back_dc = CreateCompatibleDC(hdc);
+    let back_bitmap = CreateCompatibleBitmap(hdc, width, height);
+    let back_old = SelectObject(back_dc, back_bitmap);
+
+    let static_dc = CreateCompatibleDC(hdc);
+    let static_bitmap = CreateCompatibleBitmap(hdc, width, height);
+    let static_old = SelectObject(static_dc, static_bitmap);
+
+    state.render_cache = Some(RenderCache {
+        width,
+        height,
+        back_dc,
+        back_bitmap,
+        back_old,
+        static_dc,
+        static_bitmap,
+        static_old,
+    });
+    state.static_layer_dirty = true;
+}
+
+unsafe fn destroy_render_cache(state: &mut OverlayState) {
+    let Some(cache) = state.render_cache.take() else {
+        return;
+    };
+    let _ = SelectObject(cache.back_dc, cache.back_old);
+    let _ = DeleteObject(cache.back_bitmap);
+    let _ = DeleteDC(cache.back_dc);
+    let _ = SelectObject(cache.static_dc, cache.static_old);
+    let _ = DeleteObject(cache.static_bitmap);
+    let _ = DeleteDC(cache.static_dc);
+}
+
+unsafe fn paint_static_capture_surface(hdc: HDC, state: &OverlayState, include_watermark: bool) {
+    paint_background(hdc, state);
+    let Some(region) = state.region_overlay() else {
+        return;
+    };
+    draw_dim_outside_region(hdc, state.screen_bounds, region);
+    draw_region_control_backdrop(hdc, state, region);
+    draw_handles(hdc, region);
+    if web_ui_owns_pointer_input(state) {
+        draw_native_backed_annotations(hdc, state);
+        if include_watermark {
+            draw_watermark_pattern(hdc, state, region);
+            draw_watermark_annotations(hdc, state);
+        }
+    } else {
+        draw_annotations(hdc, state);
+        if include_watermark {
+            draw_watermark_pattern(hdc, state, region);
+            draw_watermark_annotations(hdc, state);
+        }
+    }
+}
+
+unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
+    state.region_control_buttons.clear();
+    state.region_control_bounds = None;
+    paint_background(hdc, state);
+
+    if let Some(region) = state.region_overlay() {
+        draw_dim_outside_region(hdc, state.screen_bounds, region);
+        draw_region_control_backdrop(hdc, state, region);
+        draw_region_gradient_border(hdc, state, region);
+        draw_handles(hdc, region);
+        if !region_control_chrome_hidden(state) {
+            draw_region_controls(hdc, state, region);
+        }
+        if web_ui_owns_pointer_input(state) {
+            draw_native_backed_annotations(hdc, state);
+        } else {
+            draw_annotations(hdc, state);
+            draw_selected_annotation(hdc, state);
+            draw_drag_preview(hdc, state);
+            draw_toolbar(hdc, state, region);
+            draw_tool_submenu(hdc, state);
+        }
+    } else if let Some(DragState::Selecting { start, current }) = state.drag {
+        let region = Rect::from_points(start, current);
+        draw_region_gradient_border(hdc, state, region);
+        if !web_ui_owns_pointer_input(state) {
+            draw_crosshair_guides(hdc, state, current);
+            draw_sniper_cursor(hdc, current);
+            draw_pixel_magnifier(hdc, state, current);
+        }
+    } else if let Some(region) = state.smart_region.as_ref().map(|candidate| {
+        candidate
+            .rect
+            .translate(-state.screen_bounds.x, -state.screen_bounds.y)
+    }) {
+        draw_dim_outside_region(hdc, state.screen_bounds, region);
+        draw_region_control_backdrop(hdc, state, region);
+        draw_region_gradient_border(hdc, state, region);
+        if !region_control_chrome_hidden(state) {
+            draw_region_controls(hdc, state, region);
+        }
+        if !web_ui_owns_pointer_input(state) {
+            draw_crosshair_guides(hdc, state, state.cursor_position);
+            draw_sniper_cursor(hdc, state.cursor_position);
+            draw_pixel_magnifier(hdc, state, state.cursor_position);
+        }
+    } else if !web_ui_owns_pointer_input(state) {
+        draw_crosshair_guides(hdc, state, state.cursor_position);
+        draw_sniper_cursor(hdc, state.cursor_position);
+        draw_pixel_magnifier(hdc, state, state.cursor_position);
+    }
+}
+
+unsafe fn draw_crosshair_guides(hdc: HDC, state: &OverlayState, point: Point) {
+    let width = state.screen_bounds.width.max(0.0);
+    let height = state.screen_bounds.height.max(0.0);
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    let x = point.x.clamp(0.0, width);
+    let y = point.y.clamp(0.0, height);
+    let gap = 26.0;
+    let dpi = GetDpiForWindow(state.hwnd).max(96) as f32;
+    let guide_length = 75.6 * dpi / 96.0;
+    let left = (x - guide_length).max(0.0);
+    let right = (x + guide_length).min(width);
+    let top = (y - guide_length).max(0.0);
+    let bottom = (y + guide_length).min(height);
+    let color = Color::rgb(0xff, 0x3b, 0x30);
+    let source_dc = CreateCompatibleDC(hdc);
+    let source_bitmap = CreateCompatibleBitmap(hdc, 1, 1);
+    let old_bitmap = SelectObject(source_dc, source_bitmap);
+    let brush = CreateSolidBrush(crate::util::colorref(color));
+    FillRect(
+        source_dc,
+        &rect_to_rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
+        brush,
+    );
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 102,
+        AlphaFormat: 0,
+    };
+
+    for rect in [
+        Rect::new(left, y, (x - gap - left).max(0.0), 1.0),
+        Rect::new((x + gap).min(right), y, (right - x - gap).max(0.0), 1.0),
+        Rect::new(x, top, 1.0, (y - gap - top).max(0.0)),
+        Rect::new(x, (y + gap).min(bottom), 1.0, (bottom - y - gap).max(0.0)),
+    ] {
+        let destination_width = rect.width.round() as i32;
+        let destination_height = rect.height.round() as i32;
+        if destination_width <= 0 || destination_height <= 0 {
+            continue;
+        }
+        let _ = AlphaBlend(
+            hdc,
+            rect.x.round() as i32,
+            rect.y.round() as i32,
+            destination_width,
+            destination_height,
+            source_dc,
+            0,
+            0,
+            1,
+            1,
+            blend,
+        );
+    }
+
+    let _ = DeleteObject(brush);
+    let _ = SelectObject(source_dc, old_bitmap);
+    let _ = DeleteObject(source_bitmap);
+    let _ = DeleteDC(source_dc);
+}
+
+unsafe fn draw_sniper_cursor(hdc: HDC, point: Point) {
+    let color = Color::rgb(255, 255, 255);
+    let _pen = SelectedPen::new(hdc, 2.0, color);
+    let radius = 10.0;
+    let gap = 5.0;
+    let arm = 20.0;
+    let rect = rect_to_rect(Rect::new(
+        point.x - radius,
+        point.y - radius,
+        radius * 2.0,
+        radius * 2.0,
+    ));
+    let _brush = SelectedStockObject::null_brush(hdc);
+    let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+    for (start, end) in [
+        (
+            Point::new(point.x - arm, point.y),
+            Point::new(point.x - gap, point.y),
+        ),
+        (
+            Point::new(point.x + gap, point.y),
+            Point::new(point.x + arm, point.y),
+        ),
+        (
+            Point::new(point.x, point.y - arm),
+            Point::new(point.x, point.y - gap),
+        ),
+        (
+            Point::new(point.x, point.y + gap),
+            Point::new(point.x, point.y + arm),
+        ),
+    ] {
+        let _ = MoveToEx(hdc, start.x.round() as i32, start.y.round() as i32, None);
+        let _ = LineTo(hdc, end.x.round() as i32, end.y.round() as i32);
+    }
+}
+
+unsafe fn draw_pixel_magnifier(hdc: HDC, state: &OverlayState, point: Point) {
+    let size = scaled(state, MAGNIFIER_SIZE);
+    let sample = scaled(state, MAGNIFIER_SAMPLE_SIZE).round().max(8.0);
+    let margin = scaled(state, 18.0);
+    let offset = scaled(state, 28.0);
+    let mut x = point.x + offset;
+    let mut y = point.y + offset;
+    if x + size + margin > state.screen_bounds.width {
+        x = point.x - offset - size;
+    }
+    if y + size + margin > state.screen_bounds.height {
+        y = point.y - offset - size;
+    }
+    x = x
+        .max(margin)
+        .min((state.screen_bounds.width - size - margin).max(margin));
+    y = y
+        .max(margin)
+        .min((state.screen_bounds.height - size - margin).max(margin));
+    let dest = Rect::new(x, y, size, size);
+
+    let source_dc = CreateCompatibleDC(hdc);
+    let old = SelectObject(source_dc, state.background_bitmap);
+    let source_x = (point.x - sample / 2.0)
+        .max(0.0)
+        .min((state.screen_bounds.width - sample).max(0.0))
+        .round() as i32;
+    let source_y = (point.y - sample / 2.0)
+        .max(0.0)
+        .min((state.screen_bounds.height - sample).max(0.0))
+        .round() as i32;
+    let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+    let _ = StretchBlt(
+        hdc,
+        dest.x.round() as i32,
+        dest.y.round() as i32,
+        dest.width.round() as i32,
+        dest.height.round() as i32,
+        source_dc,
+        source_x,
+        source_y,
+        sample.round() as i32,
+        sample.round() as i32,
+        SRCCOPY,
+    );
+    let _ = SelectObject(source_dc, old);
+    let _ = DeleteDC(source_dc);
+
+    alpha_fill_rect(hdc, dest, Color::BLACK, 34);
+    let _pen = SelectedPen::new(hdc, 2.0, Color::rgb(0xff, 0x3b, 0x30));
+    let _brush = SelectedStockObject::null_brush(hdc);
+    let r = rect_to_rect(dest);
+    let _ = Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+    let center = dest.center();
+    let _ = MoveToEx(hdc, dest.x.round() as i32, center.y.round() as i32, None);
+    let _ = LineTo(hdc, dest.right().round() as i32, center.y.round() as i32);
+    let _ = MoveToEx(hdc, center.x.round() as i32, dest.y.round() as i32, None);
+    let _ = LineTo(hdc, center.x.round() as i32, dest.bottom().round() as i32);
+}
+
+unsafe fn draw_dim_outside_region(hdc: HDC, screen_bounds: Rect, region: Rect) {
+    let full = Rect::new(0.0, 0.0, screen_bounds.width, screen_bounds.height);
+    for rect in [
+        Rect::new(full.x, full.y, full.width, region.y.max(0.0)),
+        Rect::new(
+            full.x,
+            region.bottom(),
+            full.width,
+            (full.bottom() - region.bottom()).max(0.0),
+        ),
+        Rect::new(full.x, region.y, region.x.max(0.0), region.height),
+        Rect::new(
+            region.right(),
+            region.y,
+            (full.right() - region.right()).max(0.0),
+            region.height,
+        ),
+    ] {
+        if rect.is_visible() {
+            alpha_fill_rect(hdc, rect, Color::BLACK, 153);
+        }
+    }
+}
+
+unsafe fn draw_region_control_backdrop(hdc: HDC, state: &OverlayState, region: Rect) {
+    if region_control_chrome_hidden(state) {
+        return;
+    }
+    let height = scaled(state, 55.0).min(region.height.max(0.0));
+    if height <= 0.0 {
+        return;
+    }
+    alpha_gradient_rect(
+        hdc,
+        Rect::new(region.x, region.y, region.width, height),
+        0.85,
+        1.65,
+    );
+}
+
+unsafe fn draw_region_gradient_border(hdc: HDC, state: &OverlayState, region: Rect) {
+    if !region.is_visible() {
+        return;
+    }
+    let left = region.x.max(0.0);
+    let top = region.y.max(0.0);
+    let right = region.right().min(state.screen_bounds.width);
+    let bottom = region.bottom().min(state.screen_bounds.height);
+    let visible = Rect::new(left, top, (right - left).max(0.0), (bottom - top).max(0.0));
+    if !visible.is_visible() {
+        return;
+    }
+    let inset = 3.0;
+    let rect = Rect::new(
+        visible.x + inset,
+        visible.y + inset,
+        (visible.width - inset * 2.0).max(1.0),
+        (visible.height - inset * 2.0).max(1.0),
+    );
+    let radius = 7.0_f32.min(rect.width / 2.0).min(rect.height / 2.0);
+    let points = rounded_region_border_points(rect, radius);
+    if points.len() < 2 {
+        return;
+    }
+    let phase = animated_region_phase();
+    let count = points.len() - 1;
+    for index in 0..count {
+        let color = animated_region_border_color(index as f32 / count as f32 + phase);
+        let _pen = SelectedPen::new(hdc, 2.0, color);
+        let start = points[index];
+        let end = points[index + 1];
+        let _ = MoveToEx(hdc, start.x.round() as i32, start.y.round() as i32, None);
+        let _ = LineTo(hdc, end.x.round() as i32, end.y.round() as i32);
+    }
+}
+
+fn rounded_region_border_points(rect: Rect, radius: f32) -> Vec<Point> {
+    let mut points = Vec::with_capacity(129);
+    let straight_steps = 24;
+    let arc_steps = 8;
+    push_line_points(
+        &mut points,
+        Point::new(rect.x + radius, rect.y),
+        Point::new(rect.right() - radius, rect.y),
+        straight_steps,
+    );
+    push_arc_points(
+        &mut points,
+        Point::new(rect.right() - radius, rect.y + radius),
+        radius,
+        -std::f32::consts::FRAC_PI_2,
+        0.0,
+        arc_steps,
+    );
+    push_line_points(
+        &mut points,
+        Point::new(rect.right(), rect.y + radius),
+        Point::new(rect.right(), rect.bottom() - radius),
+        straight_steps,
+    );
+    push_arc_points(
+        &mut points,
+        Point::new(rect.right() - radius, rect.bottom() - radius),
+        radius,
+        0.0,
+        std::f32::consts::FRAC_PI_2,
+        arc_steps,
+    );
+    push_line_points(
+        &mut points,
+        Point::new(rect.right() - radius, rect.bottom()),
+        Point::new(rect.x + radius, rect.bottom()),
+        straight_steps,
+    );
+    push_arc_points(
+        &mut points,
+        Point::new(rect.x + radius, rect.bottom() - radius),
+        radius,
+        std::f32::consts::FRAC_PI_2,
+        std::f32::consts::PI,
+        arc_steps,
+    );
+    push_line_points(
+        &mut points,
+        Point::new(rect.x, rect.bottom() - radius),
+        Point::new(rect.x, rect.y + radius),
+        straight_steps,
+    );
+    push_arc_points(
+        &mut points,
+        Point::new(rect.x + radius, rect.y + radius),
+        radius,
+        std::f32::consts::PI,
+        std::f32::consts::PI * 1.5,
+        arc_steps,
+    );
+    if let Some(first) = points.first().copied() {
+        points.push(first);
+    }
+    points
+}
+
+fn push_line_points(points: &mut Vec<Point>, start: Point, end: Point, steps: usize) {
+    for step in 0..steps {
+        let t = step as f32 / steps as f32;
+        points.push(Point::new(
+            start.x + (end.x - start.x) * t,
+            start.y + (end.y - start.y) * t,
+        ));
+    }
+}
+
+fn push_arc_points(
+    points: &mut Vec<Point>,
+    center: Point,
+    radius: f32,
+    start_angle: f32,
+    end_angle: f32,
+    steps: usize,
+) {
+    for step in 0..steps {
+        let t = step as f32 / steps as f32;
+        let angle = start_angle + (end_angle - start_angle) * t;
+        points.push(Point::new(
+            center.x + angle.cos() * radius,
+            center.y + angle.sin() * radius,
+        ));
+    }
+}
+
+fn animated_region_phase() -> f32 {
+    const REGION_BORDER_CYCLE_MS: u128 = 6087;
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| {
+            (duration.as_millis() % REGION_BORDER_CYCLE_MS) as f32 / REGION_BORDER_CYCLE_MS as f32
+        })
+        .unwrap_or(0.0)
+}
+
+fn animated_region_border_color(t: f32) -> Color {
+    let colors = region_preview_colors();
+    let wrapped = t.rem_euclid(1.0) * colors.len() as f32;
+    let index = wrapped.floor() as usize % colors.len();
+    let next = (index + 1) % colors.len();
+    let local = wrapped - wrapped.floor();
+    lerp_color(colors[index], colors[next], local)
+}
+
+fn region_preview_colors() -> [Color; 6] {
+    [
+        Color::rgb(0xff, 0x7f, 0x83),
+        Color::rgb(0xff, 0x63, 0x00),
+        Color::rgb(0xff, 0x3b, 0x30),
+        Color::rgb(0xff, 0xaa, 0xac),
+        Color::rgb(0xff, 0x63, 0x00),
+        Color::rgb(0xff, 0x7f, 0x83),
+    ]
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let mix = |from: u8, to: u8| -> u8 {
+        (from as f32 + (to as f32 - from as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::rgb(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
+}
+
+unsafe fn alpha_fill_rect(hdc: HDC, rect: Rect, color: Color, alpha: u8) {
+    let width = rect.width.round() as i32;
+    let height = rect.height.round() as i32;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let mem_dc = CreateCompatibleDC(hdc);
+    let bitmap = CreateCompatibleBitmap(hdc, width, height);
+    let old = SelectObject(mem_dc, bitmap);
+    let brush = CreateSolidBrush(crate::util::colorref(color));
+    let local_rect = Rect::new(0.0, 0.0, rect.width, rect.height);
+    FillRect(mem_dc, &rect_to_rect(local_rect), brush);
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: alpha,
+        AlphaFormat: 0,
+    };
+    let _ = AlphaBlend(
+        hdc,
+        rect.x.round() as i32,
+        rect.y.round() as i32,
+        width,
+        height,
+        mem_dc,
+        0,
+        0,
+        width,
+        height,
+        blend,
+    );
+    let _ = DeleteObject(brush);
+    let _ = SelectObject(mem_dc, old);
+    let _ = DeleteObject(bitmap);
+    let _ = DeleteDC(mem_dc);
+}
+
+unsafe fn alpha_gradient_rect(hdc: HDC, rect: Rect, max_opacity: f32, exponent: f32) {
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for y in 0..height {
+        let t = (y as f32 + 0.5) / height as f32;
+        let alpha = (max_opacity.clamp(0.0, 1.0) * 255.0 * (1.0 - t).powf(exponent))
+            .round()
+            .clamp(0.0, 255.0) as u8;
+        let row = (y * width * 4) as usize;
+        for x in 0..width {
+            let offset = row + (x * 4) as usize;
+            bgra[offset] = 0;
+            bgra[offset + 1] = 0;
+            bgra[offset + 2] = 0;
+            bgra[offset + 3] = alpha;
+        }
+    }
+
+    let _ = alpha_blend_bgra(
+        hdc,
+        Rect::new(rect.x.round(), rect.y.round(), width as f32, height as f32),
+        width,
+        height,
+        &bgra,
+    );
+}
+
+unsafe fn capture_screen_bitmap(screen_bounds: Rect) -> HBITMAP {
+    let screen_dc = GetDC(None);
+    let mem_dc = CreateCompatibleDC(screen_dc);
+    let bitmap = CreateCompatibleBitmap(
+        screen_dc,
+        screen_bounds.width.round() as i32,
+        screen_bounds.height.round() as i32,
+    );
+    let _ = SelectObject(mem_dc, bitmap);
+    let _ = BitBlt(
+        mem_dc,
+        0,
+        0,
+        screen_bounds.width.round() as i32,
+        screen_bounds.height.round() as i32,
+        screen_dc,
+        screen_bounds.x.round() as i32,
+        screen_bounds.y.round() as i32,
+        SRCCOPY,
+    );
+    let _ = DeleteDC(mem_dc);
+    ReleaseDC(None, screen_dc);
+    bitmap
+}
+
+unsafe fn paint_background(hdc: HDC, state: &OverlayState) {
+    let mem_dc = CreateCompatibleDC(hdc);
+    let _ = SelectObject(mem_dc, state.background_bitmap);
+    let _ = BitBlt(
+        hdc,
+        0,
+        0,
+        state.screen_bounds.width.round() as i32,
+        state.screen_bounds.height.round() as i32,
+        mem_dc,
+        0,
+        0,
+        SRCCOPY,
+    );
+    let _ = DeleteDC(mem_dc);
+}
+
+unsafe fn draw_handles(hdc: HDC, region: Rect) {
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x00303bff));
+    let radius = HANDLE_RADIUS * 0.5;
+    let points = [
+        Point::new(region.x, region.y),
+        Point::new(region.center().x, region.y),
+        Point::new(region.right(), region.y),
+        Point::new(region.right(), region.center().y),
+        Point::new(region.right(), region.bottom()),
+        Point::new(region.center().x, region.bottom()),
+        Point::new(region.x, region.bottom()),
+        Point::new(region.x, region.center().y),
+    ];
+    for point in points {
+        let handle = Rect::new(
+            point.x - radius,
+            point.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        );
+        alpha_fill_rect(
+            hdc,
+            expand_rect(handle, 2.0),
+            Color::rgb(0xff, 0x3b, 0x30),
+            42,
+        );
+        FillRect(hdc, &rect_to_rect(handle), brush);
+    }
+    let _ = DeleteObject(brush);
+}
+
+unsafe fn draw_region_controls(hdc: HDC, state: &mut OverlayState, region: Rect) {
+    let lock_icon = scaled(state, REGION_CONTROL_ICON_SIZE * 1.1);
+    let ratio_icon = scaled(state, REGION_CONTROL_ICON_SIZE * 1.2);
+    let icon = lock_icon.max(ratio_icon);
+    let gap = scaled(state, REGION_CONTROL_GAP);
+    let margin = scaled(state, REGION_CONTROL_MARGIN);
+    let divider_height = scaled(state, REGION_CONTROL_DIVIDER_HEIGHT);
+    let top = (region.y + margin).clamp(
+        margin,
+        (state.screen_bounds.height - icon - margin).max(margin),
+    );
+    let controls_width = lock_icon + ratio_icon + gap * 2.0;
+    let left = (region.center().x - controls_width / 2.0)
+        .max(margin)
+        .min((state.screen_bounds.width - controls_width - margin).max(margin));
+    let lock_rect = Rect::new(left, top + (icon - lock_icon) / 2.0, lock_icon, lock_icon);
+    let divider = Rect::new(
+        lock_rect.right() + gap * 0.85,
+        top + (icon - divider_height) / 2.0,
+        scaled(state, 2.0),
+        divider_height,
+    );
+    let ratio_rect = Rect::new(divider.right() + gap * 0.85, top, ratio_icon, ratio_icon);
+    state.region_control_bounds = Some(Rect::new(
+        left - scaled(state, 8.0),
+        top - scaled(state, 6.0),
+        controls_width + scaled(state, 16.0),
+        icon + scaled(state, 12.0),
+    ));
+
+    let lock_active =
+        monitor_for_region(region.translate(state.screen_bounds.x, state.screen_bounds.y))
+            .map(|(monitor_id, _)| state.settings.is_region_locked(&monitor_id))
+            .unwrap_or(false);
+    let lock_svg = if lock_active {
+        include_str!("../assets/region-controls/locked.svg")
+    } else {
+        include_str!("../assets/region-controls/unlocked.svg")
+    };
+    let ratio_svg = ratio_svg(state.settings.aspect_ratio);
+
+    draw_region_control_icon(hdc, state, lock_rect, lock_svg, RegionControlKind::Lock);
+    alpha_fill_rect(hdc, divider, Color::WHITE, 166);
+    draw_region_control_icon(hdc, state, ratio_rect, ratio_svg, RegionControlKind::Ratio);
+
+    state.region_control_buttons.push(RegionControlButton {
+        rect: lock_rect,
+        kind: RegionControlKind::Lock,
+    });
+    state.region_control_buttons.push(RegionControlButton {
+        rect: ratio_rect,
+        kind: RegionControlKind::Ratio,
+    });
+}
+
+unsafe fn draw_region_control_icon(
+    hdc: HDC,
+    state: &OverlayState,
+    rect: Rect,
+    svg: &str,
+    kind: RegionControlKind,
+) {
+    let hovered = state.hovered_region_control == Some(kind);
+    let color = if hovered {
+        Color::rgb(0xff, 0x3b, 0x30)
+    } else {
+        Color::WHITE
+    };
+    let mut svg = recolor_svg(svg, color);
+    if !hovered {
+        svg = svg.replacen("<svg ", "<svg opacity=\"0.9\" ", 1);
+    }
+    let _ = draw_svg(hdc, &svg, rect);
+}
+
+fn ratio_svg(mode: AspectRatioMode) -> &'static str {
+    match mode {
+        AspectRatioMode::Custom => include_str!("../assets/region-controls/ratio-custom.svg"),
+        AspectRatioMode::Ratio9x16 => include_str!("../assets/region-controls/ratio-9x16.svg"),
+        AspectRatioMode::Ratio16x9 => include_str!("../assets/region-controls/ratio-16x9.svg"),
+        AspectRatioMode::Ratio1x1 => include_str!("../assets/region-controls/ratio-1x1.svg"),
+        AspectRatioMode::Ratio4x5 => include_str!("../assets/region-controls/ratio-4x5.svg"),
+    }
+}
+
+fn toolbar_width(state: &OverlayState) -> f32 {
+    scaled(state, 36.0 + 24.0 + 10.0 * 36.0 + 12.0 + 4.0 * 36.0 + 12.0)
+}
+
+fn toolbar_action_width(state: &OverlayState, action: ToolbarAction) -> f32 {
+    match action {
+        ToolbarAction::Grip => scaled(state, 36.0),
+        ToolbarAction::Numbering => scaled(state, 24.0),
+        ToolbarAction::Divider => scaled(state, 12.0),
+        _ => scaled(state, TOOLBAR_BUTTON),
+    }
+}
+
+fn annotation_colors() -> [Color; 5] {
+    [
+        Color::rgb(0xff, 0x3b, 0x30),
+        Color::rgb(0x0a, 0x84, 0xff),
+        Color::rgb(0xff, 0xd6, 0x0a),
+        Color::rgb(0x00, 0xc8, 0x53),
+        Color::rgb(0xbf, 0x5a, 0xf2),
+    ]
+}
+
+fn centered_icon_rect(state: &OverlayState, rect: Rect) -> Rect {
+    let size = scaled(state, TOOL_ICON_SIZE);
+    Rect::new(
+        rect.x + (rect.width - size) / 2.0,
+        rect.y + (rect.height - size) / 2.0,
+        size,
+        size,
+    )
+}
+
+fn numbering_icon_rect(state: &OverlayState, rect: Rect) -> Rect {
+    let size = scaled(state, 22.0);
+    Rect::new(
+        rect.x + (rect.width - size) / 2.0,
+        rect.y + (rect.height - size) / 2.0,
+        size,
+        size,
+    )
+}
+
+fn numbering_toggle_rect(state: &OverlayState, rect: Rect) -> Rect {
+    let width = scaled(state, 11.0);
+    let height = scaled(state, 1.05);
+    Rect::new(
+        rect.x + (rect.width - width) / 2.0,
+        rect.bottom() - scaled(state, 7.0),
+        width,
+        height,
+    )
+}
+
+fn rounded_rect_coverage(x: f32, y: f32, width: f32, height: f32, radius: f32) -> f32 {
+    if width <= 0.0 || height <= 0.0 {
+        return 0.0;
+    }
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
+    if radius <= 0.0 {
+        return 1.0;
+    }
+    let cx = x.clamp(radius, width - radius);
+    let cy = y.clamp(radius, height - radius);
+    let dx = x - cx;
+    let dy = y - cy;
+    if dx * dx + dy * dy <= radius * radius {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+unsafe fn alpha_blend_bgra(
+    hdc: HDC,
+    rect: Rect,
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+) -> std::result::Result<(), ()> {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: (width * height * 4) as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let bitmap =
+        CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0).map_err(|_| ())?;
+    if bits.is_null() {
+        let _ = DeleteObject(bitmap);
+        return Err(());
+    }
+    std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), bgra.len());
+
+    let mem_dc = CreateCompatibleDC(hdc);
+    let old = SelectObject(mem_dc, bitmap);
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    let _ = AlphaBlend(
+        hdc,
+        rect.x.round() as i32,
+        rect.y.round() as i32,
+        width as i32,
+        height as i32,
+        mem_dc,
+        0,
+        0,
+        width as i32,
+        height as i32,
+        blend,
+    );
+    let _ = SelectObject(mem_dc, old);
+    let _ = DeleteObject(bitmap);
+    let _ = DeleteDC(mem_dc);
+    Ok(())
+}
+
+unsafe fn fill_rounded_rect_antialias(hdc: HDC, rect: Rect, radius: f32, color: Color) {
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    let samples = 2;
+    let sample_count = (samples * samples) as f32;
+
+    for y in 0..height {
+        for x in 0..width {
+            let mut covered = 0.0;
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let px = x as f32 + (sx as f32 + 0.5) / samples as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / samples as f32;
+                    covered += rounded_rect_coverage(px, py, width as f32, height as f32, radius);
+                }
+            }
+            let alpha = ((color.a as f32 * covered / sample_count).round() as u8).min(color.a);
+            let offset = ((y * width + x) * 4) as usize;
+            bgra[offset] = ((color.b as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 1] = ((color.g as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 3] = alpha;
+        }
+    }
+
+    let _ = alpha_blend_bgra(hdc, rect, width, height, &bgra);
+}
+
+unsafe fn stroke_rounded_rect_antialias(
+    hdc: HDC,
+    rect: Rect,
+    radius: f32,
+    stroke_width: f32,
+    color: Color,
+) {
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    let samples = 2;
+    let sample_count = (samples * samples) as f32;
+    let inner_width = (width as f32 - stroke_width * 2.0).max(0.0);
+    let inner_height = (height as f32 - stroke_width * 2.0).max(0.0);
+    let inner_radius = (radius - stroke_width).max(0.0);
+
+    for y in 0..height {
+        for x in 0..width {
+            let mut covered = 0.0;
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let px = x as f32 + (sx as f32 + 0.5) / samples as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / samples as f32;
+                    let outer = rounded_rect_coverage(px, py, width as f32, height as f32, radius);
+                    let inner = rounded_rect_coverage(
+                        px - stroke_width,
+                        py - stroke_width,
+                        inner_width,
+                        inner_height,
+                        inner_radius,
+                    );
+                    covered += (outer - inner).clamp(0.0, 1.0);
+                }
+            }
+            let alpha = ((color.a as f32 * covered / sample_count).round() as u8).min(color.a);
+            let offset = ((y * width + x) * 4) as usize;
+            bgra[offset] = ((color.b as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 1] = ((color.g as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 3] = alpha;
+        }
+    }
+
+    let _ = alpha_blend_bgra(hdc, rect, width, height, &bgra);
+}
+
+unsafe fn draw_toolbar_shadow(hdc: HDC, state: &OverlayState, rect: Rect) {
+    for (inflate, y_offset, alpha) in [(2.0_f32, 3.0_f32, 18_u8), (4.0_f32, 6.0_f32, 8_u8)] {
+        let shadow = Rect::new(
+            rect.x - scaled(state, inflate),
+            rect.y + scaled(state, y_offset),
+            rect.width + scaled(state, inflate * 2.0),
+            rect.height + scaled(state, inflate * 2.0),
+        );
+        fill_rounded_rect_antialias(
+            hdc,
+            shadow,
+            scaled(state, TOOLBAR_RADIUS + inflate),
+            Color::rgba(0, 0, 0, alpha),
+        );
+    }
+}
+
+unsafe fn draw_toolbar_border(hdc: HDC, state: &OverlayState, rect: Rect, palette: ToolbarPalette) {
+    let radius = scaled(state, TOOLBAR_RADIUS);
+    let _top = SelectedPen::new(hdc, 1.0, palette.border_top);
+    let _ = MoveToEx(
+        hdc,
+        (rect.x + radius).round() as i32,
+        rect.y.round() as i32,
+        None,
+    );
+    let _ = LineTo(
+        hdc,
+        (rect.right() - radius).round() as i32,
+        rect.y.round() as i32,
+    );
+    drop(_top);
+
+    let _bottom = SelectedPen::new(hdc, 1.0, palette.border_bottom);
+    let _ = MoveToEx(
+        hdc,
+        (rect.x + radius).round() as i32,
+        rect.bottom().round() as i32 - 1,
+        None,
+    );
+    let _ = LineTo(
+        hdc,
+        (rect.right() - radius).round() as i32,
+        rect.bottom().round() as i32 - 1,
+    );
+}
+
+unsafe fn draw_toolbar(hdc: HDC, state: &mut OverlayState, region: Rect) {
+    state.toolbar_buttons.clear();
+    let actions = [
+        ToolbarAction::Grip,
+        ToolbarAction::Numbering,
+        ToolbarAction::Tool(ToolKind::Rectangle),
+        ToolbarAction::Tool(ToolKind::Oval),
+        ToolbarAction::Tool(ToolKind::Line),
+        ToolbarAction::Tool(ToolKind::Arrow),
+        ToolbarAction::Tool(ToolKind::Pen),
+        ToolbarAction::Tool(ToolKind::Highlighter),
+        ToolbarAction::Tool(ToolKind::Text),
+        ToolbarAction::Tool(ToolKind::Tag),
+        ToolbarAction::Tool(ToolKind::Watermark),
+        ToolbarAction::Tool(ToolKind::Mosaic),
+        ToolbarAction::Divider,
+        ToolbarAction::Undo,
+        ToolbarAction::Copy,
+        ToolbarAction::Save,
+        ToolbarAction::Cancel,
+    ];
+    let toolbar_height = scaled(state, TOOLBAR_HEIGHT);
+    let width = toolbar_width(state);
+    let total_height = toolbar_height;
+    let origin = state
+        .toolbar_origin
+        .unwrap_or_else(|| default_toolbar_origin(state, region));
+    let x = origin
+        .x
+        .max(8.0)
+        .min((state.screen_bounds.width - width - 8.0).max(8.0));
+    let y = origin
+        .y
+        .max(8.0)
+        .min((state.screen_bounds.height - total_height - 8.0).max(8.0));
+    state.toolbar_origin = Some(Point::new(x, y));
+
+    let palette = crate::theme::toolbar_palette(state.theme);
+    let bar = Rect::new(x, y, width, total_height);
+    draw_toolbar_shadow(hdc, state, bar);
+    fill_rounded_rect_antialias(hdc, bar, scaled(state, TOOLBAR_RADIUS), palette.background);
+    draw_toolbar_border(hdc, state, bar, palette);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, crate::util::colorref(palette.icon));
+
+    let mut x_cursor = x;
+    for action in actions {
+        let button_width = toolbar_action_width(state, action);
+        let rect = Rect::new(x_cursor, y, button_width, toolbar_height);
+        draw_toolbar_button(hdc, rect, action, state, palette);
+        if !matches!(action, ToolbarAction::Divider) {
+            state
+                .toolbar_buttons
+                .push(ToolbarButton { rect, tool: action });
+        }
+        x_cursor += button_width;
+    }
+}
+
+fn default_toolbar_origin(state: &OverlayState, region: Rect) -> Point {
+    let width = toolbar_width(state);
+    let height = scaled(state, TOOLBAR_HEIGHT);
+    let margin = scaled(state, 18.0);
+    let submenu_clearance = scaled(state, SUBMENU_HEIGHT + 34.0);
+    let x = (region.center().x - width / 2.0)
+        .max(margin)
+        .min((state.screen_bounds.width - width - margin).max(margin));
+    let lowest_with_options_visible =
+        (state.screen_bounds.height - height - submenu_clearance - margin).max(margin);
+    let preferred_y = if region.height > height + margin * 2.0 {
+        region.bottom() - height - margin
+    } else if region.bottom() + height + margin <= state.screen_bounds.height {
+        region.bottom() + margin
+    } else {
+        (region.y - height - margin).max(margin)
+    };
+    let y = preferred_y.min(lowest_with_options_visible).max(margin);
+    Point::new(x, y)
+}
+
+fn toolbar_origin_near_point(state: &OverlayState, _click: Point, screen_region: Rect) -> Point {
+    let region = screen_region.translate(-state.screen_bounds.x, -state.screen_bounds.y);
+    default_toolbar_origin(state, region)
+}
+
+fn color_distance(a: Color, b: Color) -> u16 {
+    (a.r as i16 - b.r as i16).unsigned_abs()
+        + (a.g as i16 - b.g as i16).unsigned_abs()
+        + (a.b as i16 - b.b as i16).unsigned_abs()
+}
+
+fn contrast_text_color(background: Color) -> Color {
+    if color_distance(background, Color::rgb(0xff, 0xd6, 0x0a)) < 24 {
+        Color::BLACK
+    } else {
+        Color::WHITE
+    }
+}
+
+unsafe fn draw_toolbar_button(
+    hdc: HDC,
+    rect: Rect,
+    action: ToolbarAction,
+    state: &OverlayState,
+    palette: ToolbarPalette,
+) {
+    if matches!(action, ToolbarAction::Divider) {
+        let x = rect.x + rect.width / 2.0;
+        let _pen = SelectedPen::new(hdc, 1.0, palette.divider);
+        let _ = MoveToEx(
+            hdc,
+            x.round() as i32,
+            (rect.y + scaled(state, 7.0)).round() as i32,
+            None,
+        );
+        let _ = LineTo(
+            hdc,
+            x.round() as i32,
+            (rect.bottom() - scaled(state, 7.0)).round() as i32,
+        );
+        return;
+    }
+
+    let selected = matches!(action, ToolbarAction::Tool(tool) if tool == state.active_tool)
+        || matches!(action, ToolbarAction::Numbering if state.numbering_enabled);
+    let icon_bg = if selected {
+        palette.selected_icon_background
+    } else {
+        palette.icon_background
+    };
+    let icon_rect = match action {
+        ToolbarAction::Grip => rect,
+        ToolbarAction::Numbering => numbering_icon_rect(state, rect),
+        _ => centered_icon_rect(state, rect),
+    };
+    if !matches!(action, ToolbarAction::Grip | ToolbarAction::Numbering) {
+        fill_rounded_rect_antialias(
+            hdc,
+            icon_rect,
+            scaled(state, TOOL_ICON_SELECTED_RADIUS),
+            icon_bg,
+        );
+    }
+    draw_toolbar_icon(hdc, state, action, icon_rect, palette);
+    if matches!(action, ToolbarAction::Numbering) {
+        draw_numbering_toggle(hdc, state, numbering_toggle_rect(state, rect), palette);
+    }
+}
+
+unsafe fn draw_numbering_toggle(
+    hdc: HDC,
+    state: &OverlayState,
+    rect: Rect,
+    palette: ToolbarPalette,
+) {
+    let progress = state.numbering_toggle_progress.clamp(0.0, 1.0);
+    let off = match state.theme {
+        AppTheme::Light => Color::rgb(0xc9, 0xc9, 0xc9),
+        AppTheme::Dark => Color::rgb(0x58, 0x58, 0x58),
+    };
+    let green_left = Color::rgb(0x48, 0x62, 0x4e);
+    let green_right = Color::rgb(0x67, 0xc4, 0x5d);
+    let track_color = blend_color(off, green_left, progress);
+    fill_rounded_rect_antialias(hdc, rect, rect.height / 2.0, track_color);
+
+    let active_width = rect.width * progress;
+    if active_width > 1.0 {
+        fill_rounded_rect_antialias(
+            hdc,
+            Rect::new(rect.x, rect.y, active_width, rect.height),
+            rect.height / 2.0,
+            blend_color(green_left, green_right, progress),
+        );
+    }
+
+    let thumb_size = scaled(state, 6.2);
+    let thumb_x = rect.x - thumb_size * 0.25 + (rect.width - thumb_size * 0.5) * progress;
+    let thumb = Rect::new(
+        thumb_x,
+        rect.y + rect.height / 2.0 - thumb_size / 2.0,
+        thumb_size,
+        thumb_size,
+    );
+    fill_oval_antialias(hdc, thumb, blend_color(palette.icon, green_right, progress));
+}
+
+fn blend_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color::rgba(
+        (a.r as f32 + (b.r as f32 - a.r as f32) * t).round() as u8,
+        (a.g as f32 + (b.g as f32 - a.g as f32) * t).round() as u8,
+        (a.b as f32 + (b.b as f32 - a.b as f32) * t).round() as u8,
+        (a.a as f32 + (b.a as f32 - a.a as f32) * t).round() as u8,
+    )
+}
+
+unsafe fn draw_tool_submenu(hdc: HDC, state: &mut OverlayState) {
+    state.submenu_buttons.clear();
+    state.submenu_sliders.clear();
+    let Some(tool) = state.active_submenu else {
+        state.submenu_rect = None;
+        return;
+    };
+    let Some((_, anchor, rect)) = submenu_geometry(state) else {
+        state.submenu_rect = None;
+        return;
+    };
+
+    let palette = crate::theme::toolbar_palette(state.theme);
+    let height = scaled(state, SUBMENU_HEIGHT);
+    state.submenu_rect = Some(rect);
+
+    draw_toolbar_shadow(hdc, state, rect);
+    fill_rounded_rect_antialias(hdc, rect, scaled(state, SUBMENU_RADIUS), palette.background);
+    draw_submenu_notch(hdc, state, rect, anchor.center().x, palette.background);
+    draw_toolbar_border(hdc, state, rect, palette);
+
+    let mut x_cursor = rect.x + scaled(state, SUBMENU_EDGE_PAD);
+    match tool {
+        ToolKind::Rectangle | ToolKind::Oval | ToolKind::Line | ToolKind::Arrow => {
+            draw_submenu_slider(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.width,
+                MIN_STROKE_WIDTH,
+                MAX_STROKE_WIDTH,
+                SubmenuSliderKind::StrokeWidth,
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_color_swatches(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.color,
+            );
+        }
+        ToolKind::Pen => {
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "line",
+                state.pen_mode == PenMode::Free,
+                SubmenuAction::PenMode(PenMode::Free),
+            );
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "arrow",
+                state.pen_mode == PenMode::Arrow,
+                SubmenuAction::PenMode(PenMode::Arrow),
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_submenu_slider(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.width,
+                MIN_STROKE_WIDTH,
+                MAX_STROKE_WIDTH,
+                SubmenuSliderKind::StrokeWidth,
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_color_swatches(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.color,
+            );
+        }
+        ToolKind::Highlighter => {
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "line",
+                state.highlighter_shape == HighlightShape::Rectangle,
+                SubmenuAction::HighlighterShape(HighlightShape::Rectangle),
+            );
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "area",
+                state.highlighter_shape == HighlightShape::RoundedRectangle,
+                SubmenuAction::HighlighterShape(HighlightShape::RoundedRectangle),
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_submenu_slider(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.width,
+                MIN_STROKE_WIDTH,
+                MAX_STROKE_WIDTH,
+                SubmenuSliderKind::StrokeWidth,
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_color_swatches(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.color,
+            );
+        }
+        ToolKind::Text => {
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "line-text",
+                !state.text_filled,
+                SubmenuAction::TextFilled(false),
+            );
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "solid-text",
+                state.text_filled,
+                SubmenuAction::TextFilled(true),
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_font_slider(hdc, state, &mut x_cursor, palette);
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_color_swatches(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.color,
+            );
+        }
+        ToolKind::Tag => {
+            draw_submenu_slider(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.width.max(MIN_TAG_STROKE_WIDTH),
+                MIN_TAG_STROKE_WIDTH,
+                MAX_STROKE_WIDTH,
+                SubmenuSliderKind::StrokeWidth,
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_font_slider(hdc, state, &mut x_cursor, palette);
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_color_swatches(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                state.current_stroke.color,
+            );
+        }
+        ToolKind::Watermark => {
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "calendar",
+                state.watermark_date_enabled,
+                SubmenuAction::WatermarkMode(WatermarkMode::Date),
+            );
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "image",
+                state.watermark_image_path.is_some(),
+                SubmenuAction::WatermarkMode(WatermarkMode::Image),
+            );
+            draw_submenu_icon_button(
+                hdc,
+                state,
+                &mut x_cursor,
+                palette,
+                "cancel",
+                false,
+                SubmenuAction::ClearWatermark,
+            );
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_font_slider(hdc, state, &mut x_cursor, palette);
+            let input = Rect::new(
+                x_cursor,
+                rect.y + scaled(state, 3.0),
+                scaled(state, 112.0),
+                height - scaled(state, 6.0),
+            );
+            fill_rounded_rect_antialias(
+                hdc,
+                input,
+                scaled(state, 2.0),
+                palette.selected_icon_background,
+            );
+            draw_label_sized_color(
+                hdc,
+                input.x + scaled(state, 5.0),
+                input.y + scaled(state, 2.0),
+                if state.watermark_text.is_empty() {
+                    "Type text..."
+                } else {
+                    &state.watermark_text
+                },
+                scaled(state, 8.0),
+                palette.icon,
+            );
+            if state.editing_watermark_text && watermark_caret_visible() {
+                let text_width = if state.watermark_text.is_empty() {
+                    0.0
+                } else {
+                    approximate_text_width(&state.watermark_text, scaled(state, 8.0))
+                };
+                let caret_x = (input.x + scaled(state, 5.0) + text_width)
+                    .min(input.right() - scaled(state, 5.0));
+                fill_rounded_rect_antialias(
+                    hdc,
+                    Rect::new(
+                        caret_x,
+                        input.y + scaled(state, 4.0),
+                        scaled(state, 1.0),
+                        input.height - scaled(state, 8.0),
+                    ),
+                    scaled(state, 0.5),
+                    palette.icon,
+                );
+            }
+            state.submenu_buttons.push(SubmenuButton {
+                rect: input,
+                action: SubmenuAction::WatermarkTextInput,
+            });
+            x_cursor += input.width + scaled(state, SUBMENU_GAP);
+            draw_submenu_divider(hdc, state, &mut x_cursor, palette);
+            draw_color_swatches(hdc, state, &mut x_cursor, palette, state.watermark_color);
+        }
+        _ => {}
+    }
+}
+
+fn submenu_width(state: &OverlayState, tool: ToolKind) -> f32 {
+    scaled(state, submenu_content_width(tool))
+}
+
+fn submenu_content_width(tool: ToolKind) -> f32 {
+    let edge = SUBMENU_EDGE_PAD * 2.0;
+    let icon_button = 22.0 + SUBMENU_GAP;
+    let divider = SUBMENU_DIVIDER + SUBMENU_GAP;
+    let font_slider = 16.0 + (116.0 + SUBMENU_GAP) + 12.0;
+    let stroke_slider = 116.0 + SUBMENU_GAP;
+    let text_input = 112.0 + SUBMENU_GAP;
+    let swatches = annotation_colors().len() as f32 * (SUBMENU_SWATCH + SUBMENU_GAP + 2.0);
+    match tool {
+        ToolKind::Rectangle | ToolKind::Oval | ToolKind::Line | ToolKind::Arrow => {
+            edge + stroke_slider + divider + swatches
+        }
+        ToolKind::Pen | ToolKind::Highlighter => {
+            edge + icon_button * 2.0 + divider * 2.0 + stroke_slider + swatches
+        }
+        ToolKind::Text => edge + icon_button * 2.0 + divider * 2.0 + font_slider + swatches,
+        ToolKind::Tag => edge + stroke_slider + divider * 2.0 + font_slider + swatches,
+        ToolKind::Watermark => {
+            edge + icon_button * 3.0 + divider * 2.0 + font_slider + text_input + swatches
+        }
+        ToolKind::StepNumber => edge + icon_button * 2.0,
+        _ => 0.0,
+    }
+}
+
+unsafe fn draw_submenu_notch(
+    hdc: HDC,
+    state: &OverlayState,
+    rect: Rect,
+    anchor_x: f32,
+    color: Color,
+) {
+    let half = scaled(state, SUBMENU_NOTCH);
+    let top = rect.y - scaled(state, 8.0);
+    let center = anchor_x.clamp(rect.x + half, rect.right() - half);
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.move_to(center - half, rect.y + 1.0);
+    builder.line_to(center, top);
+    builder.line_to(center + half, rect.y + 1.0);
+    builder.close();
+    if let Some(path) = builder.finish() {
+        draw_filled_tiny_path(
+            hdc,
+            Rect::new(rect.x, top, rect.width, rect.height + (rect.y - top)),
+            path,
+            color,
+        );
+    }
+}
+
+unsafe fn draw_filled_tiny_path(
+    hdc: HDC,
+    surface: Rect,
+    path: resvg::tiny_skia::Path,
+    color: Color,
+) {
+    let width = surface.width.round().max(1.0) as u32;
+    let height = surface.height.round().max(1.0) as u32;
+    let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(width, height) else {
+        return;
+    };
+    let mut paint = resvg::tiny_skia::Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+    paint.anti_alias = true;
+    pixmap.fill_path(
+        &path,
+        &paint,
+        resvg::tiny_skia::FillRule::Winding,
+        resvg::tiny_skia::Transform::from_translate(-surface.x, -surface.y),
+        None,
+    );
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for (source, dest) in pixmap.data().chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+        dest[0] = source[2];
+        dest[1] = source[1];
+        dest[2] = source[0];
+        dest[3] = source[3];
+    }
+    let _ = alpha_blend_bgra(hdc, surface, width, height, &bgra);
+}
+
+unsafe fn draw_submenu_divider(
+    hdc: HDC,
+    state: &OverlayState,
+    x_cursor: &mut f32,
+    palette: ToolbarPalette,
+) {
+    let x = *x_cursor + scaled(state, SUBMENU_DIVIDER / 2.0);
+    let _pen = SelectedPen::new(hdc, 1.0, palette.divider);
+    let y = state
+        .submenu_buttons
+        .first()
+        .map(|button| button.rect.y)
+        .unwrap_or(0.0);
+    let _ = MoveToEx(
+        hdc,
+        x.round() as i32,
+        (y + scaled(state, 3.0)).round() as i32,
+        None,
+    );
+    let _ = LineTo(
+        hdc,
+        x.round() as i32,
+        (y + scaled(state, 21.0)).round() as i32,
+    );
+    *x_cursor += scaled(state, SUBMENU_DIVIDER + SUBMENU_GAP);
+}
+
+unsafe fn draw_submenu_slider(
+    hdc: HDC,
+    state: &mut OverlayState,
+    x_cursor: &mut f32,
+    palette: ToolbarPalette,
+    value: f32,
+    min: f32,
+    max: f32,
+    kind: SubmenuSliderKind,
+) {
+    let y = state.toolbar_origin.map(|p| p.y).unwrap_or(0.0) + scaled(state, TOOLBAR_HEIGHT + 18.0);
+    let rect = Rect::new(
+        *x_cursor,
+        y,
+        scaled(state, 116.0),
+        scaled(state, SUBMENU_HEIGHT),
+    );
+    let line_y = rect.center().y;
+    let left_dot = rect.x + scaled(state, 8.0);
+    let start = rect.x + scaled(state, 22.0);
+    let end = rect.right() - scaled(state, 22.0);
+    let right_dot = rect.right() - scaled(state, 8.0);
+    let track_height = scaled(state, 2.5);
+    fill_rounded_rect_antialias(
+        hdc,
+        Rect::new(
+            start,
+            line_y - track_height / 2.0,
+            (end - start).max(1.0),
+            track_height,
+        ),
+        track_height / 2.0,
+        palette.icon,
+    );
+    let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+    let knob_x = start + (end - start) * t;
+    let knob_outer = scaled(state, 15.0);
+    let knob_inner = scaled(state, 11.0);
+    fill_oval_antialias(
+        hdc,
+        Rect::new(
+            knob_x - knob_outer / 2.0,
+            line_y - knob_outer / 2.0,
+            knob_outer,
+            knob_outer,
+        ),
+        Color::rgb(0xc8, 0xc8, 0xc8),
+    );
+    fill_oval_antialias(
+        hdc,
+        Rect::new(
+            knob_x - knob_inner / 2.0,
+            line_y - knob_inner / 2.0,
+            knob_inner,
+            knob_inner,
+        ),
+        palette.selected_icon_background,
+    );
+    fill_rounded_rect_antialias(
+        hdc,
+        Rect::new(
+            left_dot - scaled(state, 2.0),
+            line_y - scaled(state, 2.0),
+            scaled(state, 4.0),
+            scaled(state, 4.0),
+        ),
+        scaled(state, 2.0),
+        palette.icon,
+    );
+    fill_rounded_rect_antialias(
+        hdc,
+        Rect::new(
+            right_dot - scaled(state, 4.8),
+            line_y - scaled(state, 4.8),
+            scaled(state, 9.6),
+            scaled(state, 9.6),
+        ),
+        scaled(state, 4.8),
+        palette.icon,
+    );
+    state.submenu_sliders.push(SubmenuSlider {
+        rect,
+        start_x: start,
+        end_x: end,
+        min,
+        max,
+        kind,
+    });
+    *x_cursor += rect.width + scaled(state, SUBMENU_GAP);
+}
+
+unsafe fn draw_font_slider(
+    hdc: HDC,
+    state: &mut OverlayState,
+    x_cursor: &mut f32,
+    palette: ToolbarPalette,
+) {
+    let (value, min, max) = if state.active_submenu == Some(ToolKind::Watermark) {
+        (
+            state.watermark_font_size,
+            MIN_WATERMARK_FONT_SIZE,
+            MAX_FONT_SIZE,
+        )
+    } else {
+        (state.font_size, MIN_FONT_SIZE, MAX_FONT_SIZE)
+    };
+    let y = state.toolbar_origin.map(|p| p.y).unwrap_or(0.0) + scaled(state, TOOLBAR_HEIGHT + 18.0);
+    draw_submenu_static_svg(
+        hdc,
+        Rect::new(
+            *x_cursor,
+            y + scaled(state, 4.0),
+            scaled(state, 16.0),
+            scaled(state, 16.0),
+        ),
+        include_str!("../assets/toolbar/smaller-font.svg"),
+        palette.icon,
+    );
+    *x_cursor += scaled(state, 16.0);
+    draw_submenu_slider(
+        hdc,
+        state,
+        x_cursor,
+        palette,
+        value,
+        min,
+        max,
+        SubmenuSliderKind::FontSize,
+    );
+    draw_submenu_static_svg(
+        hdc,
+        Rect::new(
+            *x_cursor - scaled(state, 2.0),
+            y + scaled(state, 2.0),
+            scaled(state, 18.0),
+            scaled(state, 18.0),
+        ),
+        include_str!("../assets/toolbar/larger-font.svg"),
+        palette.icon,
+    );
+    *x_cursor += scaled(state, 12.0);
+}
+
+unsafe fn draw_color_swatches(
+    hdc: HDC,
+    state: &mut OverlayState,
+    x_cursor: &mut f32,
+    palette: ToolbarPalette,
+    selected: Color,
+) {
+    let y = state.toolbar_origin.map(|p| p.y).unwrap_or(0.0) + scaled(state, TOOLBAR_HEIGHT + 18.0);
+    for color in annotation_colors() {
+        let rect = Rect::new(
+            *x_cursor,
+            y + scaled(state, 4.0),
+            scaled(state, SUBMENU_SWATCH),
+            scaled(state, SUBMENU_SWATCH),
+        );
+        let button_rect = Rect::new(
+            rect.x - scaled(state, 4.0),
+            rect.y - scaled(state, 4.0),
+            rect.width + scaled(state, 8.0),
+            rect.height + scaled(state, 8.0),
+        );
+        let radius = scaled(state, 2.0);
+        if color == selected {
+            fill_rounded_rect_antialias(
+                hdc,
+                button_rect,
+                scaled(state, 4.0),
+                palette.selected_icon_background,
+            );
+        }
+        if color == selected {
+            let border_color = match state.theme {
+                AppTheme::Light => Color::rgb(0x4d, 0x4d, 0x4d),
+                AppTheme::Dark => Color::rgb(0xf2, 0xf2, 0xf2),
+            };
+            fill_rounded_rect_antialias(hdc, rect, radius, color);
+            stroke_rounded_rect_antialias(hdc, rect, radius, 3.0, border_color);
+        } else {
+            fill_rounded_rect_antialias(hdc, rect, radius, color);
+        }
+        state.submenu_buttons.push(SubmenuButton {
+            rect,
+            action: SubmenuAction::Color(color),
+        });
+        *x_cursor += rect.width + scaled(state, SUBMENU_GAP + 2.0);
+    }
+}
+
+unsafe fn draw_submenu_icon_button(
+    hdc: HDC,
+    state: &mut OverlayState,
+    x_cursor: &mut f32,
+    palette: ToolbarPalette,
+    icon: &str,
+    selected: bool,
+    action: SubmenuAction,
+) {
+    let y = state.toolbar_origin.map(|p| p.y).unwrap_or(0.0) + scaled(state, TOOLBAR_HEIGHT + 18.0);
+    let rect = Rect::new(
+        *x_cursor,
+        y,
+        scaled(state, 22.0),
+        scaled(state, SUBMENU_HEIGHT),
+    );
+    if selected {
+        fill_rounded_rect_antialias(
+            hdc,
+            rect,
+            scaled(state, 4.0),
+            palette.selected_icon_background,
+        );
+    }
+    let icon_rect = Rect::new(
+        rect.x + scaled(state, 3.0),
+        rect.y + scaled(state, 4.0),
+        scaled(state, 16.0),
+        scaled(state, 16.0),
+    );
+    match icon {
+        "line" => {
+            let svg = recolor_svg(
+                include_str!("../assets/toolbar/mini-line.svg"),
+                palette.icon,
+            );
+            let _ = draw_svg(hdc, &svg, icon_rect);
+        }
+        "arrow" => {
+            let svg = recolor_svg(
+                include_str!("../assets/toolbar/mini-arrow.svg"),
+                palette.icon,
+            );
+            let _ = draw_svg(hdc, &svg, icon_rect);
+        }
+        "highlight-line" => {
+            let line = Rect::new(
+                icon_rect.x,
+                icon_rect.center().y - scaled(state, 2.5),
+                icon_rect.width,
+                scaled(state, 5.0),
+            );
+            fill_rounded_rect_antialias(hdc, line, scaled(state, 2.5), palette.icon);
+        }
+        "area" => {
+            let outer = Rect::new(
+                icon_rect.x + scaled(state, 1.0),
+                icon_rect.y + scaled(state, 2.0),
+                icon_rect.width - scaled(state, 2.0),
+                icon_rect.height - scaled(state, 4.0),
+            );
+            let inner = Rect::new(
+                outer.x + scaled(state, 2.0),
+                outer.y + scaled(state, 2.0),
+                outer.width - scaled(state, 4.0),
+                outer.height - scaled(state, 4.0),
+            );
+            fill_rounded_rect_antialias(hdc, outer, scaled(state, 2.0), palette.icon);
+            fill_rounded_rect_antialias(
+                hdc,
+                inner,
+                scaled(state, 1.0),
+                if selected {
+                    palette.selected_icon_background
+                } else {
+                    palette.background
+                },
+            );
+        }
+        "line-text" => draw_submenu_static_svg(
+            hdc,
+            icon_rect,
+            include_str!("../assets/toolbar/line-text.svg"),
+            palette.icon,
+        ),
+        "solid-text" => draw_submenu_static_svg(
+            hdc,
+            icon_rect,
+            include_str!("../assets/toolbar/solid-text.svg"),
+            palette.icon,
+        ),
+        "calendar" => draw_submenu_static_svg(
+            hdc,
+            icon_rect,
+            include_str!("../assets/toolbar/calendar.svg"),
+            palette.icon,
+        ),
+        "image" => draw_submenu_static_svg(
+            hdc,
+            icon_rect,
+            include_str!("../assets/toolbar/image.svg"),
+            palette.icon,
+        ),
+        "cancel" => draw_submenu_static_svg(
+            hdc,
+            icon_rect,
+            include_str!("../assets/toolbar/cancel.svg"),
+            palette.icon,
+        ),
+        _ => {}
+    }
+    state.submenu_buttons.push(SubmenuButton { rect, action });
+    *x_cursor += rect.width + scaled(state, SUBMENU_GAP);
+}
+
+unsafe fn draw_submenu_static_svg(hdc: HDC, rect: Rect, svg: &str, color: Color) {
+    let svg = recolor_svg(svg, color);
+    let _ = draw_svg(hdc, &svg, rect);
+}
+
+fn toolbar_label(action: ToolbarAction) -> &'static str {
+    match action {
+        ToolbarAction::Grip => "::",
+        ToolbarAction::Numbering => "1",
+        ToolbarAction::Divider => "|",
+        ToolbarAction::Tool(ToolKind::StepNumber) => "1",
+        ToolbarAction::Tool(ToolKind::Rectangle) => "[]",
+        ToolbarAction::Tool(ToolKind::Oval) => "O",
+        ToolbarAction::Tool(ToolKind::Line) => "/",
+        ToolbarAction::Tool(ToolKind::Arrow) => "->",
+        ToolbarAction::Tool(ToolKind::Pen) => "P",
+        ToolbarAction::Tool(ToolKind::Text) => "T",
+        ToolbarAction::Tool(ToolKind::Tag) => "#",
+        ToolbarAction::Tool(ToolKind::Mosaic) => "M",
+        ToolbarAction::Tool(ToolKind::Highlighter) => "H",
+        ToolbarAction::Tool(ToolKind::Watermark) => "W",
+        ToolbarAction::Undo => "U",
+        ToolbarAction::Copy => "C",
+        ToolbarAction::Save => "Sv",
+        ToolbarAction::Cancel => "X",
+    }
+}
+
+fn toolbar_svg(action: ToolbarAction, theme: AppTheme) -> Option<&'static str> {
+    match action {
+        ToolbarAction::Grip => Some(match theme {
+            AppTheme::Light => include_str!("../assets/toolbar/drag-bkcg-light.svg"),
+            AppTheme::Dark => include_str!("../assets/toolbar/drag-bkcg-dark.svg"),
+        }),
+        ToolbarAction::Numbering | ToolbarAction::Tool(ToolKind::StepNumber) => {
+            Some(include_str!("../assets/toolbar/numbering.svg"))
+        }
+        ToolbarAction::Tool(ToolKind::Rectangle) => {
+            Some(include_str!("../assets/toolbar/rectangle.svg"))
+        }
+        ToolbarAction::Tool(ToolKind::Oval) => Some(include_str!("../assets/toolbar/ellipse.svg")),
+        ToolbarAction::Tool(ToolKind::Pen) => Some(include_str!("../assets/toolbar/pen.svg")),
+        ToolbarAction::Tool(ToolKind::Line) => Some(include_str!("../assets/toolbar/line.svg")),
+        ToolbarAction::Tool(ToolKind::Arrow) => Some(include_str!("../assets/toolbar/arrow.svg")),
+        ToolbarAction::Tool(ToolKind::Highlighter) => {
+            Some(include_str!("../assets/toolbar/highlighter.svg"))
+        }
+        ToolbarAction::Tool(ToolKind::Text) => Some(include_str!("../assets/toolbar/text.svg")),
+        ToolbarAction::Tool(ToolKind::Watermark) => {
+            Some(include_str!("../assets/toolbar/watermark.svg"))
+        }
+        ToolbarAction::Tool(ToolKind::Tag) => Some(include_str!("../assets/toolbar/tag.svg")),
+        ToolbarAction::Tool(ToolKind::Mosaic) => {
+            Some(include_str!("../assets/toolbar/pixelate.svg"))
+        }
+        ToolbarAction::Undo => Some(include_str!("../assets/toolbar/undo.svg")),
+        ToolbarAction::Copy => Some(include_str!("../assets/toolbar/copy.svg")),
+        ToolbarAction::Save => Some(include_str!("../assets/toolbar/save.svg")),
+        ToolbarAction::Cancel => Some(include_str!("../assets/toolbar/cancel.svg")),
+        ToolbarAction::Divider => None,
+    }
+}
+
+unsafe fn draw_toolbar_icon(
+    hdc: HDC,
+    state: &OverlayState,
+    action: ToolbarAction,
+    rect: Rect,
+    palette: ToolbarPalette,
+) {
+    let Some(svg) = toolbar_svg(action, state.theme) else {
+        return;
+    };
+    let svg = recolor_svg(svg, palette.icon);
+    if draw_svg(hdc, &svg, rect).is_err() {
+        draw_label(
+            hdc,
+            rect.x + scaled(state, 7.0),
+            rect.y + scaled(state, 6.0),
+            toolbar_label(action),
+        );
+    }
+}
+
+fn recolor_svg(svg: &str, color: Color) -> String {
+    let hex = format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b);
+    svg.replace("#4d4d4d", &hex)
+        .replace("#4D4D4D", &hex)
+        .replace("#b3b3b3", &hex)
+        .replace("#B3B3B3", &hex)
+}
+
+unsafe fn draw_svg(hdc: HDC, svg: &str, rect: Rect) -> std::result::Result<(), ()> {
+    let opt = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|_| ())?;
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or(())?;
+    let tree_size = tree.size();
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        width as f32 / tree_size.width(),
+        height as f32 / tree_size.height(),
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for (source, dest) in pixmap.data().chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+        dest[0] = source[2];
+        dest[1] = source[1];
+        dest[2] = source[0];
+        dest[3] = source[3];
+    }
+
+    alpha_blend_bgra(hdc, rect, width, height, &bgra)
+}
+
+fn effective_stroke_color(stroke: StrokeStyle) -> Color {
+    Color::rgba(
+        stroke.color.r,
+        stroke.color.g,
+        stroke.color.b,
+        ((stroke.color.a as f32 * stroke.opacity).clamp(0.0, 255.0)).round() as u8,
+    )
+}
+
+fn highlighter_color(color: Color, opacity: f32) -> Color {
+    Color::rgba(
+        color.r,
+        color.g,
+        color.b,
+        (opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+    )
+}
+
+unsafe fn draw_highlighter(
+    hdc: HDC,
+    rect: Rect,
+    shape: HighlightShape,
+    color: Color,
+    stroke_width: f32,
+    start: Point,
+    end: Point,
+) {
+    match shape {
+        HighlightShape::Rectangle => {
+            draw_tiny_line_with_cap(
+                hdc,
+                start,
+                end,
+                StrokeStyle {
+                    width: highlighter_line_width(stroke_width),
+                    color,
+                    opacity: 1.0,
+                },
+                resvg::tiny_skia::LineCap::Round,
+            );
+        }
+        HighlightShape::RoundedRectangle => {
+            fill_rounded_rect_antialias(hdc, rect, HIGHLIGHTER_RADIUS, color)
+        }
+        HighlightShape::Oval => fill_oval_antialias(hdc, rect, color),
+    }
+}
+
+fn highlighter_line_width(stroke_width: f32) -> f32 {
+    12.0 + stroke_width.max(1.0) * 1.5
+}
+
+unsafe fn fill_oval_antialias(hdc: HDC, rect: Rect, color: Color) {
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    let rx = width as f32 / 2.0;
+    let ry = height as f32 / 2.0;
+    let samples = 2;
+    let sample_count = (samples * samples) as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let mut covered = 0.0;
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let px = (x as f32 + (sx as f32 + 0.5) / samples as f32 - rx) / rx.max(1.0);
+                    let py = (y as f32 + (sy as f32 + 0.5) / samples as f32 - ry) / ry.max(1.0);
+                    if px * px + py * py <= 1.0 {
+                        covered += 1.0;
+                    }
+                }
+            }
+            let alpha = ((color.a as f32 * covered / sample_count).round() as u8).min(color.a);
+            let offset = ((y * width + x) * 4) as usize;
+            bgra[offset] = ((color.b as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 1] = ((color.g as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 3] = alpha;
+        }
+    }
+    let _ = alpha_blend_bgra(hdc, rect, width, height, &bgra);
+}
+
+unsafe fn draw_blur_region(hdc: HDC, rect: Rect, radius: f32) {
+    if !rect.is_visible() {
+        return;
+    }
+    let surface_width = rect.width.ceil().max(1.0) as u32;
+    let surface_height = rect.height.ceil().max(1.0) as u32;
+    let mut bgra = vec![0u8; (surface_width * surface_height * 4) as usize];
+    let cell = (14.0_f32.max(rect.width.min(rect.height) / 21.0).min(24.0) * 0.6).max(6.0);
+    let cols = (rect.width / cell).ceil().max(1.0) as i32;
+    let rows = (rect.height / cell).ceil().max(1.0) as i32;
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = rect.x + col as f32 * cell;
+            let y = rect.y + row as f32 * cell;
+            let local = Rect::new(
+                (x - rect.x).max(0.0),
+                (y - rect.y).max(0.0),
+                (rect.right() - x).min(cell).max(0.0),
+                (rect.bottom() - y).min(cell).max(0.0),
+            );
+            if !local.is_visible() {
+                continue;
+            }
+            let sample_x = (x + local.width / 2.0).round() as i32;
+            let sample_y = (y + local.height / 2.0).round() as i32;
+            let pixel = GetPixel(hdc, sample_x, sample_y).0;
+            let sampled = Color::rgb(
+                (pixel & 0xff) as u8,
+                ((pixel >> 8) & 0xff) as u8,
+                ((pixel >> 16) & 0xff) as u8,
+            );
+            let color = mosaic_sample_color(sampled, row, col);
+            fill_mosaic_tile_bgra(
+                &mut bgra,
+                surface_width,
+                surface_height,
+                local,
+                rect.width,
+                rect.height,
+                radius,
+                color,
+            );
+        }
+    }
+    let _ = alpha_blend_bgra(hdc, rect, surface_width, surface_height, &bgra);
+}
+
+fn fill_mosaic_tile_bgra(
+    bgra: &mut [u8],
+    surface_width: u32,
+    surface_height: u32,
+    tile: Rect,
+    region_width: f32,
+    region_height: f32,
+    radius: f32,
+    color: Color,
+) {
+    let left = tile.x.floor().max(0.0) as u32;
+    let top = tile.y.floor().max(0.0) as u32;
+    let right = (tile.right().ceil().max(0.0) as u32).min(surface_width);
+    let bottom = (tile.bottom().ceil().max(0.0) as u32).min(surface_height);
+    let full_b = color.b;
+    let full_g = color.g;
+    let full_r = color.r;
+    for y in top..bottom {
+        let fy = y as f32 + 0.5;
+        for x in left..right {
+            let fx = x as f32 + 0.5;
+            let in_rounded_corner = radius > 0.0
+                && ((fx < radius && fy < radius)
+                    || (fx > region_width - radius && fy < radius)
+                    || (fx < radius && fy > region_height - radius)
+                    || (fx > region_width - radius && fy > region_height - radius));
+            let alpha = if in_rounded_corner {
+                let coverage = rounded_rect_coverage(fx, fy, region_width, region_height, radius);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                (255.0 * coverage).round().clamp(0.0, 255.0) as u8
+            } else {
+                255
+            };
+            let offset = ((y * surface_width + x) * 4) as usize;
+            if alpha == 255 {
+                bgra[offset] = full_b;
+                bgra[offset + 1] = full_g;
+                bgra[offset + 2] = full_r;
+                bgra[offset + 3] = 255;
+            } else {
+                bgra[offset] = ((color.b as u16 * alpha as u16) / 255) as u8;
+                bgra[offset + 1] = ((color.g as u16 * alpha as u16) / 255) as u8;
+                bgra[offset + 2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+                bgra[offset + 3] = alpha;
+            }
+        }
+    }
+}
+
+fn mosaic_sample_color(sampled: Color, row: i32, col: i32) -> Color {
+    let noise = (((row * 37 + col * 19 + row * col * 7) % 17) - 8) as i16;
+    Color::rgb(
+        quantized_mosaic_channel(sampled.r, noise),
+        quantized_mosaic_channel(sampled.g, noise),
+        quantized_mosaic_channel(sampled.b, noise),
+    )
+}
+
+fn quantized_mosaic_channel(value: u8, noise: i16) -> u8 {
+    let adjusted = (value as i16 + noise).clamp(0, 255);
+    ((adjusted + 8) / 16 * 16).clamp(0, 255) as u8
+}
+
+fn path_surface_for_rect(rect: Rect, stroke_width: f32) -> Rect {
+    let pad = stroke_width.max(1.0) / 2.0 + 2.0;
+    Rect::new(
+        rect.x - pad,
+        rect.y - pad,
+        rect.width + pad * 2.0,
+        rect.height + pad * 2.0,
+    )
+}
+
+fn path_surface_for_points(points: &[Point], stroke_width: f32) -> Option<Rect> {
+    let first = *points.first()?;
+    let mut left = first.x;
+    let mut top = first.y;
+    let mut right = first.x;
+    let mut bottom = first.y;
+    for point in points.iter().copied().skip(1) {
+        left = left.min(point.x);
+        top = top.min(point.y);
+        right = right.max(point.x);
+        bottom = bottom.max(point.y);
+    }
+    let pad = stroke_width.max(1.0) / 2.0 + 16.0;
+    Some(Rect::new(
+        left - pad,
+        top - pad,
+        (right - left) + pad * 2.0,
+        (bottom - top) + pad * 2.0,
+    ))
+}
+
+unsafe fn draw_tiny_path(
+    hdc: HDC,
+    surface: Rect,
+    path: resvg::tiny_skia::Path,
+    stroke_style: StrokeStyle,
+) {
+    draw_tiny_path_with_cap(
+        hdc,
+        surface,
+        path,
+        stroke_style,
+        resvg::tiny_skia::LineCap::Round,
+    );
+}
+
+unsafe fn draw_tiny_path_with_cap(
+    hdc: HDC,
+    surface: Rect,
+    path: resvg::tiny_skia::Path,
+    stroke_style: StrokeStyle,
+    line_cap: resvg::tiny_skia::LineCap,
+) {
+    let width = surface.width.round().max(1.0) as u32;
+    let height = surface.height.round().max(1.0) as u32;
+    let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(width, height) else {
+        return;
+    };
+    let color = effective_stroke_color(stroke_style);
+    let mut paint = resvg::tiny_skia::Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, color.a);
+    paint.anti_alias = true;
+
+    let mut stroke = resvg::tiny_skia::Stroke::default();
+    stroke.width = stroke_style.width.max(1.0);
+    stroke.line_cap = line_cap;
+    stroke.line_join = resvg::tiny_skia::LineJoin::Round;
+
+    pixmap.stroke_path(
+        &path,
+        &paint,
+        &stroke,
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
+
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for (source, dest) in pixmap.data().chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+        dest[0] = source[2];
+        dest[1] = source[1];
+        dest[2] = source[0];
+        dest[3] = source[3];
+    }
+    let _ = alpha_blend_bgra(hdc, surface, width, height, &bgra);
+}
+
+unsafe fn draw_stroked_rect(hdc: HDC, rect: Rect, stroke: StrokeStyle) {
+    let surface = path_surface_for_rect(rect, stroke.width);
+    let local = rect.translate(-surface.x, -surface.y);
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.move_to(local.x, local.y);
+    builder.line_to(local.right(), local.y);
+    builder.line_to(local.right(), local.bottom());
+    builder.line_to(local.x, local.bottom());
+    builder.close();
+    if let Some(path) = builder.finish() {
+        draw_tiny_path(hdc, surface, path, stroke);
+    }
+}
+
+unsafe fn draw_stroked_oval(hdc: HDC, rect: Rect, stroke: StrokeStyle) {
+    let surface = path_surface_for_rect(rect, stroke.width);
+    let local = rect.translate(-surface.x, -surface.y);
+    let Some(oval) = resvg::tiny_skia::Rect::from_xywh(
+        local.x,
+        local.y,
+        local.width.max(1.0),
+        local.height.max(1.0),
+    ) else {
+        return;
+    };
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.push_oval(oval);
+    if let Some(path) = builder.finish() {
+        draw_tiny_path(hdc, surface, path, stroke);
+    }
+}
+
+unsafe fn draw_line(hdc: HDC, start: Point, end: Point, arrow: bool, stroke: StrokeStyle) {
+    let shaft_end = if arrow {
+        arrow_shaft_end(start, end, stroke)
+    } else {
+        end
+    };
+    let cap = if arrow {
+        resvg::tiny_skia::LineCap::Butt
+    } else {
+        resvg::tiny_skia::LineCap::Round
+    };
+    draw_tiny_line_with_cap(hdc, start, shaft_end, stroke, cap);
+    if arrow {
+        draw_arrow_tip(hdc, start, end, stroke);
+    }
+}
+
+unsafe fn draw_tiny_line_with_cap(
+    hdc: HDC,
+    start: Point,
+    end: Point,
+    stroke: StrokeStyle,
+    cap: resvg::tiny_skia::LineCap,
+) {
+    let Some(surface) = path_surface_for_points(&[start, end], stroke.width) else {
+        return;
+    };
+    let local_start = start.translate(-surface.x, -surface.y);
+    let local_end = end.translate(-surface.x, -surface.y);
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.move_to(local_start.x, local_start.y);
+    builder.line_to(local_end.x, local_end.y);
+    if let Some(path) = builder.finish() {
+        draw_tiny_path_with_cap(hdc, surface, path, stroke, cap);
+    }
+}
+
+unsafe fn draw_pen_path(hdc: HDC, points: &[Point], stroke: StrokeStyle) {
+    draw_pen_path_with_cap(hdc, points, stroke, resvg::tiny_skia::LineCap::Round);
+}
+
+unsafe fn draw_pen_path_with_cap(
+    hdc: HDC,
+    points: &[Point],
+    stroke: StrokeStyle,
+    cap: resvg::tiny_skia::LineCap,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    let Some(surface) = path_surface_for_points(points, stroke.width) else {
+        return;
+    };
+    let local_points: Vec<Point> = points
+        .iter()
+        .map(|point| point.translate(-surface.x, -surface.y))
+        .collect();
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.move_to(local_points[0].x, local_points[0].y);
+
+    if local_points.len() == 2 {
+        builder.line_to(local_points[1].x, local_points[1].y);
+    } else {
+        for index in 1..local_points.len() - 1 {
+            let current = local_points[index];
+            let next = local_points[index + 1];
+            let midpoint = Point::new((current.x + next.x) / 2.0, (current.y + next.y) / 2.0);
+            builder.quad_to(current.x, current.y, midpoint.x, midpoint.y);
+        }
+        let last = *local_points.last().expect("len checked above");
+        builder.line_to(last.x, last.y);
+    }
+
+    if let Some(path) = builder.finish() {
+        draw_tiny_path_with_cap(hdc, surface, path, stroke, cap);
+    }
+}
+
+unsafe fn draw_arrow_tip_for_points(hdc: HDC, points: &[Point], stroke: StrokeStyle) {
+    let Some(end) = points.last().copied() else {
+        return;
+    };
+    let min_distance = (arrow_tip_size(stroke) * 0.7).max(stroke.width.max(8.0));
+    let Some(start) = points.iter().rev().copied().find(|point| {
+        ((point.x - end.x).powi(2) + (point.y - end.y).powi(2)).sqrt() > min_distance
+    }) else {
+        return;
+    };
+    draw_arrow_tip(hdc, start, end, stroke);
+}
+
+fn pen_arrow_shaft_points(points: &[Point], stroke: StrokeStyle) -> Vec<Point> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    let trim = (arrow_tip_size(stroke) * 0.72).max(stroke.width * 2.0);
+    let mut remaining = trim;
+    let mut keep = points.len() - 1;
+    for index in (1..points.len()).rev() {
+        let a = points[index - 1];
+        let b = points[index];
+        let segment = distance(a, b);
+        if segment >= remaining && segment > 0.1 {
+            let t = 1.0 - remaining / segment;
+            let shaft_end = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
+            let mut shaft = points[..index].to_vec();
+            shaft.push(shaft_end);
+            return shaft;
+        }
+        remaining -= segment;
+        keep = index - 1;
+    }
+    let mut shaft = points[..=keep].to_vec();
+    if shaft.len() < 2 {
+        shaft = points[..2].to_vec();
+    }
+    shaft
+}
+
+unsafe fn draw_arrow_tip(hdc: HDC, start: Point, end: Point, stroke: StrokeStyle) {
+    let angle = (end.y - start.y).atan2(end.x - start.x);
+    let size = arrow_tip_size(stroke);
+    let spread = 0.48_f32;
+    let p1 = Point::new(
+        end.x - size * (angle + spread).cos(),
+        end.y - size * (angle + spread).sin(),
+    );
+    let p2 = Point::new(
+        end.x - size * (angle - spread).cos(),
+        end.y - size * (angle - spread).sin(),
+    );
+    let left = end.x.min(p1.x).min(p2.x) - 2.0;
+    let top = end.y.min(p1.y).min(p2.y) - 2.0;
+    let right = end.x.max(p1.x).max(p2.x) + 2.0;
+    let bottom = end.y.max(p1.y).max(p2.y) + 2.0;
+    let surface = Rect::new(left, top, right - left, bottom - top);
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.move_to(end.x, end.y);
+    builder.line_to(p1.x, p1.y);
+    builder.line_to(p2.x, p2.y);
+    builder.close();
+    if let Some(path) = builder.finish() {
+        draw_filled_tiny_path(hdc, surface, path, effective_stroke_color(stroke));
+    }
+}
+
+fn arrow_shaft_end(start: Point, end: Point, stroke: StrokeStyle) -> Point {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= 0.1 {
+        return end;
+    }
+    let size = arrow_tip_size(stroke);
+    let backoff = (size * 0.55).min(length * 0.5);
+    Point::new(end.x - dx / length * backoff, end.y - dy / length * backoff)
+}
+
+fn arrow_tip_size(stroke: StrokeStyle) -> f32 {
+    (stroke.width * 5.8).clamp(16.0, 64.0)
+}
+
+fn distance(a: Point, b: Point) -> f32 {
+    ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt()
+}
+
+unsafe fn draw_label(hdc: HDC, x: f32, y: f32, label: &str) {
+    draw_label_sized(hdc, x, y, label, 18.0);
+}
+
+unsafe fn draw_label_sized(hdc: HDC, x: f32, y: f32, label: &str, font_size: f32) {
+    draw_label_sized_color(hdc, x, y, label, font_size, Color::BLACK);
+}
+
+unsafe fn draw_label_sized_color(
+    hdc: HDC,
+    x: f32,
+    y: f32,
+    label: &str,
+    font_size: f32,
+    color: Color,
+) {
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, crate::util::colorref(color));
+    let font = CreateFontW(
+        -(font_size.round().max(1.0) as i32),
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        w!("Segoe UI"),
+    );
+    let old_font = SelectObject(hdc, font);
+    let wide: Vec<u16> = label.encode_utf16().collect();
+    let _ = TextOutW(hdc, x.round() as i32, y.round() as i32, &wide);
+    let _ = SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
+unsafe fn watermark_text_block_bitmap(
+    hdc: HDC,
+    text: &str,
+    date: Option<&str>,
+    font_size: f32,
+    max_text_width: f32,
+    color: Color,
+    degrees: f32,
+) -> Option<WatermarkBitmap> {
+    if (text.is_empty() && date.is_none()) || color.a == 0 {
+        return None;
+    }
+    let layout = watermark_text_block_layout(hdc, text, date, font_size, max_text_width);
+    let pad = (font_size * 0.55).ceil().max(8.0);
+    let width = (layout.width + pad * 2.0).ceil().max(1.0) as u32;
+    let height = (layout.height + pad * 2.0).ceil().max(1.0) as u32;
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: width * height * 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let Ok(bitmap) = CreateDIBSection(hdc, &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
+        return None;
+    };
+    if bits.is_null() {
+        let _ = DeleteObject(bitmap);
+        return None;
+    }
+    let pixels = std::slice::from_raw_parts_mut(bits.cast::<u8>(), (width * height * 4) as usize);
+    pixels.fill(0);
+
+    let mem_dc = CreateCompatibleDC(hdc);
+    let old_bitmap = SelectObject(mem_dc, bitmap);
+    SetBkMode(mem_dc, TRANSPARENT);
+    SetTextColor(mem_dc, windows::Win32::Foundation::COLORREF(0x00ff_ffff));
+
+    if !layout.lines.is_empty() {
+        let font = CreateFontW(
+            -(font_size.round().max(1.0) as i32),
+            0,
+            0,
+            0,
+            700,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        );
+        let old_font = SelectObject(mem_dc, font);
+        for (index, line) in layout.lines.iter().enumerate() {
+            let text_width = measure_watermark_text_width(hdc, line, font_size, true);
+            let wide: Vec<u16> = line.encode_utf16().collect();
+            let _ = TextOutW(
+                mem_dc,
+                (pad + (layout.width - text_width) / 2.0).round() as i32,
+                (pad + index as f32 * layout.line_height).round() as i32,
+                &wide,
+            );
+        }
+        let _ = SelectObject(mem_dc, old_font);
+        let _ = DeleteObject(font);
+    }
+
+    if let Some(date) = date {
+        let date_width = measure_watermark_text_width(hdc, date, layout.date_font, false);
+        let font = CreateFontW(
+            -(layout.date_font.round().max(1.0) as i32),
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        );
+        let old_font = SelectObject(mem_dc, font);
+        let wide: Vec<u16> = date.encode_utf16().collect();
+        let _ = TextOutW(
+            mem_dc,
+            (pad + (layout.width - date_width) / 2.0).round() as i32,
+            (pad + layout.date_y).round() as i32,
+            &wide,
+        );
+        let _ = SelectObject(mem_dc, old_font);
+        let _ = DeleteObject(font);
+    }
+
+    for pixel in pixels.chunks_exact_mut(4) {
+        let coverage = pixel[0].max(pixel[1]).max(pixel[2]);
+        if coverage == 0 {
+            pixel[0] = 0;
+            pixel[1] = 0;
+            pixel[2] = 0;
+            pixel[3] = 0;
+            continue;
+        }
+        let alpha = ((coverage as u16 * color.a as u16) / 255) as u8;
+        pixel[0] = color.b;
+        pixel[1] = color.g;
+        pixel[2] = color.r;
+        pixel[3] = alpha;
+    }
+
+    let source = WatermarkBitmap {
+        width,
+        height,
+        bgra: pixels.to_vec(),
+    };
+    let _ = SelectObject(mem_dc, old_bitmap);
+    let _ = DeleteObject(bitmap);
+    let _ = DeleteDC(mem_dc);
+
+    Some(rotated_watermark_bitmap(&source, degrees, 1.0))
+}
+unsafe fn draw_text_annotation(
+    hdc: HDC,
+    bounds: Rect,
+    text: &str,
+    font_size: f32,
+    color: Color,
+    framed: bool,
+    filled: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let padding = 8.0;
+    let draw_bounds = if framed && bounds.is_visible() {
+        bounds
+    } else {
+        let text_width = inline_text_width(text, font_size).max(font_size);
+        let line_count = inline_text_lines(text).count().max(1) as f32;
+        Rect::new(
+            bounds.x - INLINE_TEXT_PADDING,
+            bounds.y - font_size * INLINE_TEXT_ASCENT - INLINE_TEXT_PADDING,
+            text_width + INLINE_TEXT_PADDING * 2.0,
+            font_size * INLINE_TEXT_LINE_HEIGHT * line_count + INLINE_TEXT_PADDING * 2.0,
+        )
+    };
+    let text_color = if filled {
+        contrast_text_color(color)
+    } else {
+        color
+    };
+    if filled && framed {
+        fill_rounded_rect_antialias(hdc, draw_bounds, 9.0, color);
+    }
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, crate::util::colorref(text_color));
+    let font = CreateFontW(
+        -(font_size.round().max(1.0) as i32),
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        w!("Segoe UI"),
+    );
+    let old_font = SelectObject(hdc, font);
+    if framed {
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut rect = rect_to_rect(Rect::new(
+            draw_bounds.x + padding,
+            draw_bounds.y + padding,
+            (draw_bounds.width - padding * 2.0).max(1.0),
+            (draw_bounds.height - padding * 2.0).max(1.0),
+        ));
+        let _ = DrawTextW(hdc, &mut wide, &mut rect, DT_LEFT | DT_WORDBREAK);
+    } else {
+        let text_y = bounds.y - font_size * 1.08;
+        let line_height = font_size * INLINE_TEXT_LINE_HEIGHT;
+        for (index, line) in inline_text_lines(text).enumerate() {
+            if filled {
+                let line_width = measure_current_font_text_width(hdc, line).max(font_size * 0.45);
+                fill_rounded_rect_antialias(
+                    hdc,
+                    Rect::new(
+                        bounds.x - padding,
+                        text_y + index as f32 * line_height - padding * 0.45,
+                        line_width + padding * 2.0,
+                        line_height + padding * 0.45,
+                    ),
+                    3.5,
+                    color,
+                );
+            }
+            let wide: Vec<u16> = line.encode_utf16().collect();
+            let _ = TextOutW(
+                hdc,
+                bounds.x.round() as i32,
+                (text_y + index as f32 * line_height).round() as i32,
+                &wide,
+            );
+        }
+    }
+    let _ = SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
+unsafe fn measure_current_font_text_width(hdc: HDC, text: &str) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE { cx: 0, cy: 0 };
+    if GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() && size.cx > 0 {
+        size.cx as f32
+    } else {
+        text.chars().count() as f32 * 12.0
+    }
+}
+
+unsafe fn draw_inline_text_caret(
+    hdc: HDC,
+    baseline: Point,
+    text: &str,
+    font_size: f32,
+    color: Color,
+) {
+    if !watermark_caret_visible() {
+        return;
+    }
+    let caret_x = baseline.x + inline_text_width(text, font_size) - font_size * 0.18;
+    let caret_top = baseline.y - font_size * 1.08;
+    let caret_height = font_size * 1.28;
+    let width = (font_size * 0.07).clamp(2.0, 4.0);
+    fill_rounded_rect_antialias(
+        hdc,
+        Rect::new(caret_x, caret_top, width, caret_height),
+        width / 2.0,
+        color,
+    );
+}
+
+fn inline_text_width(text: &str, font_size: f32) -> f32 {
+    static WIDTH_CACHE: OnceLock<Mutex<HashMap<(String, u32), f32>>> = OnceLock::new();
+
+    let key = (text.to_string(), font_size.to_bits());
+    let cache = WIDTH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(widths) = cache.lock() {
+        if let Some(width) = widths.get(&key) {
+            return *width;
+        }
+    }
+
+    let measured = unsafe { measure_inline_text_width(text, font_size) };
+    if let Ok(mut widths) = cache.lock() {
+        if widths.len() >= INLINE_TEXT_WIDTH_CACHE_LIMIT {
+            widths.clear();
+        }
+        widths.insert(key, measured);
+    }
+    measured
+}
+
+fn inline_text_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+}
+
+unsafe fn measure_inline_text_width(text: &str, font_size: f32) -> f32 {
+    let hdc = GetDC(None);
+    let font = CreateFontW(
+        -(font_size.round().max(1.0) as i32),
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        w!("Segoe UI"),
+    );
+    let old_font = SelectObject(hdc, font);
+    let measured = inline_text_lines(text)
+        .map(|line| measure_current_font_text_width(hdc, line))
+        .fold(0.0, f32::max);
+    let _ = SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+    ReleaseDC(None, hdc);
+    measured
+}
+
+unsafe fn draw_dotted_rect(hdc: HDC, rect: Rect) {
+    let dot = 2.0_f32;
+    let gap = 5.0_f32;
+    let mut x = rect.x;
+    while x <= rect.right() {
+        let width = dot.min(rect.right() - x).max(0.0);
+        if width > 0.0 {
+            let brush = CreateSolidBrush(crate::util::colorref(inverted_pixel_color(
+                hdc,
+                x + width / 2.0,
+                rect.y,
+            )));
+            FillRect(hdc, &rect_to_rect(Rect::new(x, rect.y, width, dot)), brush);
+            let _ = DeleteObject(brush);
+            let brush = CreateSolidBrush(crate::util::colorref(inverted_pixel_color(
+                hdc,
+                x + width / 2.0,
+                rect.bottom() - dot,
+            )));
+            FillRect(
+                hdc,
+                &rect_to_rect(Rect::new(x, rect.bottom() - dot, width, dot)),
+                brush,
+            );
+            let _ = DeleteObject(brush);
+        }
+        x += dot + gap;
+    }
+    let mut y = rect.y;
+    while y <= rect.bottom() {
+        let height = dot.min(rect.bottom() - y).max(0.0);
+        if height > 0.0 {
+            let brush = CreateSolidBrush(crate::util::colorref(inverted_pixel_color(
+                hdc,
+                rect.x,
+                y + height / 2.0,
+            )));
+            FillRect(hdc, &rect_to_rect(Rect::new(rect.x, y, dot, height)), brush);
+            let _ = DeleteObject(brush);
+            let brush = CreateSolidBrush(crate::util::colorref(inverted_pixel_color(
+                hdc,
+                rect.right() - dot,
+                y + height / 2.0,
+            )));
+            FillRect(
+                hdc,
+                &rect_to_rect(Rect::new(rect.right() - dot, y, dot, height)),
+                brush,
+            );
+            let _ = DeleteObject(brush);
+        }
+        y += dot + gap;
+    }
+}
+
+unsafe fn inverted_pixel_color(hdc: HDC, x: f32, y: f32) -> Color {
+    let pixel = GetPixel(hdc, x.round() as i32, y.round() as i32).0;
+    let r = (pixel & 0xff) as u8;
+    let g = ((pixel >> 8) & 0xff) as u8;
+    let b = ((pixel >> 16) & 0xff) as u8;
+    Color::rgb(255 - r, 255 - g, 255 - b)
+}
+
+fn resize_tag_for_text(annotation: &mut Annotation, font_size: f32) {
+    let AnnotationKind::Tag { label, .. } = &annotation.kind else {
+        return;
+    };
+    if label.is_empty() {
+        return;
+    }
+    let inner_width = (annotation.bounds.width - 16.0).max(font_size);
+    let chars_per_line = (inner_width / (font_size * 0.55)).floor().max(1.0);
+    let line_count = label
+        .lines()
+        .map(|line| {
+            (line.chars().count() as f32 / chars_per_line)
+                .ceil()
+                .max(1.0)
+        })
+        .sum::<f32>()
+        .max(1.0);
+    let desired_height = 16.0 + line_count * font_size * 1.45;
+    if desired_height > annotation.bounds.height {
+        annotation.bounds.height = desired_height;
+    }
+}
+
+fn resize_framed_text_for_text(annotation: &mut Annotation, font_size: f32) {
+    let AnnotationKind::Text {
+        text, framed: true, ..
+    } = &annotation.kind
+    else {
+        return;
+    };
+    let inner_width = (annotation.bounds.width - 16.0).max(font_size);
+    let chars_per_line = (inner_width / (font_size * 0.58)).floor().max(1.0);
+    let line_count = text
+        .lines()
+        .map(|line| {
+            (line.chars().count() as f32 / chars_per_line)
+                .ceil()
+                .max(1.0)
+        })
+        .sum::<f32>()
+        .max(1.0);
+    let desired_height = 16.0 + line_count * font_size * 1.22;
+    if desired_height > annotation.bounds.height {
+        annotation.bounds.height = desired_height.ceil();
+    }
+}
+
+unsafe fn draw_tag_annotation(
+    hdc: HDC,
+    bounds: Rect,
+    anchor: Point,
+    label: &str,
+    frame_color: Color,
+    font_size: f32,
+    frame_width: f32,
+    style: RenderStyle,
+) {
+    let frame = tag_frame_for_width(frame_width);
+    let pointer_frame = style.tag_frame;
+    let radius = style.tag_radius;
+    draw_tag_outer_shape(
+        hdc,
+        bounds,
+        anchor,
+        frame_color,
+        frame,
+        pointer_frame,
+        radius,
+    );
+    fill_rounded_rect_antialias(hdc, bounds, radius.max(2.0), Color::WHITE);
+    draw_wrapped_text(hdc, bounds, label, font_size, Color::BLACK);
+}
+
+fn tag_frame_for_width(width: f32) -> f32 {
+    if width >= 6.0 {
+        width.clamp(6.0, 28.0)
+    } else {
+        TAG_FRAME
+    }
+}
+
+unsafe fn draw_tag_outer_shape(
+    hdc: HDC,
+    bounds: Rect,
+    anchor: Point,
+    color: Color,
+    frame: f32,
+    pointer_frame: f32,
+    radius: f32,
+) {
+    let pointer_box = expand_rect(bounds, pointer_frame);
+    if let Some(geom) = tag_corner_connector(pointer_box, anchor, pointer_frame, radius) {
+        draw_tag_pointer_shape(hdc, geom, color, pointer_frame.max(radius * 0.35));
+    } else {
+        let geom = tag_pointer_geometry(pointer_box, anchor, pointer_frame, radius);
+        draw_tag_pointer_shape(hdc, geom, color, pointer_frame.max(radius * 0.35));
+    }
+    fill_rounded_rect_antialias(hdc, expand_rect(bounds, frame), radius + frame, color);
+}
+
+fn expand_rect(rect: Rect, amount: f32) -> Rect {
+    Rect::new(
+        rect.x - amount,
+        rect.y - amount,
+        rect.width + amount * 2.0,
+        rect.height + amount * 2.0,
+    )
+}
+
+fn tag_corner_connector(
+    bounds: Rect,
+    anchor: Point,
+    frame: f32,
+    radius: f32,
+) -> Option<TagPointerGeometry> {
+    let outside_x = anchor.x < bounds.x || anchor.x > bounds.right();
+    let outside_y = anchor.y < bounds.y || anchor.y > bounds.bottom();
+    if !outside_x || !outside_y {
+        return None;
+    }
+    let r = radius
+        .min(bounds.width / 2.0)
+        .min(bounds.height / 2.0)
+        .max(0.0);
+    let inset = (frame + (frame * 0.35).max(3.0)).max(r * 0.65);
+    let center = Point::new(
+        if anchor.x < bounds.x {
+            bounds.x + inset
+        } else {
+            bounds.right() - inset
+        },
+        if anchor.y < bounds.y {
+            bounds.y + inset
+        } else {
+            bounds.bottom() - inset
+        },
+    );
+    Some(tag_pointer_from_center(
+        center,
+        anchor,
+        (frame * 0.77).max(6.0),
+        (frame * 0.20).max(2.1),
+        frame * 0.72,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct TagPointerGeometry {
+    base1: Point,
+    base2: Point,
+    tip1: Point,
+    tip2: Point,
+    anchor: Point,
+}
+
+unsafe fn draw_tag_pointer_shape(hdc: HDC, geom: TagPointerGeometry, color: Color, pad: f32) {
+    let mut builder = resvg::tiny_skia::PathBuilder::new();
+    builder.move_to(geom.base1.x, geom.base1.y);
+    builder.line_to(geom.tip1.x, geom.tip1.y);
+    builder.quad_to(geom.anchor.x, geom.anchor.y, geom.tip2.x, geom.tip2.y);
+    builder.line_to(geom.base2.x, geom.base2.y);
+    builder.close();
+    if let Some(path) = builder.finish() {
+        let min_x = geom
+            .base1
+            .x
+            .min(geom.base2.x)
+            .min(geom.tip1.x)
+            .min(geom.tip2.x)
+            .min(geom.anchor.x);
+        let min_y = geom
+            .base1
+            .y
+            .min(geom.base2.y)
+            .min(geom.tip1.y)
+            .min(geom.tip2.y)
+            .min(geom.anchor.y);
+        let max_x = geom
+            .base1
+            .x
+            .max(geom.base2.x)
+            .max(geom.tip1.x)
+            .max(geom.tip2.x)
+            .max(geom.anchor.x);
+        let max_y = geom
+            .base1
+            .y
+            .max(geom.base2.y)
+            .max(geom.tip1.y)
+            .max(geom.tip2.y)
+            .max(geom.anchor.y);
+        let surface = Rect::new(
+            min_x - pad,
+            min_y - pad,
+            (max_x - min_x + pad * 2.0).max(1.0),
+            (max_y - min_y + pad * 2.0).max(1.0),
+        );
+        draw_filled_tiny_path(hdc, surface, path, color);
+    }
+}
+
+fn tag_pointer_geometry(
+    bounds: Rect,
+    anchor: Point,
+    frame: f32,
+    radius: f32,
+) -> TagPointerGeometry {
+    let edge = if anchor.y < bounds.y {
+        2
+    } else if anchor.y > bounds.bottom() {
+        3
+    } else if anchor.x < bounds.x {
+        0
+    } else if anchor.x > bounds.right() {
+        1
+    } else {
+        3
+    };
+    let r = radius
+        .min(bounds.width / 2.0)
+        .min(bounds.height / 2.0)
+        .max(0.0);
+    let horizontal_half =
+        (frame * 0.77).clamp(6.0, ((bounds.width - r * 2.0) / 2.0 - 1.0).max(6.0));
+    let vertical_half = (frame * 0.77).clamp(6.0, ((bounds.height - r * 2.0) / 2.0 - 1.0).max(6.0));
+    let overlap = (frame * 1.08).max(6.0);
+    let round = frame * 0.72;
+    match edge {
+        0 => {
+            let y = anchor.y.clamp(
+                bounds.y + r + vertical_half,
+                bounds.bottom() - r - vertical_half,
+            );
+            tag_pointer_from_base(
+                Point::new(bounds.x + overlap, y + vertical_half),
+                Point::new(bounds.x + overlap, y - vertical_half),
+                anchor,
+                round,
+            )
+        }
+        1 => {
+            let y = anchor.y.clamp(
+                bounds.y + r + vertical_half,
+                bounds.bottom() - r - vertical_half,
+            );
+            tag_pointer_from_base(
+                Point::new(bounds.right() - overlap, y - vertical_half),
+                Point::new(bounds.right() - overlap, y + vertical_half),
+                anchor,
+                round,
+            )
+        }
+        2 => {
+            let x = anchor.x.clamp(
+                bounds.x + r + horizontal_half,
+                bounds.right() - r - horizontal_half,
+            );
+            tag_pointer_from_base(
+                Point::new(x - horizontal_half, bounds.y + overlap),
+                Point::new(x + horizontal_half, bounds.y + overlap),
+                anchor,
+                round,
+            )
+        }
+        _ => {
+            let x = anchor.x.clamp(
+                bounds.x + r + horizontal_half,
+                bounds.right() - r - horizontal_half,
+            );
+            tag_pointer_from_base(
+                Point::new(x + horizontal_half, bounds.bottom() - overlap),
+                Point::new(x - horizontal_half, bounds.bottom() - overlap),
+                anchor,
+                round,
+            )
+        }
+    }
+}
+
+fn tag_pointer_from_center(
+    base_center: Point,
+    anchor: Point,
+    base_half: f32,
+    tip_half: f32,
+    round: f32,
+) -> TagPointerGeometry {
+    let vx = anchor.x - base_center.x;
+    let vy = anchor.y - base_center.y;
+    let len = (vx * vx + vy * vy).sqrt().max(1.0);
+    let ux = vx / len;
+    let uy = vy / len;
+    let px = -uy;
+    let py = ux;
+    let r = round.min(len * 0.4);
+    let base1 = Point::new(
+        base_center.x + px * base_half,
+        base_center.y + py * base_half,
+    );
+    let base2 = Point::new(
+        base_center.x - px * base_half,
+        base_center.y - py * base_half,
+    );
+    let tip_a = Point::new(
+        anchor.x - ux * r + px * tip_half,
+        anchor.y - uy * r + py * tip_half,
+    );
+    let tip_b = Point::new(
+        anchor.x - ux * r - px * tip_half,
+        anchor.y - uy * r - py * tip_half,
+    );
+    let same_order = distance_squared(base1, tip_a) + distance_squared(base2, tip_b);
+    let swapped_order = distance_squared(base1, tip_b) + distance_squared(base2, tip_a);
+    let (tip1, tip2) = if same_order <= swapped_order {
+        (tip_a, tip_b)
+    } else {
+        (tip_b, tip_a)
+    };
+    TagPointerGeometry {
+        base1,
+        base2,
+        tip1,
+        tip2,
+        anchor,
+    }
+}
+
+fn tag_pointer_from_base(
+    base1: Point,
+    base2: Point,
+    anchor: Point,
+    round: f32,
+) -> TagPointerGeometry {
+    let mid = Point::new((base1.x + base2.x) / 2.0, (base1.y + base2.y) / 2.0);
+    let vx = anchor.x - mid.x;
+    let vy = anchor.y - mid.y;
+    let len = (vx * vx + vy * vy).sqrt().max(1.0);
+    let ux = vx / len;
+    let uy = vy / len;
+    let px = -uy;
+    let py = ux;
+    let r = round.min(len * 0.4);
+    let tip_a = Point::new(
+        anchor.x - ux * r + px * r * 0.45,
+        anchor.y - uy * r + py * r * 0.45,
+    );
+    let tip_b = Point::new(
+        anchor.x - ux * r - px * r * 0.45,
+        anchor.y - uy * r - py * r * 0.45,
+    );
+    let same_order = distance_squared(base1, tip_a) + distance_squared(base2, tip_b);
+    let swapped_order = distance_squared(base1, tip_b) + distance_squared(base2, tip_a);
+    let (tip1, tip2) = if same_order <= swapped_order {
+        (tip_a, tip_b)
+    } else {
+        (tip_b, tip_a)
+    };
+    TagPointerGeometry {
+        base1,
+        base2,
+        tip1,
+        tip2,
+        anchor,
+    }
+}
+
+fn distance_squared(a: Point, b: Point) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx * dx + dy * dy
+}
+
+unsafe fn draw_wrapped_text(hdc: HDC, rect: Rect, text: &str, font_size: f32, color: Color) {
+    if text.is_empty() {
+        return;
+    }
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, crate::util::colorref(color));
+    let font = CreateFontW(
+        -(font_size.round().max(1.0) as i32),
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        w!("Segoe UI"),
+    );
+    let old_font = SelectObject(hdc, font);
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    let mut text_rect = rect_to_rect(Rect::new(
+        rect.x + 8.0,
+        rect.y + 8.0,
+        (rect.width - 16.0).max(1.0),
+        (rect.height - 16.0).max(1.0),
+    ));
+    let _ = DrawTextW(hdc, &mut wide, &mut text_rect, DT_LEFT | DT_WORDBREAK);
+    let _ = SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
+unsafe fn draw_annotations(hdc: HDC, state: &OverlayState) {
+    for annotation in &state.session.document.annotations {
+        if is_mosaic_annotation(annotation) && !is_watermark_annotation(annotation) {
+            draw_annotation(hdc, state, annotation);
+        }
+    }
+    for annotation in &state.session.document.annotations {
+        if !is_watermark_annotation(annotation) && !is_mosaic_annotation(annotation) {
+            draw_annotation(hdc, state, annotation);
+        }
+    }
+}
+
+unsafe fn draw_watermark_annotations(hdc: HDC, state: &OverlayState) {
+    for annotation in &state.session.document.annotations {
+        if is_watermark_annotation(annotation) {
+            draw_annotation(hdc, state, annotation);
+        }
+    }
+}
+
+unsafe fn draw_native_backed_annotations(hdc: HDC, state: &OverlayState) {
+    for annotation in &state.session.document.annotations {
+        if is_mosaic_annotation(annotation) && !is_watermark_annotation(annotation) {
+            draw_annotation(hdc, state, annotation);
+        }
+    }
+}
+
+fn is_mosaic_annotation(annotation: &Annotation) -> bool {
+    matches!(annotation.kind, AnnotationKind::Mosaic { .. })
+}
+
+fn is_watermark_annotation(annotation: &Annotation) -> bool {
+    matches!(annotation.kind, AnnotationKind::Watermark { .. })
+}
+
+#[derive(Clone, Copy)]
+struct AnnotationRenderSpace {
+    origin: Point,
+}
+
+impl AnnotationRenderSpace {
+    fn overlay(state: &OverlayState) -> Self {
+        Self {
+            origin: Point::new(state.screen_bounds.x, state.screen_bounds.y),
+        }
+    }
+
+    fn export(region: Rect) -> Self {
+        Self {
+            origin: Point::new(region.x, region.y),
+        }
+    }
+
+    fn rect(self, rect: Rect) -> Rect {
+        rect.translate(-self.origin.x, -self.origin.y)
+    }
+
+    fn point(self, point: Point) -> Point {
+        point.translate(-self.origin.x, -self.origin.y)
+    }
+
+    fn points(self, points: &[Point]) -> Vec<Point> {
+        points.iter().map(|point| self.point(*point)).collect()
+    }
+}
+
+unsafe fn draw_watermark_pattern(hdc: HDC, state: &OverlayState, region: Rect) {
+    let text = state.watermark_text.trim();
+    let date = state.watermark_date_enabled.then(localized_today_string);
+    let image = state.watermark_image_bitmap.as_ref();
+    if text.is_empty() && date.is_none() && image.is_none() {
+        return;
+    }
+    let color = Color::rgba(
+        state.watermark_color.r,
+        state.watermark_color.g,
+        state.watermark_color.b,
+        (255.0 * WATERMARK_OPACITY).round() as u8,
+    );
+    let font_size = state
+        .watermark_font_size
+        .clamp(MIN_WATERMARK_FONT_SIZE, MAX_FONT_SIZE);
+    let max_text_width = watermark_max_text_width(region, font_size);
+    let (footprint_width, footprint_height) =
+        watermark_tile_footprint(hdc, text, date.as_deref(), image, font_size, max_text_width);
+    let metrics = watermark_honeycomb_metrics(footprint_width, footprint_height, font_size);
+    let has_text_watermark = !text.is_empty() || date.is_some();
+    let text_bitmap = if has_text_watermark {
+        watermark_text_block_bitmap(
+            hdc,
+            text,
+            date.as_deref(),
+            font_size,
+            max_text_width,
+            color,
+            WATERMARK_ROTATION_DEGREES,
+        )
+    } else {
+        None
+    };
+    for tile in watermark_honeycomb_tiles(region, metrics, 72) {
+        let use_image = image.is_some() && (!has_text_watermark || tile.parity == 0);
+        let use_text = has_text_watermark && (image.is_none() || tile.parity == 1);
+        if use_image {
+            if let Some(bitmap) = image {
+                draw_watermark_bitmap(hdc, bitmap, tile.x, tile.y);
+            }
+        }
+        if use_text {
+            if let Some(bitmap) = &text_bitmap {
+                draw_watermark_bitmap(hdc, bitmap, tile.x, tile.y);
+            }
+        }
+    }
+}
+
+fn approximate_text_width(text: &str, font_size: f32) -> f32 {
+    text.chars().count() as f32 * font_size * 0.56
+}
+
+fn approximate_watermark_text_width(text: &str, font_size: f32) -> f32 {
+    text.chars().count() as f32 * font_size * 0.78
+}
+
+fn measure_watermark_text_width(hdc: HDC, text: &str, font_size: f32, bold: bool) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    unsafe {
+        let font = CreateFontW(
+            -(font_size.round().max(1.0) as i32),
+            0,
+            0,
+            0,
+            if bold { 700 } else { 400 },
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            w!("Segoe UI"),
+        );
+        if font.is_invalid() {
+            return approximate_watermark_text_width(text, font_size);
+        }
+        let old_font = SelectObject(hdc, font);
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE { cx: 0, cy: 0 };
+        let ok = GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool();
+        let _ = SelectObject(hdc, old_font);
+        let _ = DeleteObject(font);
+        if ok && size.cx > 0 {
+            size.cx as f32
+        } else {
+            approximate_watermark_text_width(text, font_size)
+        }
+    }
+}
+
+fn watermark_tile_footprint(
+    hdc: HDC,
+    text: &str,
+    date: Option<&str>,
+    image: Option<&WatermarkBitmap>,
+    font_size: f32,
+    max_text_width: f32,
+) -> (f32, f32) {
+    let layout = watermark_text_block_layout(hdc, text, date, font_size, max_text_width);
+    let (rotated_text_width, rotated_text_height) =
+        rotated_bounds(layout.width, layout.height, WATERMARK_ROTATION_DEGREES);
+    let image_width = image.map(|bitmap| bitmap.width as f32).unwrap_or(0.0);
+    let image_height = image.map(|bitmap| bitmap.height as f32).unwrap_or(0.0);
+    (
+        rotated_text_width.max(image_width).max(80.0),
+        rotated_text_height.max(image_height).max(56.0),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct WatermarkHoneycombMetrics {
+    side: f32,
+    width: f32,
+    height: f32,
+    dx: f32,
+    dy: f32,
+}
+
+#[derive(Clone, Copy)]
+struct WatermarkTile {
+    x: f32,
+    y: f32,
+    parity: usize,
+}
+
+fn watermark_honeycomb_metrics(
+    footprint_width: f32,
+    footprint_height: f32,
+    font_size: f32,
+) -> WatermarkHoneycombMetrics {
+    let padding = 28.0_f32.max(font_size * 0.65);
+    let side = 118.0_f32
+        .max((footprint_width + padding * 2.0) / 3.0_f32.sqrt())
+        .max((footprint_height + padding * 2.0) / 2.0);
+    watermark_honeycomb_metrics_from_side(side)
+}
+
+fn watermark_honeycomb_metrics_from_side(side: f32) -> WatermarkHoneycombMetrics {
+    WatermarkHoneycombMetrics {
+        side,
+        width: 3.0_f32.sqrt() * side,
+        height: 2.0 * side,
+        dx: 3.0_f32.sqrt() * side,
+        dy: 1.5 * side,
+    }
+}
+
+fn watermark_honeycomb_tiles(
+    region: Rect,
+    metrics: WatermarkHoneycombMetrics,
+    max_tiles: usize,
+) -> Vec<WatermarkTile> {
+    let mut actual = metrics;
+    let estimated_cols = ((region.width + actual.width * 2.0) / actual.dx).ceil() as usize + 1;
+    let estimated_rows = ((region.height + actual.height * 2.0) / actual.dy).ceil() as usize + 1;
+    let estimated = estimated_cols.saturating_mul(estimated_rows);
+    if estimated > max_tiles {
+        let scale_up = (estimated as f32 / max_tiles.max(1) as f32).sqrt();
+        actual = watermark_honeycomb_metrics_from_side(actual.side * scale_up);
+    }
+    let mut tiles = Vec::new();
+    let mut row = 0_usize;
+    let mut y = region.y - actual.height;
+    while y <= region.bottom() + actual.height {
+        let stagger = if row % 2 == 0 { 0.0 } else { actual.dx / 2.0 };
+        let mut col = 0_usize;
+        let mut x = region.x - actual.width + stagger;
+        while x <= region.right() + actual.width {
+            tiles.push(WatermarkTile {
+                x,
+                y,
+                parity: (row + col) % 2,
+            });
+            col += 1;
+            x += actual.dx;
+        }
+        row += 1;
+        y += actual.dy;
+    }
+    tiles.sort_by(|a, b| {
+        a.y.partial_cmp(&b.y)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    tiles
+}
+
+struct WatermarkTextBlockLayout {
+    lines: Vec<String>,
+    width: f32,
+    height: f32,
+    line_height: f32,
+    date_y: f32,
+    date_font: f32,
+}
+
+fn watermark_text_block_layout(
+    hdc: HDC,
+    text: &str,
+    date: Option<&str>,
+    font_size: f32,
+    max_text_width: f32,
+) -> WatermarkTextBlockLayout {
+    let date_font = font_size * 0.72;
+    let lines = if text.is_empty() {
+        Vec::new()
+    } else {
+        wrap_watermark_text(hdc, text, font_size, max_text_width)
+    };
+    let line_height = font_size * 1.08;
+    let text_width = lines
+        .iter()
+        .map(|line| measure_watermark_text_width(hdc, line, font_size, true))
+        .fold(0.0, f32::max);
+    let date_width = date
+        .map(|date| measure_watermark_text_width(hdc, date, date_font, false))
+        .unwrap_or(0.0);
+    let text_height = if lines.is_empty() {
+        0.0
+    } else {
+        (lines.len() - 1) as f32 * line_height + font_size
+    };
+    let date_height = if date.is_some() { date_font } else { 0.0 };
+    let gap = if !lines.is_empty() && date.is_some() {
+        font_size * 0.18
+    } else {
+        0.0
+    };
+    WatermarkTextBlockLayout {
+        lines,
+        width: text_width.max(date_width).max(font_size),
+        height: font_size.max(text_height + gap + date_height),
+        line_height,
+        date_y: if text_height > 0.0 {
+            text_height + gap
+        } else {
+            0.0
+        },
+        date_font,
+    }
+}
+
+fn watermark_max_text_width(region: Rect, font_size: f32) -> f32 {
+    260.0_f32.max((font_size * 13.0).min(region.width * 0.24))
+}
+
+fn wrap_watermark_text(hdc: HDC, text: &str, font_size: f32, max_width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if line.is_empty() {
+            word.to_string()
+        } else {
+            format!("{line} {word}")
+        };
+        if measure_watermark_text_width(hdc, &candidate, font_size, true) <= max_width {
+            line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+        if measure_watermark_text_width(hdc, word, font_size, true) <= max_width {
+            line = word.to_string();
+            continue;
+        }
+        let mut chunk = String::new();
+        for ch in word.chars() {
+            let mut candidate = chunk.clone();
+            candidate.push(ch);
+            if !chunk.is_empty()
+                && measure_watermark_text_width(hdc, &candidate, font_size, true) > max_width
+            {
+                lines.push(std::mem::take(&mut chunk));
+                chunk.push(ch);
+            } else {
+                chunk = candidate;
+            }
+        }
+        line = chunk;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    if lines.is_empty() && !text.is_empty() {
+        lines.push(text.to_string());
+    }
+    lines
+}
+
+fn rotated_bounds(width: f32, height: f32, degrees: f32) -> (f32, f32) {
+    let radians = degrees.abs().to_radians();
+    let cos = radians.cos();
+    let sin = radians.sin();
+    (width * cos + height * sin, width * sin + height * cos)
+}
+
+fn watermark_caret_visible() -> bool {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() % 1000 < 500)
+        .unwrap_or(true)
+}
+
+struct WatermarkBitmap {
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
+}
+
+fn watermark_bitmap_data_url(bitmap: &WatermarkBitmap) -> Option<String> {
+    let mut rgba = Vec::with_capacity((bitmap.width * bitmap.height * 4) as usize);
+    for px in bitmap.bgra.chunks_exact(4) {
+        let alpha = px[3];
+        if alpha == 0 {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let r = ((px[2] as u16 * 255) / alpha as u16).min(255) as u8;
+            let g = ((px[1] as u16 * 255) / alpha as u16).min(255) as u8;
+            let b = ((px[0] as u16 * 255) / alpha as u16).min(255) as u8;
+            rgba.extend_from_slice(&[r, g, b, alpha]);
+        }
+    }
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, bitmap.width, bitmap.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&rgba).ok()?;
+    }
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64_encode(&png_bytes)
+    ))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let b1 = bytes.get(i + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(i + 2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < bytes.len() {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < bytes.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
+fn load_watermark_bitmap(path: &PathBuf, target_size: u32) -> Option<WatermarkBitmap> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("svg") => load_svg_watermark_bitmap(path, target_size),
+        Some("png") => load_png_watermark_bitmap(path, target_size),
+        _ => None,
+    }
+}
+
+fn load_svg_watermark_bitmap(path: &PathBuf, target_size: u32) -> Option<WatermarkBitmap> {
+    let svg = std::fs::read_to_string(path).ok()?;
+    let opt = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(&svg, &opt).ok()?;
+    let tree_size = tree.size();
+    let scale = target_size as f32 / tree_size.width().max(tree_size.height()).max(1.0);
+    let width = (tree_size.width() * scale).round().max(1.0) as u32;
+    let height = (tree_size.height() * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Some(rgba_pixmap_to_watermark(width, height, pixmap.data()))
+}
+
+fn load_png_watermark_bitmap(path: &PathBuf, target_size: u32) -> Option<WatermarkBitmap> {
+    let file = File::open(path).ok()?;
+    let mut decoder = png::Decoder::new(BufReader::new(file));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    let bytes = &buffer[..info.buffer_size()];
+    let mut bgra = Vec::with_capacity((info.width * info.height * 4) as usize);
+    match info.color_type {
+        png::ColorType::Rgba => {
+            for px in bytes.chunks_exact(4) {
+                bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            }
+        }
+        png::ColorType::Rgb => {
+            for px in bytes.chunks_exact(3) {
+                bgra.extend_from_slice(&[px[2], px[1], px[0], 255]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for value in bytes {
+                bgra.extend_from_slice(&[*value, *value, *value, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for px in bytes.chunks_exact(2) {
+                bgra.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+        png::ColorType::Indexed => return None,
+    }
+    Some(scale_watermark_bitmap(
+        WatermarkBitmap {
+            width: info.width,
+            height: info.height,
+            bgra,
+        },
+        target_size,
+    ))
+}
+
+fn rgba_pixmap_to_watermark(width: u32, height: u32, rgba: &[u8]) -> WatermarkBitmap {
+    let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+    for px in rgba.chunks_exact(4) {
+        bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+    }
+    WatermarkBitmap {
+        width,
+        height,
+        bgra,
+    }
+}
+
+fn scale_watermark_bitmap(bitmap: WatermarkBitmap, target_size: u32) -> WatermarkBitmap {
+    let max_dim = bitmap.width.max(bitmap.height).max(1);
+    if max_dim == target_size {
+        return bitmap;
+    }
+    let scale = target_size as f32 / max_dim as f32;
+    let width = (bitmap.width as f32 * scale).round().max(1.0) as u32;
+    let height = (bitmap.height as f32 * scale).round().max(1.0) as u32;
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let sx = ((x as f32 / scale).round() as u32).min(bitmap.width - 1);
+            let sy = ((y as f32 / scale).round() as u32).min(bitmap.height - 1);
+            let src = ((sy * bitmap.width + sx) * 4) as usize;
+            let dst = ((y * width + x) * 4) as usize;
+            bgra[dst..dst + 4].copy_from_slice(&bitmap.bgra[src..src + 4]);
+        }
+    }
+    WatermarkBitmap {
+        width,
+        height,
+        bgra,
+    }
+}
+
+unsafe fn draw_watermark_bitmap(hdc: HDC, bitmap: &WatermarkBitmap, x: f32, y: f32) {
+    let rect = Rect::new(
+        x - bitmap.width as f32 / 2.0,
+        y - bitmap.height as f32 / 2.0,
+        bitmap.width as f32,
+        bitmap.height as f32,
+    );
+    let _ = alpha_blend_bgra(hdc, rect, bitmap.width, bitmap.height, &bitmap.bgra);
+}
+
+fn faded_watermark_bitmap(bitmap: &WatermarkBitmap, opacity: f32) -> WatermarkBitmap {
+    let mut bgra = bitmap.bgra.clone();
+    for px in bgra.chunks_exact_mut(4) {
+        let alpha = (px[3] as f32 * opacity).round().clamp(0.0, 255.0) as u8;
+        px[3] = alpha;
+        for channel in 0..3 {
+            px[channel] = ((px[channel] as u16 * alpha as u16) / 255) as u8;
+        }
+    }
+    WatermarkBitmap {
+        width: bitmap.width,
+        height: bitmap.height,
+        bgra,
+    }
+}
+
+#[allow(dead_code)]
+fn rotated_watermark_bitmap(
+    bitmap: &WatermarkBitmap,
+    degrees: f32,
+    opacity: f32,
+) -> WatermarkBitmap {
+    let angle = degrees.to_radians();
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let width = (bitmap.width as f32 * cos.abs() + bitmap.height as f32 * sin.abs())
+        .ceil()
+        .max(1.0) as u32;
+    let height = (bitmap.width as f32 * sin.abs() + bitmap.height as f32 * cos.abs())
+        .ceil()
+        .max(1.0) as u32;
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    let src_cx = bitmap.width as f32 / 2.0;
+    let src_cy = bitmap.height as f32 / 2.0;
+    let dst_cx = width as f32 / 2.0;
+    let dst_cy = height as f32 / 2.0;
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 - dst_cx;
+            let dy = y as f32 - dst_cy;
+            let sx = dx * cos + dy * sin + src_cx;
+            let sy = -dx * sin + dy * cos + src_cy;
+            if sx >= 0.0 && sy >= 0.0 && sx < bitmap.width as f32 && sy < bitmap.height as f32 {
+                let src = ((sy as u32 * bitmap.width + sx as u32) * 4) as usize;
+                let dst = ((y * width + x) * 4) as usize;
+                let alpha = (bitmap.bgra[src + 3] as f32 * opacity)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+                bgra[dst + 3] = alpha;
+                for channel in 0..3 {
+                    bgra[dst + channel] =
+                        ((bitmap.bgra[src + channel] as u16 * alpha as u16) / 255) as u8;
+                }
+            }
+        }
+    }
+    WatermarkBitmap {
+        width,
+        height,
+        bgra,
+    }
+}
+
+fn localized_today_string() -> String {
+    unsafe {
+        let local_time = GetLocalTime();
+        let mut buffer = [0_u16; 128];
+        let len = GetDateFormatEx(
+            PCWSTR::null(),
+            DATE_SHORTDATE,
+            Some(&local_time),
+            PCWSTR::null(),
+            Some(&mut buffer),
+            PCWSTR::null(),
+        );
+        if len > 1 {
+            return String::from_utf16_lossy(&buffer[..(len - 1) as usize]);
+        }
+    }
+    "Today".to_string()
+}
+
+unsafe fn draw_selected_annotation(hdc: HDC, state: &OverlayState) {
+    let Some(selected_id) = state.session.document.selected_annotation_id else {
+        return;
+    };
+    let Some(annotation) = state.session.document.annotation(selected_id) else {
+        return;
+    };
+    let bounds = annotation
+        .bounds
+        .translate(-state.screen_bounds.x, -state.screen_bounds.y);
+    let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(0x0000c8ff));
+
+    match &annotation.kind {
+        AnnotationKind::Line { start, end }
+        | AnnotationKind::Arrow { start, end }
+        | AnnotationKind::Highlighter {
+            shape: HighlightShape::Rectangle,
+            start,
+            end,
+            ..
+        } => {
+            for point in [
+                state.screen_to_overlay(*start),
+                state.screen_to_overlay(*end),
+            ] {
+                let handle = Rect::new(point.x - 5.0, point.y - 5.0, 10.0, 10.0);
+                FillRect(hdc, &rect_to_rect(handle), brush);
+            }
+        }
+        AnnotationKind::Tag { anchor, .. } => {
+            FrameRect(hdc, &rect_to_rect(bounds), brush);
+            for point in [
+                state.screen_to_overlay(*anchor),
+                Point::new(bounds.x, bounds.y),
+                Point::new(bounds.right(), bounds.y),
+                Point::new(bounds.right(), bounds.bottom()),
+                Point::new(bounds.x, bounds.bottom()),
+            ] {
+                let handle = Rect::new(point.x - 4.0, point.y - 4.0, 8.0, 8.0);
+                FillRect(hdc, &rect_to_rect(handle), brush);
+            }
+        }
+        AnnotationKind::Text { framed: true, .. } => {
+            draw_dotted_rect(hdc, bounds);
+            for point in [
+                Point::new(bounds.x, bounds.y),
+                Point::new(bounds.center().x, bounds.y),
+                Point::new(bounds.right(), bounds.y),
+                Point::new(bounds.right(), bounds.center().y),
+                Point::new(bounds.right(), bounds.bottom()),
+                Point::new(bounds.center().x, bounds.bottom()),
+                Point::new(bounds.x, bounds.bottom()),
+                Point::new(bounds.x, bounds.center().y),
+            ] {
+                let handle = Rect::new(point.x - 3.0, point.y - 3.0, 6.0, 6.0);
+                FillRect(hdc, &rect_to_rect(handle), brush);
+            }
+        }
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed: false,
+            filled,
+        } => {
+            if state.editing_text_id == Some(selected_id) {
+                let caret_color = if *filled {
+                    contrast_text_color(annotation.stroke.color)
+                } else {
+                    annotation.stroke.color
+                };
+                draw_inline_text_caret(
+                    hdc,
+                    Point::new(bounds.x, bounds.y),
+                    text,
+                    *font_size,
+                    caret_color,
+                );
+            }
+        }
+        AnnotationKind::Pen { .. } | AnnotationKind::PenArrow { .. } => {}
+        _ => {
+            FrameRect(hdc, &rect_to_rect(bounds), brush);
+            for point in [
+                Point::new(bounds.x, bounds.y),
+                Point::new(bounds.right(), bounds.y),
+                Point::new(bounds.right(), bounds.bottom()),
+                Point::new(bounds.x, bounds.bottom()),
+            ] {
+                let handle = Rect::new(point.x - 4.0, point.y - 4.0, 8.0, 8.0);
+                FillRect(hdc, &rect_to_rect(handle), brush);
+            }
+        }
+    }
+    let _ = DeleteObject(brush);
+}
+
+unsafe fn draw_drag_preview(hdc: HDC, state: &OverlayState) {
+    let Some(DragState::DrawingAnnotation {
+        start,
+        current,
+        points,
+    }) = &state.drag
+    else {
+        return;
+    };
+
+    if state.active_tool == ToolKind::Pen {
+        let overlay_points: Vec<Point> = points
+            .iter()
+            .map(|point| state.screen_to_overlay(*point))
+            .collect();
+        draw_fast_polyline(hdc, &overlay_points, state.current_stroke);
+        if state.pen_mode == PenMode::Arrow {
+            draw_arrow_tip_for_points(hdc, &overlay_points, state.current_stroke);
+        }
+        return;
+    }
+
+    if matches!(
+        state.active_tool,
+        ToolKind::Rectangle | ToolKind::Oval | ToolKind::Line | ToolKind::Arrow
+    ) {
+        let annotation = annotation_from_tool(state, *start, *current, points.clone());
+        draw_annotation(hdc, state, &annotation);
+        return;
+    }
+
+    if state.active_tool == ToolKind::Mosaic {
+        let bounds = Rect::from_points(*start, *current)
+            .translate(-state.screen_bounds.x, -state.screen_bounds.y);
+        draw_blur_region(hdc, bounds, HIGHLIGHTER_RADIUS);
+        return;
+    }
+
+    let annotation = annotation_from_tool(state, *start, *current, points.clone());
+    draw_annotation(hdc, state, &annotation);
+    if let AnnotationKind::Text { framed: true, .. } = annotation.kind {
+        let bounds = annotation
+            .bounds
+            .translate(-state.screen_bounds.x, -state.screen_bounds.y);
+        draw_dotted_rect(hdc, bounds);
+    }
+}
+
+unsafe fn draw_fast_polyline(hdc: HDC, points: &[Point], stroke: StrokeStyle) {
+    let Some(first) = points.first().copied() else {
+        return;
+    };
+    let _pen = SelectedPen::new(hdc, stroke.width, stroke.color);
+    let _ = MoveToEx(hdc, first.x.round() as i32, first.y.round() as i32, None);
+    for point in points.iter().copied().skip(1) {
+        let _ = LineTo(hdc, point.x.round() as i32, point.y.round() as i32);
+    }
+}
+
+unsafe fn draw_annotation(hdc: HDC, state: &OverlayState, annotation: &Annotation) {
+    draw_annotation_in_space(
+        hdc,
+        state,
+        annotation,
+        AnnotationRenderSpace::overlay(state),
+    );
+}
+
+unsafe fn draw_annotation_in_space(
+    hdc: HDC,
+    state: &OverlayState,
+    annotation: &Annotation,
+    space: AnnotationRenderSpace,
+) {
+    let style = RenderStyle::for_state(state);
+    let bounds = space.rect(annotation.bounds);
+    match &annotation.kind {
+        AnnotationKind::Rectangle => {
+            draw_stroked_rect(hdc, bounds, annotation.stroke);
+        }
+        AnnotationKind::Oval => {
+            draw_stroked_oval(hdc, bounds, annotation.stroke);
+        }
+        AnnotationKind::Line { start, end } => draw_line(
+            hdc,
+            space.point(*start),
+            space.point(*end),
+            false,
+            annotation.stroke,
+        ),
+        AnnotationKind::Arrow { start, end } => draw_line(
+            hdc,
+            space.point(*start),
+            space.point(*end),
+            true,
+            annotation.stroke,
+        ),
+        AnnotationKind::StepNumber { number } => {
+            draw_step_number(hdc, bounds, *number, annotation.stroke.color, style);
+        }
+        AnnotationKind::Text {
+            text,
+            font_size,
+            framed,
+            filled,
+        } => {
+            draw_text_annotation(
+                hdc,
+                bounds,
+                text,
+                *font_size,
+                annotation.stroke.color,
+                *framed,
+                *filled,
+            );
+        }
+        AnnotationKind::Watermark { text, .. } => {
+            draw_label_sized_color(
+                hdc,
+                bounds.x,
+                bounds.y,
+                text,
+                state.watermark_font_size,
+                annotation.stroke.color,
+            );
+        }
+        AnnotationKind::Tag {
+            label,
+            anchor,
+            font_size,
+        } => {
+            draw_tag_annotation(
+                hdc,
+                bounds,
+                space.point(*anchor),
+                label,
+                annotation.stroke.color,
+                *font_size,
+                annotation.stroke.width,
+                style,
+            );
+        }
+        AnnotationKind::Mosaic { .. } => {
+            draw_blur_region(hdc, bounds, HIGHLIGHTER_RADIUS);
+        }
+        AnnotationKind::Highlighter {
+            shape,
+            opacity,
+            start,
+            end,
+        } => {
+            draw_highlighter(
+                hdc,
+                bounds,
+                *shape,
+                highlighter_color(annotation.stroke.color, *opacity),
+                annotation.stroke.width,
+                space.point(*start),
+                space.point(*end),
+            );
+        }
+        AnnotationKind::Pen { points } => {
+            let render_points = space.points(points);
+            draw_pen_path(hdc, &render_points, annotation.stroke);
+        }
+        AnnotationKind::PenArrow { points } => {
+            let render_points = space.points(points);
+            let shaft_points = pen_arrow_shaft_points(&render_points, annotation.stroke);
+            draw_pen_path_with_cap(
+                hdc,
+                &shaft_points,
+                annotation.stroke,
+                resvg::tiny_skia::LineCap::Round,
+            );
+            draw_arrow_tip_for_points(hdc, &render_points, annotation.stroke);
+        }
+    }
+    if let Some(number) = annotation.step_number {
+        draw_step_badge(
+            hdc,
+            auto_step_badge_center(annotation, bounds, space, style),
+            number,
+            annotation.stroke.color,
+            style,
+        );
+    }
+}
+
+unsafe fn draw_step_number(hdc: HDC, bounds: Rect, number: u32, color: Color, style: RenderStyle) {
+    draw_step_badge(hdc, bounds.center(), number, color, style);
+}
+
+fn auto_step_badge_center(
+    annotation: &Annotation,
+    bounds: Rect,
+    space: AnnotationRenderSpace,
+    style: RenderStyle,
+) -> Point {
+    let size = style.step_badge_size;
+    let unit = size / 24.0;
+    match &annotation.kind {
+        AnnotationKind::Line { start, end }
+        | AnnotationKind::Arrow { start, end }
+        | AnnotationKind::Highlighter {
+            shape: HighlightShape::Rectangle,
+            start,
+            end,
+            ..
+        } => {
+            let start = space.point(*start);
+            let end = space.point(*end);
+            Point::new(
+                (start.x + end.x) / 2.0,
+                (start.y + end.y) / 2.0 - annotation.stroke.width / 2.0 - size / 2.0 - 6.0 * unit,
+            )
+        }
+        AnnotationKind::Pen { points } | AnnotationKind::PenArrow { points } => {
+            let render_points = space.points(points);
+            let midpoint = polyline_midpoint(&render_points).unwrap_or_else(|| bounds.center());
+            Point::new(
+                midpoint.x,
+                midpoint.y - annotation.stroke.width / 2.0 - size / 2.0 - 3.0 * unit,
+            )
+        }
+        _ => Point::new(bounds.center().x, bounds.y - size / 2.0 - 6.0 * unit),
+    }
+}
+
+fn polyline_midpoint(points: &[Point]) -> Option<Point> {
+    if points.is_empty() {
+        return None;
+    }
+    if points.len() == 1 {
+        return Some(points[0]);
+    }
+    let total: f32 = points
+        .windows(2)
+        .map(|pair| ((pair[1].x - pair[0].x).powi(2) + (pair[1].y - pair[0].y).powi(2)).sqrt())
+        .sum();
+    if total <= 0.0 {
+        return Some(points[points.len() / 2]);
+    }
+    let target = total / 2.0;
+    let mut walked = 0.0;
+    for pair in points.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        let length = ((end.x - start.x).powi(2) + (end.y - start.y).powi(2)).sqrt();
+        if walked + length >= target {
+            let t = (target - walked) / length.max(1.0);
+            return Some(Point::new(
+                start.x + (end.x - start.x) * t,
+                start.y + (end.y - start.y) * t,
+            ));
+        }
+        walked += length;
+    }
+    points.last().copied()
+}
+
+unsafe fn draw_step_badge(hdc: HDC, center: Point, number: u32, color: Color, style: RenderStyle) {
+    let size = style.step_badge_size;
+    let marker = Rect::new(center.x - size / 2.0, center.y - size / 2.0, size, size);
+    fill_oval_antialias(hdc, marker, color);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, crate::util::colorref(contrast_text_color(color)));
+    let font = CreateFontW(
+        -(style.step_badge_font_size.round().max(1.0) as i32),
+        0,
+        0,
+        0,
+        700,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        w!("Segoe UI"),
+    );
+    let old_font = SelectObject(hdc, font);
+    let mut text_rect = rect_to_rect(marker);
+    let mut label: Vec<u16> = number.to_string().encode_utf16().collect();
+    let _ = DrawTextW(
+        hdc,
+        &mut label,
+        &mut text_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    let _ = SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
+struct OwnedBitmap(Option<HBITMAP>);
+
+impl OwnedBitmap {
+    fn new(bitmap: HBITMAP) -> Self {
+        Self(Some(bitmap))
+    }
+
+    fn handle(&self) -> HBITMAP {
+        self.0.expect("owned bitmap is available")
+    }
+
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for OwnedBitmap {
+    fn drop(&mut self) {
+        if let Some(bitmap) = self.0.take() {
+            unsafe {
+                let _ = DeleteObject(bitmap);
+            }
+        }
+    }
+}
+
+struct ClipboardSession {
+    open: bool,
+}
+
+impl ClipboardSession {
+    unsafe fn open(owner: HWND) -> windows::core::Result<Self> {
+        OpenClipboard(owner)?;
+        Ok(Self { open: true })
+    }
+
+    unsafe fn close(mut self) -> windows::core::Result<()> {
+        self.open = false;
+        CloseClipboard()
+    }
+}
+
+impl Drop for ClipboardSession {
+    fn drop(&mut self) {
+        if self.open {
+            unsafe {
+                let _ = CloseClipboard();
+            }
+        }
+    }
+}
+
+unsafe fn copy_capture_to_clipboard(state: &OverlayState) -> std::result::Result<(), String> {
+    let _ = maybe_request_web_export(state, ExportTarget::Clipboard);
+    let Some(rendered_bitmap) = render_capture_bitmap(state) else {
+        return Err("The screenshot could not be rendered.".to_string());
+    };
+    let mut bitmap = OwnedBitmap::new(rendered_bitmap);
+    let region = state
+        .session
+        .document
+        .capture_region
+        .ok_or_else(|| "No capture region is selected.".to_string())?;
+    let auto_save_error = auto_save_capture_if_enabled(state, bitmap.handle(), region).err();
+
+    let clipboard = ClipboardSession::open(state.hwnd).map_err(|error| error.to_string())?;
+    EmptyClipboard().map_err(|error| error.to_string())?;
+    SetClipboardData(CF_BITMAP_FORMAT, HANDLE(bitmap.handle().0))
+        .map_err(|error| error.to_string())?;
+    bitmap.release();
+    clipboard.close().map_err(|error| error.to_string())?;
+
+    if let Some(error) = auto_save_error {
+        return Err(format!(
+            "The screenshot was copied, but automatic saving failed: {error}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum SaveCaptureOutcome {
+    Saved,
+    Cancelled,
+    Failed(String),
+}
+
+unsafe fn complete_copy_action(state: &mut OverlayState) {
+    match copy_capture_to_clipboard(state) {
+        Ok(()) => {
+            request_overlay_close(state);
+        }
+        Err(message) => {
+            show_capture_message(state.hwnd, "Screen Cap'n Copy", &message, MB_ICONWARNING)
+        }
+    }
+}
+
+unsafe fn complete_save_action(state: &mut OverlayState) {
+    match save_capture_to_file(state) {
+        SaveCaptureOutcome::Saved => {
+            request_overlay_close(state);
+        }
+        SaveCaptureOutcome::Cancelled => {}
+        SaveCaptureOutcome::Failed(message) => {
+            show_capture_message(state.hwnd, "Screen Cap'n Save", &message, MB_ICONERROR)
+        }
+    }
+}
+
+unsafe fn request_overlay_close(state: &mut OverlayState) {
+    if state.close_requested {
+        return;
+    }
+    match PostMessageW(state.hwnd, WM_OVERLAY_CLOSE_REQUEST, WPARAM(0), LPARAM(0)) {
+        Ok(()) => state.close_requested = true,
+        Err(error) => show_capture_message(
+            state.hwnd,
+            "Screen Cap'n",
+            &format!("The capture window could not be closed safely.\n\n{error}"),
+            MB_ICONWARNING,
+        ),
+    }
+}
+
+unsafe fn show_capture_message(
+    hwnd: HWND,
+    title: &str,
+    message: &str,
+    icon: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
+) {
+    let title = wide_null(title);
+    let message = wide_null(message);
+    let _ = MessageBoxW(
+        hwnd,
+        PCWSTR(message.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        MB_OK | icon,
+    );
+}
+
+unsafe fn save_capture_to_file(state: &OverlayState) -> SaveCaptureOutcome {
+    let _ = maybe_request_web_export(state, ExportTarget::Save);
+    let Some(path) = show_save_png_dialog(state.hwnd) else {
+        return SaveCaptureOutcome::Cancelled;
+    };
+    let _ = ShowWindow(state.hwnd, SW_HIDE);
+    let Some(rendered_bitmap) = render_capture_bitmap(state) else {
+        let _ = ShowWindow(state.hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(state.hwnd);
+        return SaveCaptureOutcome::Failed("The screenshot could not be rendered.".to_string());
+    };
+    let bitmap = OwnedBitmap::new(rendered_bitmap);
+    match write_png_file(
+        bitmap.handle(),
+        state
+            .session
+            .document
+            .capture_region
+            .expect("bitmap needs region"),
+        &path,
+    ) {
+        Ok(()) => SaveCaptureOutcome::Saved,
+        Err(error) => {
+            let _ = ShowWindow(state.hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(state.hwnd);
+            SaveCaptureOutcome::Failed(format!(
+                "The PNG could not be written to {}.\n\n{error}",
+                path.display(),
+            ))
+        }
+    }
+}
+
+unsafe fn auto_save_capture_if_enabled(
+    state: &OverlayState,
+    bitmap: HBITMAP,
+    region: Rect,
+) -> std::io::Result<Option<PathBuf>> {
+    if !state.settings.auto_save.enabled {
+        return Ok(None);
+    }
+    let path = next_auto_save_path(&state.settings.auto_save.folder)?;
+    write_png_file(bitmap, region, &path)?;
+    Ok(Some(path))
+}
+
+fn next_auto_save_path(folder: &PathBuf) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(folder)?;
+    let stamp = local_timestamp();
+    for index in 0..1000 {
+        let filename = if index == 0 {
+            format!("ScreenCapn-{stamp}.png")
+        } else {
+            format!("ScreenCapn-{stamp}-{index}.png")
+        };
+        let path = folder.join(filename);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique automatic-save filename",
+    ))
+}
+
+fn local_timestamp() -> String {
+    unsafe {
+        let local = GetLocalTime();
+        format!(
+            "{:04}-{:02}-{:02}-{:02}{:02}{:02}",
+            local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond
+        )
+    }
+}
+
+unsafe fn render_capture_bitmap(state: &OverlayState) -> Option<HBITMAP> {
+    let Some(region) = state.session.document.capture_region else {
+        return None;
+    };
+
+    let screen_dc = GetDC(None);
+    let source_dc = CreateCompatibleDC(screen_dc);
+    let mem_dc = CreateCompatibleDC(screen_dc);
+    let bitmap = CreateCompatibleBitmap(
+        screen_dc,
+        region.width.round() as i32,
+        region.height.round() as i32,
+    );
+    let _ = SelectObject(source_dc, state.background_bitmap);
+    let _ = SelectObject(mem_dc, bitmap);
+    let _ = BitBlt(
+        mem_dc,
+        0,
+        0,
+        region.width.round() as i32,
+        region.height.round() as i32,
+        source_dc,
+        (region.x - state.screen_bounds.x).round() as i32,
+        (region.y - state.screen_bounds.y).round() as i32,
+        SRCCOPY,
+    );
+
+    draw_export_annotations(mem_dc, state, region);
+    draw_watermark_pattern(
+        mem_dc,
+        state,
+        Rect::new(0.0, 0.0, region.width, region.height),
+    );
+    draw_export_watermark_annotations(mem_dc, state, region);
+
+    let _ = DeleteDC(source_dc);
+    let _ = DeleteDC(mem_dc);
+    ReleaseDC(None, screen_dc);
+    Some(bitmap)
+}
+
+unsafe fn write_png_file(bitmap: HBITMAP, region: Rect, path: &PathBuf) -> std::io::Result<()> {
+    let (width, height, pixels) = bitmap_rgba_pixels(bitmap, region)?;
+    let file = File::create(path)?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&pixels)?;
+    Ok(())
+}
+
+unsafe fn bitmap_rgba_pixels(
+    bitmap: HBITMAP,
+    region: Rect,
+) -> std::io::Result<(u32, u32, Vec<u8>)> {
+    let width = region.width.round().max(1.0) as i32;
+    let height = region.height.round().max(1.0) as i32;
+    let stride = width as usize * 4;
+    let image_size = stride * height as usize;
+    let mut bgra = vec![0_u8; image_size];
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: image_size as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let hdc = GetDC(None);
+    let lines = GetDIBits(
+        hdc,
+        bitmap,
+        0,
+        height as u32,
+        Some(bgra.as_mut_ptr().cast()),
+        &mut info,
+        DIB_RGB_COLORS,
+    );
+    ReleaseDC(None, hdc);
+    if lines == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut rgba = bgra;
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        pixel[3] = 255;
+    }
+    Ok((width as u32, height as u32, rgba))
+}
+
+unsafe fn show_save_png_dialog(owner: HWND) -> Option<PathBuf> {
+    let mut file_buffer = default_png_save_path_wide();
+    file_buffer.resize(1024, 0);
+    let filter = wide_null_double("PNG Image (*.png)\0*.png\0All Files (*.*)\0*.*\0");
+    let title = wide_null("Save screenshot as PNG");
+    let default_ext = wide_null("png");
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file_buffer.as_mut_ptr()),
+        nMaxFile: file_buffer.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        lpstrDefExt: PCWSTR(default_ext.as_ptr()),
+        Flags: OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+    if !GetSaveFileNameW(&mut dialog).as_bool() {
+        return None;
+    }
+    let len = file_buffer
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(file_buffer.len());
+    let mut path = PathBuf::from(String::from_utf16_lossy(&file_buffer[..len]));
+    if path.extension().is_none() {
+        path.set_extension("png");
+    }
+    Some(path)
+}
+
+unsafe fn show_open_image_dialog(owner: HWND) -> Option<PathBuf> {
+    let _ = ReleaseCapture();
+    match show_open_image_dialog_modern(owner) {
+        Ok(path) => {
+            diagnostics::log_breadcrumb(format!(
+                "watermark-image-dialog-result selected={}",
+                path.is_some()
+            ));
+            path
+        }
+        Err(error) => {
+            let _ = error;
+            write_web_ui_debug("watermark-image-dialog-failed");
+            None
+        }
+    }
+}
+
+unsafe fn show_open_image_dialog_modern(owner: HWND) -> Result<Option<PathBuf>> {
+    let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+    let filters = [
+        COMDLG_FILTERSPEC {
+            pszName: w!("Images (*.png;*.svg)"),
+            pszSpec: w!("*.png;*.svg"),
+        },
+        COMDLG_FILTERSPEC {
+            pszName: w!("All Files (*.*)"),
+            pszSpec: w!("*.*"),
+        },
+    ];
+    dialog.SetFileTypes(&filters)?;
+    dialog.SetFileTypeIndex(1)?;
+    dialog.SetTitle(w!("Choose watermark image"))?;
+    let options = dialog.GetOptions()?;
+    dialog.SetOptions(options | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_FILEMUSTEXIST)?;
+    if dialog.Show(owner).is_err() {
+        return Ok(None);
+    }
+    let item = dialog.GetResult()?;
+    let path_ptr = item.GetDisplayName(SIGDN_FILESYSPATH)?;
+    if path_ptr.is_null() {
+        return Ok(None);
+    }
+    let path = path_ptr.to_string().ok().map(PathBuf::from);
+    CoTaskMemFree(Some(path_ptr.as_ptr().cast()));
+    Ok(path)
+}
+
+fn default_png_save_path_wide() -> Vec<u16> {
+    let path = default_save_path();
+    wide_null(path.to_string_lossy().as_ref())
+}
+
+fn default_save_path() -> PathBuf {
+    let dir = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .join("Pictures")
+        .join("Screen Cap'n");
+    let _ = fs::create_dir_all(&dir);
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    dir.join(format!("ScreenCapn-{seconds}.png"))
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn wide_null_double(value: &str) -> Vec<u16> {
+    let mut wide: Vec<u16> = value.encode_utf16().collect();
+    if !wide.ends_with(&[0, 0]) {
+        wide.push(0);
+        wide.push(0);
+    }
+    wide
+}
+
+unsafe fn draw_export_annotations(hdc: HDC, state: &OverlayState, region: Rect) {
+    let space = AnnotationRenderSpace::export(region);
+    for annotation in &state.session.document.annotations {
+        if is_mosaic_annotation(annotation) && !is_watermark_annotation(annotation) {
+            draw_annotation_in_space(hdc, state, annotation, space);
+        }
+    }
+    for annotation in &state.session.document.annotations {
+        if !is_watermark_annotation(annotation) && !is_mosaic_annotation(annotation) {
+            draw_annotation_in_space(hdc, state, annotation, space);
+        }
+    }
+}
+
+unsafe fn draw_export_watermark_annotations(hdc: HDC, state: &OverlayState, region: Rect) {
+    let space = AnnotationRenderSpace::export(region);
+    for annotation in &state.session.document.annotations {
+        if is_watermark_annotation(annotation) {
+            draw_annotation_in_space(hdc, state, annotation, space);
+        }
+    }
+}
