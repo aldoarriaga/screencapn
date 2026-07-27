@@ -1,3 +1,4 @@
+use crate::native_svg::{draw_svg, recolor_svg};
 use crate::overlay::AppTheme;
 use crate::settings::AppSettings;
 use crate::startup::RunOnStartupState;
@@ -8,22 +9,23 @@ use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetMonitorInfoW, GetStockObject, LineTo, MonitorFromPoint, MoveToEx, RoundRect,
-    SelectObject, SetBkMode, SetTextColor, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    FillRect, GetMonitorInfoW, LineTo, MonitorFromPoint, MoveToEx, RoundRect, SelectObject,
+    SetBkMode, SetTextColor, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HDC, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, IsWindow, LoadCursorW, LoadIconW, RegisterClassW,
+    GetMessageW, GetWindowLongPtrW, IsWindow, LoadCursorW, LoadIconW, RegisterClassW, SetCursor,
     SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW, MSG, SW_SHOW, WM_APP, WM_CLOSE,
-    WM_CREATE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, IDC_ARROW, IDC_HAND, MSG, SW_SHOW, WM_APP,
+    WM_CLOSE, WM_CREATE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -35,15 +37,21 @@ const ROW_HEIGHT: f32 = 40.0;
 const SECTION_HEIGHT: f32 = 24.0;
 const OUTER_PADDING: f32 = 8.0;
 const SECTION_GAP: f32 = 4.0;
+const ROW_CONTROL_SIZE: f32 = 18.0;
+const ROW_TEXT_INDENT: f32 = 34.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrayAction {
     SetShortcut,
     ToggleAutoSave,
+    OpenAutoSaveFolder,
     SetAutoSaveFolder,
     ToggleRunOnStartup,
     ToggleTheme,
+    ToggleCaptureTips,
+    OpenSetup,
     ShowUpdate,
+    ReportBug,
     Donate,
     Exit,
 }
@@ -67,6 +75,7 @@ struct TrayRow {
     action: TrayAction,
     label: String,
     value: Option<String>,
+    icon: TrayIcon,
     kind: TrayRowKind,
     enabled: bool,
 }
@@ -74,8 +83,24 @@ struct TrayRow {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TrayRowKind {
     Standard,
-    AutoSave { checked: bool },
-    Startup { checked: bool },
+    Toggle { checked: bool },
+    IconToggle { checked: bool },
+    Update,
+}
+
+#[derive(Clone, Copy)]
+enum TrayIcon {
+    Shortcut,
+    Folder,
+    FolderOpen,
+    Startup,
+    Setup,
+    LightMode,
+    DarkMode,
+    Tips,
+    Donate,
+    Bug,
+    Exit,
     Update,
 }
 
@@ -84,6 +109,7 @@ struct TrayPopoverState {
     items: Vec<TrayItem>,
     row_rects: Vec<(usize, Rect)>,
     hover: Option<usize>,
+    trailing_hover: Option<usize>,
     focus: Option<usize>,
     result: Option<Option<TrayAction>>,
     scale: f32,
@@ -178,6 +204,7 @@ pub unsafe fn show_tray_menu(owner: HWND, menu: TrayMenuState) -> Option<TrayAct
 
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
+    let _ = SetCapture(hwnd);
 
     let mut message = MSG::default();
     while GetMessageW(&mut message, None, 0, 0).into() {
@@ -198,6 +225,9 @@ pub unsafe fn show_tray_menu(owner: HWND, menu: TrayMenuState) -> Option<TrayAct
     let mut state = Box::from_raw(state_ptr);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
     let result = state.result.take().flatten();
+    if GetCapture() == hwnd {
+        let _ = ReleaseCapture();
+    }
     if IsWindow(hwnd).as_bool() {
         let _ = DestroyWindow(hwnd);
     }
@@ -212,6 +242,7 @@ impl TrayPopoverState {
             items,
             row_rects: Vec::new(),
             hover: None,
+            trailing_hover: None,
             focus: None,
             result: None,
             scale,
@@ -267,6 +298,37 @@ impl TrayPopoverState {
         }
     }
 
+    fn action_at_point(&self, point: Point) -> Option<TrayAction> {
+        let index = self.item_at(point)?;
+        let row = match self.items.get(index) {
+            Some(TrayItem::Row(row)) => row,
+            _ => return None,
+        };
+        let rect = self
+            .row_rects
+            .iter()
+            .find_map(|(row_index, rect)| (*row_index == index).then_some(*rect))?;
+        if trailing_action(row).is_some() && trailing_rect(self.scale, rect).contains(point) {
+            return trailing_action(row);
+        }
+        self.action_at(index)
+    }
+
+    fn trailing_at(&self, point: Point) -> Option<usize> {
+        let index = self.item_at(point)?;
+        let _row = match self.items.get(index) {
+            Some(TrayItem::Row(row)) if trailing_action(row).is_some() => row,
+            _ => return None,
+        };
+        let rect = self
+            .row_rects
+            .iter()
+            .find_map(|(row_index, rect)| (*row_index == index).then_some(*rect))?;
+        trailing_rect(self.scale, rect)
+            .contains(point)
+            .then_some(index)
+    }
+
     fn selectable_indices(&self) -> Vec<usize> {
         self.items
             .iter()
@@ -294,6 +356,7 @@ impl TrayPopoverState {
         let next = (current as i32 + delta).rem_euclid(selectable.len() as i32) as usize;
         self.focus = Some(selectable[next]);
         self.hover = None;
+        self.trailing_hover = None;
     }
 }
 
@@ -321,21 +384,31 @@ unsafe extern "system" fn popover_wnd_proc(
         WM_MOUSEMOVE => {
             if let Some(state) = popover_state(hwnd) {
                 let next = state.item_at(point_from_lparam(lparam));
-                if state.hover != next || state.focus.is_some() {
+                let trailing = state.trailing_at(point_from_lparam(lparam));
+                if state.hover != next || state.trailing_hover != trailing || state.focus.is_some()
+                {
                     state.hover = next;
+                    state.trailing_hover = trailing;
                     state.focus = None;
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
+                }
+                if let Ok(cursor) =
+                    LoadCursorW(None, if next.is_some() { IDC_HAND } else { IDC_ARROW })
+                {
+                    let _ = SetCursor(cursor);
                 }
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             if let Some(state) = popover_state(hwnd) {
-                if let Some(action) = state
-                    .item_at(point_from_lparam(lparam))
-                    .and_then(|index| state.action_at(index))
-                {
+                let point = point_from_lparam(lparam);
+                if let Some(action) = state.action_at_point(point) {
                     state.result = Some(Some(action));
+                } else if !Rect::new(0.0, 0.0, state.size.0 as f32, state.size.1 as f32)
+                    .contains(point)
+                {
+                    state.result = Some(None);
                 }
             }
             LRESULT(0)
@@ -385,6 +458,7 @@ fn menu_items(menu: &TrayMenuState) -> Vec<TrayItem> {
             action: TrayAction::ShowUpdate,
             label: "Update available".to_string(),
             value: None,
+            icon: TrayIcon::Update,
             kind: TrayRowKind::Update,
             enabled: true,
         }));
@@ -395,6 +469,7 @@ fn menu_items(menu: &TrayMenuState) -> Vec<TrayItem> {
         action: TrayAction::SetShortcut,
         label: "Quick access shortcut".to_string(),
         value: Some(menu.settings.hotkey.display_label()),
+        icon: TrayIcon::Shortcut,
         kind: TrayRowKind::Standard,
         enabled: true,
     }));
@@ -402,7 +477,8 @@ fn menu_items(menu: &TrayMenuState) -> Vec<TrayItem> {
         action: TrayAction::ToggleAutoSave,
         label: "Auto-save screenshots".to_string(),
         value: None,
-        kind: TrayRowKind::AutoSave {
+        icon: TrayIcon::Shortcut,
+        kind: TrayRowKind::Toggle {
             checked: menu.settings.auto_save.enabled,
         },
         enabled: true,
@@ -411,6 +487,7 @@ fn menu_items(menu: &TrayMenuState) -> Vec<TrayItem> {
         action: TrayAction::SetAutoSaveFolder,
         label: "Choose auto-save folder".to_string(),
         value: None,
+        icon: TrayIcon::Folder,
         kind: TrayRowKind::Standard,
         enabled: true,
     }));
@@ -431,7 +508,8 @@ fn menu_items(menu: &TrayMenuState) -> Vec<TrayItem> {
         action: TrayAction::ToggleRunOnStartup,
         label: startup_label.to_string(),
         value: None,
-        kind: TrayRowKind::Startup {
+        icon: TrayIcon::Startup,
+        kind: TrayRowKind::Toggle {
             checked: menu.startup_state.is_enabled(),
         },
         enabled: !startup_disabled,
@@ -444,15 +522,46 @@ fn menu_items(menu: &TrayMenuState) -> Vec<TrayItem> {
         }
         .to_string(),
         value: None,
+        icon: match menu.theme {
+            AppTheme::Light => TrayIcon::DarkMode,
+            AppTheme::Dark => TrayIcon::LightMode,
+        },
+        kind: TrayRowKind::Standard,
+        enabled: true,
+    }));
+    items.push(TrayItem::Row(TrayRow {
+        action: TrayAction::ToggleCaptureTips,
+        label: "Show capture tips".to_string(),
+        value: None,
+        icon: TrayIcon::Tips,
+        kind: TrayRowKind::IconToggle {
+            checked: menu.settings.show_capture_tips,
+        },
+        enabled: true,
+    }));
+    items.push(TrayItem::Row(TrayRow {
+        action: TrayAction::OpenSetup,
+        label: "Screen Cap'n setup".to_string(),
+        value: None,
+        icon: TrayIcon::Setup,
         kind: TrayRowKind::Standard,
         enabled: true,
     }));
 
     items.push(TrayItem::Section("SUPPORT"));
     items.push(TrayItem::Row(TrayRow {
+        action: TrayAction::ReportBug,
+        label: "Report a bug".to_string(),
+        value: None,
+        icon: TrayIcon::Bug,
+        kind: TrayRowKind::Standard,
+        enabled: true,
+    }));
+    items.push(TrayItem::Row(TrayRow {
         action: TrayAction::Donate,
         label: "Enjoying Screen Cap'n? Consider donating".to_string(),
         value: None,
+        icon: TrayIcon::Donate,
         kind: TrayRowKind::Standard,
         enabled: true,
     }));
@@ -461,6 +570,7 @@ fn menu_items(menu: &TrayMenuState) -> Vec<TrayItem> {
         action: TrayAction::Exit,
         label: "Exit Screen Cap'n".to_string(),
         value: None,
+        icon: TrayIcon::Exit,
         kind: TrayRowKind::Standard,
         enabled: true,
     }));
@@ -502,6 +612,9 @@ unsafe fn draw_popover(hdc: HDC, state: &TrayPopoverState) {
     for (index, item) in state.items.iter().enumerate() {
         match item {
             TrayItem::Section(label) => {
+                if index > 0 {
+                    draw_section_separator(hdc, state, y, palette);
+                }
                 draw_text(
                     hdc,
                     Rect::new(
@@ -525,6 +638,7 @@ unsafe fn draw_popover(hdc: HDC, state: &TrayPopoverState) {
                     .find_map(|(row_index, rect)| (*row_index == index).then_some(*rect))
                     .unwrap_or_default();
                 let active = state.hover == Some(index) || state.focus == Some(index);
+                let trailing_active = state.trailing_hover == Some(index);
                 if active && row.enabled {
                     fill_rect(
                         hdc,
@@ -532,7 +646,7 @@ unsafe fn draw_popover(hdc: HDC, state: &TrayPopoverState) {
                         hover_color(state.menu.theme, row.kind),
                     );
                 }
-                draw_row(hdc, state, row, rect, active, palette);
+                draw_row(hdc, state, row, rect, active, trailing_active, palette);
                 y = rect.bottom();
             }
         }
@@ -545,30 +659,19 @@ unsafe fn draw_row(
     row: &TrayRow,
     rect: Rect,
     active: bool,
+    trailing_active: bool,
     palette: crate::theme::ToolbarPalette,
 ) {
     let mut label_rect = inset_rect(rect, scaled(state.scale, 10.0));
-    if row.kind == TrayRowKind::Update {
-        draw_download_icon(
-            hdc,
-            Point::new(
-                label_rect.x + scaled(state.scale, 8.0),
-                label_rect.y + label_rect.height / 2.0,
-            ),
-            scaled(state.scale, 16.0),
-            palette.accent,
-        );
-        label_rect.x += scaled(state.scale, 28.0);
-        label_rect.width -= scaled(state.scale, 28.0);
-    }
-    if matches!(
-        row.kind,
-        TrayRowKind::AutoSave { .. } | TrayRowKind::Startup { .. }
-    ) {
-        label_rect.width -= scaled(state.scale, 28.0);
-    }
+    // All actions share this left control column, whether it contains a
+    // checkbox, an icon, or intentional empty space.
+    label_rect.x += scaled(state.scale, ROW_TEXT_INDENT);
+    label_rect.width -= scaled(state.scale, ROW_TEXT_INDENT);
     if row.value.is_some() {
         label_rect.width -= scaled(state.scale, 96.0);
+    }
+    if trailing_action(row).is_some() {
+        label_rect.width -= scaled(state.scale, 34.0);
     }
     let foreground = if row.enabled {
         palette.icon
@@ -580,11 +683,7 @@ unsafe fn draw_row(
         label_rect,
         &row.label,
         scaled(state.scale, 13.0) as i32,
-        if row.kind == TrayRowKind::Update && active {
-            palette.accent
-        } else {
-            foreground
-        },
+        foreground,
         false,
         DT_LEFT,
     );
@@ -604,99 +703,186 @@ unsafe fn draw_row(
             DT_RIGHT,
         );
     }
+    let icon_rect = check_rect(state.scale, rect);
     match row.kind {
-        TrayRowKind::AutoSave { checked } => {
-            let preview = if active { !checked } else { checked };
-            draw_check(
+        TrayRowKind::Toggle { checked } => {
+            let preview = if active && !trailing_active && row.enabled {
+                !checked
+            } else {
+                checked
+            };
+            let color = if preview {
+                foreground
+            } else {
+                inactive_toggle_color(state.menu.theme)
+            };
+            draw_checkmark(hdc, icon_rect, color, state.scale);
+        }
+        TrayRowKind::IconToggle { checked } => {
+            let preview = if active && row.enabled {
+                !checked
+            } else {
+                checked
+            };
+            let color = if preview {
+                foreground
+            } else {
+                inactive_toggle_color(state.menu.theme)
+            };
+            let icon_center = icon_rect.center();
+            let icon_size = icon_rect.width * 1.3225;
+            draw_row_icon(
                 hdc,
-                check_rect(state.scale, rect),
-                preview,
-                palette.accent,
-                foreground,
+                row.icon,
+                Rect::new(
+                    icon_center.x - icon_size / 2.0,
+                    icon_center.y - icon_size / 2.0,
+                    icon_size,
+                    icon_size,
+                ),
+                color,
             );
         }
-        TrayRowKind::Startup { checked } => draw_check(
+        TrayRowKind::Standard | TrayRowKind::Update => {
+            draw_row_icon(hdc, row.icon, icon_rect, foreground);
+        }
+    }
+    if trailing_action(row).is_some() {
+        let color = if trailing_active {
+            palette.accent
+        } else {
+            foreground
+        };
+        draw_row_icon(
             hdc,
-            check_rect(state.scale, rect),
-            checked,
-            palette.accent,
-            foreground,
-        ),
-        _ => {}
+            TrayIcon::FolderOpen,
+            trailing_rect(state.scale, rect),
+            color,
+        );
     }
 }
 
-unsafe fn draw_check(hdc: HDC, rect: Rect, checked: bool, accent: Color, foreground: Color) {
-    let border = if checked { accent } else { foreground };
-    let pen = CreatePen(PS_SOLID, 1, colorref(border));
-    let old_pen = SelectObject(hdc, pen);
-    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    let _ = RoundRect(
-        hdc,
-        rect.x.round() as i32,
-        rect.y.round() as i32,
-        rect.right().round() as i32,
-        rect.bottom().round() as i32,
-        3,
-        3,
+unsafe fn draw_checkmark(hdc: HDC, rect: Rect, color: Color, scale: f32) {
+    let pen = CreatePen(
+        PS_SOLID,
+        scaled(scale, 2.0).round().max(1.0) as i32,
+        colorref(color),
     );
-    if checked {
-        let _ = MoveToEx(
-            hdc,
-            rect.x.round() as i32 + 3,
-            rect.y.round() as i32 + 7,
-            None,
-        );
-        let _ = LineTo(hdc, rect.x.round() as i32 + 6, rect.y.round() as i32 + 10);
-        let _ = LineTo(hdc, rect.x.round() as i32 + 12, rect.y.round() as i32 + 3);
-    }
-    let _ = SelectObject(hdc, old_brush);
-    let _ = SelectObject(hdc, old_pen);
+    let old = SelectObject(hdc, pen);
+    let left = rect.x;
+    let top = rect.y;
+    let size = rect.width;
+    let _ = MoveToEx(
+        hdc,
+        (left + size * 0.12).round() as i32,
+        (top + size * 0.53).round() as i32,
+        None,
+    );
+    let _ = LineTo(
+        hdc,
+        (left + size * 0.40).round() as i32,
+        (top + size * 0.78).round() as i32,
+    );
+    let _ = LineTo(
+        hdc,
+        (left + size * 0.88).round() as i32,
+        (top + size * 0.20).round() as i32,
+    );
+    let _ = SelectObject(hdc, old);
     let _ = DeleteObject(pen);
 }
 
 fn check_rect(scale: f32, rect: Rect) -> Rect {
-    let size = scaled(scale, 15.0);
+    let size = scaled(scale, ROW_CONTROL_SIZE);
     Rect::new(
-        rect.right() - scaled(scale, 15.0) - size,
-        rect.y + (rect.height - size) / 2.0,
+        rect.x + scaled(scale, 10.0),
+        rect.y + (rect.height - size) / 2.0 + scaled(scale, 1.5),
         size,
         size,
     )
 }
 
-unsafe fn draw_download_icon(hdc: HDC, center: Point, size: f32, color: Color) {
-    let pen = CreatePen(PS_SOLID, 2, colorref(color));
+fn trailing_rect(scale: f32, rect: Rect) -> Rect {
+    let size = scaled(scale, ROW_CONTROL_SIZE);
+    Rect::new(
+        rect.right() - scaled(scale, 10.0) - size,
+        rect.y + (rect.height - size) / 2.0 + scaled(scale, 1.5),
+        size,
+        size,
+    )
+}
+
+fn trailing_action(row: &TrayRow) -> Option<TrayAction> {
+    (row.action == TrayAction::ToggleAutoSave).then_some(TrayAction::OpenAutoSaveFolder)
+}
+
+unsafe fn draw_row_icon(hdc: HDC, icon: TrayIcon, rect: Rect, color: Color) {
+    let source = match icon {
+        TrayIcon::Shortcut => include_str!("../assets/tray/shortcut.svg"),
+        TrayIcon::Folder => include_str!("../assets/tray/folder.svg"),
+        TrayIcon::FolderOpen => include_str!("../assets/tray/folder-open.svg"),
+        TrayIcon::Startup => include_str!("../assets/tray/startup.svg"),
+        TrayIcon::Setup => include_str!("../assets/tray/setup.svg"),
+        TrayIcon::LightMode => include_str!("../assets/toolbar/light-mode.svg"),
+        TrayIcon::DarkMode => include_str!("../assets/toolbar/dark-mode.svg"),
+        TrayIcon::Tips => include_str!("../assets/tips/tooltip.svg"),
+        TrayIcon::Donate => include_str!("../assets/tray/donate.svg"),
+        TrayIcon::Bug => include_str!("../assets/tray/bug.svg"),
+        TrayIcon::Exit => include_str!("../assets/tray/exit.svg"),
+        TrayIcon::Update => include_str!("../assets/tray/update.svg"),
+    };
+    // The toolbar theme artwork has intentionally generous SVG padding. Crop
+    // only its tray presentation so its visible vector matches the 24px icons.
+    let source = match icon {
+        TrayIcon::LightMode => source
+            .replace("viewBox=\"0 0 16 16\"", "viewBox=\"3 3 10 10\"")
+            .replace(
+                "stroke-linecap:",
+                "stroke-width: .75px;\n        stroke-linecap:",
+            )
+            .replace("r=\".5\"", "r=\".4\""),
+        TrayIcon::DarkMode => source
+            .replace("viewBox=\"0 0 16 16\"", "viewBox=\"5 5 6 6\"")
+            .replace(
+                "stroke-linecap:",
+                "stroke-width: .5px;\n        stroke-linecap:",
+            ),
+        TrayIcon::Bug => source.replace("viewBox=\"0 0 24 24\"", "viewBox=\"2 2 20 20\""),
+        _ => source.to_string(),
+    };
+    let source = recolor_svg(&source, color);
+    let _ = draw_svg(hdc, &source, rect);
+}
+
+unsafe fn draw_section_separator(
+    hdc: HDC,
+    state: &TrayPopoverState,
+    y: f32,
+    palette: crate::theme::ToolbarPalette,
+) {
+    let color = blend_color(palette.background, palette.divider, 0.24);
+    let pen = CreatePen(PS_SOLID, 1, colorref(color));
     let old = SelectObject(hdc, pen);
-    let half = size / 2.0;
-    let x = center.x.round() as i32;
-    let _ = MoveToEx(hdc, x, (center.y - half * 0.65).round() as i32, None);
-    let _ = LineTo(hdc, x, (center.y + half * 0.3).round() as i32);
-    let _ = MoveToEx(hdc, x, (center.y + half * 0.3).round() as i32, None);
-    let _ = LineTo(
-        hdc,
-        (center.x - half * 0.34).round() as i32,
-        (center.y - half * 0.04).round() as i32,
-    );
-    let _ = MoveToEx(hdc, x, (center.y + half * 0.3).round() as i32, None);
-    let _ = LineTo(
-        hdc,
-        (center.x + half * 0.34).round() as i32,
-        (center.y - half * 0.04).round() as i32,
-    );
-    let _ = MoveToEx(
-        hdc,
-        (center.x - half * 0.58).round() as i32,
-        (center.y + half * 0.7).round() as i32,
-        None,
-    );
-    let _ = LineTo(
-        hdc,
-        (center.x + half * 0.58).round() as i32,
-        (center.y + half * 0.7).round() as i32,
-    );
+    let inset = scaled(state.scale, 18.0);
+    let line_y = y.round() as i32;
+    let _ = MoveToEx(hdc, inset.round() as i32, line_y, None);
+    let _ = LineTo(hdc, (state.size.0 as f32 - inset).round() as i32, line_y);
     let _ = SelectObject(hdc, old);
     let _ = DeleteObject(pen);
+}
+
+fn blend_color(background: Color, foreground: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel = |back: u8, front: u8| {
+        (back as f32 + (front as f32 - back as f32) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::rgb(
+        channel(background.r, foreground.r),
+        channel(background.g, foreground.g),
+        channel(background.b, foreground.b),
+    )
 }
 
 unsafe fn draw_text(
@@ -761,15 +947,17 @@ unsafe fn fill_rect(hdc: HDC, rect: Rect, color: Color) {
 }
 
 fn hover_color(theme: AppTheme, kind: TrayRowKind) -> Color {
-    if kind == TrayRowKind::Update {
-        return match theme {
-            AppTheme::Light => Color::rgb(0xff, 0xea, 0xe8),
-            AppTheme::Dark => Color::rgb(0x45, 0x29, 0x28),
-        };
-    }
+    let _ = kind;
     match theme {
         AppTheme::Light => Color::rgb(0xe4, 0xe4, 0xe4),
         AppTheme::Dark => Color::rgb(0x2a, 0x2a, 0x2a),
+    }
+}
+
+fn inactive_toggle_color(theme: AppTheme) -> Color {
+    match theme {
+        AppTheme::Light => Color::rgb(0xd8, 0xd8, 0xd8),
+        AppTheme::Dark => Color::rgb(0x28, 0x28, 0x28),
     }
 }
 

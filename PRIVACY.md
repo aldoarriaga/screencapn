@@ -1,6 +1,6 @@
 # Screen Cap'n Privacy Policy
 
-Last updated: 2026-07-12
+Last updated: 2026-07-25
 
 Screen Cap'n is a local screenshot capture and annotation app for Windows.
 
@@ -16,15 +16,17 @@ Screen Cap'n does not include third-party advertising trackers.
 
 ## Store Update Checks
 
-When Screen Cap'n is installed through Microsoft Store, it may check Microsoft Store roughly once every seven days to see whether a newer Screen Cap'n package is available. If Microsoft Store confirms an update, Screen Cap'n may request the matching public release-notes file from `https://screencapn.com/updates/<version>.json` so the app can explain what changed before you choose to update.
+When Screen Cap'n is installed through Microsoft Store, it may check Microsoft Store roughly once every seven days to see whether a newer Screen Cap'n package is available. If Microsoft Store confirms an update, Screen Cap'n may request the matching public WordPress update post from `https://screencapn.com/wp-json/wp/v2/posts` so the app can explain what changed before you choose to update.
 
-These requests do not include screenshot content, annotation text, clipboard content, file paths, account identifiers, analytics identifiers, cookies, or advertising trackers. Screen Cap'n does not contact the release-notes website when Microsoft Store reports that no update is available.
+These requests do not include screenshot content, annotation text, clipboard content, file paths, account identifiers, device identifiers, analytics identifiers, usage data, cookies, or advertising trackers. Screen Cap'n does not contact the release-notes website when Microsoft Store reports that no update is available.
 
 ## Local Settings And Diagnostics
 
-Screen Cap'n may store local settings and local diagnostic logs on your device to support app functionality and troubleshooting.
+Screen Cap'n stores preferences, onboarding status, default colors, and tip rotation state locally on your device.
 
-Production diagnostic logs are disabled by default unless explicitly enabled for troubleshooting with `SCREENCAPTN_DIAGNOSTICS`. Diagnostic logs should not include screenshot image data, clipboard contents, annotation text, window titles, user-selected file paths, or sensitive file contents.
+Optional local diagnostic logs are disabled by default. You may enable them during first-run setup to help troubleshoot crashes and app behavior. Logs remain on your device, are size-limited, and are never uploaded automatically.
+
+Diagnostic logs do not include screenshot image data, clipboard contents, annotation text, window titles, user-selected file paths, account identifiers, device identifiers, or sensitive file contents.
 
 ## Microsoft Store Diagnostics
 
@@ -36,6 +38,6 @@ If optional crash reporting or usage analytics are added in a future version, th
 
 ## Contact
 
-For support or privacy questions, contact:
+For support, privacy questions, or bug reports, visit:
 
-TODO: add support email or support URL before Microsoft Store submission.
+https://screencapn.com/feedback/

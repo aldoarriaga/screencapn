@@ -1,4 +1,5 @@
-use crate::settings::{PendingUpdate, ReleaseNotes, UpdateCheckSettings};
+use crate::settings::{PendingUpdate, ReleasePost, UpdateCheckSettings};
+use serde::Deserialize;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -295,8 +296,17 @@ pub fn clear_installed_pending_update(settings: &mut UpdateCheckSettings) -> boo
     false
 }
 
-pub fn details_url(version: &str) -> String {
-    format!("https://{NOTES_HOST}/updates/{version}")
+pub fn details_url(pending: &PendingUpdate) -> String {
+    pending
+        .release_notes
+        .as_ref()
+        .filter(|post| release_post_is_valid(post, &pending.version))
+        .map(|post| post.url.clone())
+        .or_else(|| {
+            release_slug(&pending.version)
+                .map(|slug| format!("https://{NOTES_HOST}/updates/{slug}/"))
+        })
+        .unwrap_or_else(|| format!("https://{NOTES_HOST}/updates/"))
 }
 
 fn finish_install(runtime: &Arc<Mutex<UpdateRuntime>>, outcome: UpdateInstallOutcome, hwnd: usize) {
@@ -369,6 +379,19 @@ fn check_is_due(settings: &UpdateCheckSettings, now: i64) -> bool {
     {
         return false;
     }
+    if settings
+        .pending
+        .as_ref()
+        .and_then(|pending| {
+            pending
+                .release_notes
+                .as_ref()
+                .map(|post| !release_post_is_valid(post, &pending.version))
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
     settings
         .last_successful_check_unix_seconds
         .is_none_or(|last| now.saturating_sub(last) >= WEEK_SECONDS)
@@ -400,27 +423,120 @@ fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
     parse(left).cmp(&parse(right))
 }
 
-fn fetch_release_notes(version: &str) -> Option<ReleaseNotes> {
-    let bytes = fetch_https(&format!("/updates/{version}.json"))?;
-    let notes: ReleaseNotes = serde_json::from_slice(&bytes).ok()?;
-    normalize_release_notes(notes, version)
+fn fetch_release_notes(version: &str) -> Option<ReleasePost> {
+    let slug = release_slug(version)?;
+    let path = format!(
+        "/wp-json/wp/v2/posts?slug={slug}&_fields=slug,status,link,title,excerpt,categories"
+    );
+    let bytes = fetch_https(&path)?;
+    normalize_wordpress_response(&bytes, version, &slug)
 }
 
-fn normalize_release_notes(mut notes: ReleaseNotes, version: &str) -> Option<ReleaseNotes> {
-    if notes.version != version || notes.title.trim().is_empty() {
+#[derive(Deserialize)]
+struct WordpressRendered {
+    rendered: String,
+}
+
+#[derive(Deserialize)]
+struct WordpressPost {
+    slug: String,
+    status: String,
+    link: String,
+    title: WordpressRendered,
+    excerpt: WordpressRendered,
+    #[allow(dead_code)]
+    categories: Vec<u64>,
+}
+
+fn normalize_wordpress_response(bytes: &[u8], version: &str, slug: &str) -> Option<ReleasePost> {
+    let mut posts: Vec<WordpressPost> = serde_json::from_slice(bytes).ok()?;
+    if posts.len() != 1 {
         return None;
     }
-    notes.title = notes.title.trim().chars().take(120).collect();
-    notes.highlights = notes
-        .highlights
-        .into_iter()
-        .filter_map(|highlight| {
-            let trimmed = highlight.trim();
-            (!trimmed.is_empty()).then(|| trimmed.chars().take(180).collect::<String>())
-        })
-        .take(3)
-        .collect();
-    Some(notes)
+    let post = posts.pop()?;
+    let expected_url = format!("https://{NOTES_HOST}/updates/{slug}/");
+    if post.slug != slug || post.status != "publish" || post.link != expected_url {
+        return None;
+    }
+    let title = truncate_at_word_boundary(&plain_wordpress_text(&post.title.rendered), 120);
+    let summary = truncate_at_word_boundary(&plain_wordpress_text(&post.excerpt.rendered), 320);
+    let release = ReleasePost {
+        version: version.to_string(),
+        title,
+        summary,
+        url: expected_url,
+    };
+    release_post_is_valid(&release, version).then_some(release)
+}
+
+fn release_slug(version: &str) -> Option<String> {
+    let parts = version
+        .split('.')
+        .map(str::parse::<u16>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    (parts.len() == 4).then(|| format!("v{}-{}-{}-{}", parts[0], parts[1], parts[2], parts[3]))
+}
+
+fn release_post_is_valid(post: &ReleasePost, version: &str) -> bool {
+    let Some(slug) = release_slug(version) else {
+        return false;
+    };
+    post.version == version
+        && !post.title.trim().is_empty()
+        && !post.summary.trim().is_empty()
+        && post.url == format!("https://{NOTES_HOST}/updates/{slug}/")
+}
+
+fn plain_wordpress_text(value: &str) -> String {
+    let mut without_markup = String::with_capacity(value.len());
+    let mut inside_tag = false;
+    for character in value.chars() {
+        match character {
+            '<' => inside_tag = true,
+            '>' if inside_tag => {
+                inside_tag = false;
+                without_markup.push(' ');
+            }
+            _ if !inside_tag => without_markup.push(character),
+            _ => {}
+        }
+    }
+    let decoded = without_markup
+        .replace("&amp;", "&")
+        .replace("&#038;", "&")
+        .replace("&#38;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&hellip;", "...")
+        .replace("&ndash;", "-")
+        .replace("&mdash;", "-");
+    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_at_word_boundary(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        return value.trim().to_string();
+    }
+    let clipped: String = value.chars().take(maximum + 1).collect();
+    let boundary = clipped
+        .char_indices()
+        .take_while(|(index, _)| *index <= maximum)
+        .filter_map(|(index, character)| character.is_whitespace().then_some(index))
+        .last()
+        .unwrap_or_else(|| {
+            clipped
+                .char_indices()
+                .nth(maximum)
+                .map(|(index, _)| index)
+                .unwrap_or(clipped.len())
+        });
+    format!("{}...", clipped[..boundary].trim_end())
 }
 
 fn fetch_https(path: &str) -> Option<Vec<u8>> {
@@ -555,28 +671,75 @@ mod tests {
     }
 
     #[test]
-    fn notes_require_the_store_version_and_keep_only_three_highlights() {
-        let notes = ReleaseNotes {
-            version: "1.0.2.0".to_string(),
-            title: "  Ready for launch  ".to_string(),
-            highlights: vec![
-                " First ".to_string(),
-                "Second".to_string(),
-                "Third".to_string(),
-                "Fourth".to_string(),
-            ],
+    fn release_versions_convert_to_wordpress_slugs() {
+        assert_eq!(release_slug("1.0.2.0").as_deref(), Some("v1-0-2-0"));
+        assert!(release_slug("1.0.2").is_none());
+        assert!(release_slug("1.0.x.0").is_none());
+    }
+
+    #[test]
+    fn wordpress_post_is_sanitized_and_validated() {
+        let response = br#"[{
+            "slug":"v1-0-2-0",
+            "status":"publish",
+            "link":"https://screencapn.com/updates/v1-0-2-0/",
+            "title":{"rendered":"A &amp; sharper capture"},
+            "excerpt":{"rendered":"<p>Faster controls &mdash; and calmer capture.</p>"},
+            "categories":[12]
+        }]"#;
+        let post = normalize_wordpress_response(response, "1.0.2.0", "v1-0-2-0").unwrap();
+        assert_eq!(post.title, "A & sharper capture");
+        assert_eq!(post.summary, "Faster controls - and calmer capture.");
+        assert_eq!(post.url, "https://screencapn.com/updates/v1-0-2-0/");
+    }
+
+    #[test]
+    fn wordpress_post_rejects_duplicates_and_noncanonical_links() {
+        let duplicate = br#"[{},{}]"#;
+        assert!(normalize_wordpress_response(duplicate, "1.0.2.0", "v1-0-2-0").is_none());
+        let wrong_link = br#"[{
+            "slug":"v1-0-2-0","status":"publish",
+            "link":"https://example.com/updates/v1-0-2-0/",
+            "title":{"rendered":"Title"},"excerpt":{"rendered":"Summary"},
+            "categories":[]
+        }]"#;
+        assert!(normalize_wordpress_response(wrong_link, "1.0.2.0", "v1-0-2-0").is_none());
+    }
+
+    #[test]
+    fn wordpress_summary_is_bounded_at_a_word_boundary() {
+        let long_summary = "captain ".repeat(80);
+        let response = format!(
+            r#"[{{
+                "slug":"v1-0-2-0","status":"publish",
+                "link":"https://screencapn.com/updates/v1-0-2-0/",
+                "title":{{"rendered":"Release"}},
+                "excerpt":{{"rendered":"<p>{long_summary}</p>"}},
+                "categories":[]
+            }}]"#
+        );
+        let post =
+            normalize_wordpress_response(response.as_bytes(), "1.0.2.0", "v1-0-2-0").unwrap();
+        assert!(post.summary.chars().count() <= 323);
+        assert!(post.summary.ends_with("..."));
+        assert!(!post.summary.contains("captai..."));
+    }
+
+    #[test]
+    fn incomplete_legacy_post_forces_a_refresh() {
+        let settings = UpdateCheckSettings {
+            last_successful_check_unix_seconds: Some(100),
+            pending: Some(PendingUpdate {
+                version: "1.0.2.0".to_string(),
+                release_notes: Some(ReleasePost {
+                    version: "1.0.2.0".to_string(),
+                    title: "Legacy".to_string(),
+                    summary: String::new(),
+                    url: String::new(),
+                }),
+            }),
+            ..Default::default()
         };
-        let normalized = normalize_release_notes(notes, "1.0.2.0").unwrap();
-        assert_eq!(normalized.title, "Ready for launch");
-        assert_eq!(normalized.highlights, ["First", "Second", "Third"]);
-        assert!(normalize_release_notes(
-            ReleaseNotes {
-                version: "1.0.1.0".to_string(),
-                title: "Wrong version".to_string(),
-                highlights: vec![],
-            },
-            "1.0.2.0",
-        )
-        .is_none());
+        assert!(check_is_due(&settings, 101));
     }
 }

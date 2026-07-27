@@ -1,8 +1,12 @@
-use screencaptn_core::Rect;
+use screencaptn_core::{Color, Rect};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{
+    FOLDERID_Pictures, FOLDERID_Screenshots, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -12,6 +16,11 @@ pub struct AppSettings {
     pub update_check: UpdateCheckSettings,
     pub aspect_ratio: AspectRatioMode,
     pub locked_regions: Vec<LockedRegion>,
+    pub onboarding: OnboardingSettings,
+    pub diagnostics: DiagnosticsSettings,
+    pub color_defaults: ColorDefaultsSettings,
+    pub show_capture_tips: bool,
+    pub tip_rotation: TipRotationSettings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,6 +43,41 @@ pub struct AutoSaveSettings {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+pub struct OnboardingSettings {
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DiagnosticsSettings {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ColorDefaultsSettings {
+    pub annotation: RgbDto,
+    pub highlighter: RgbDto,
+    pub watermark: RgbDto,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RgbDto {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TipRotationSettings {
+    pub remaining_ids: Vec<String>,
+    pub last_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct UpdateCheckSettings {
     pub last_successful_check_unix_seconds: Option<i64>,
     pub retry_after_unix_seconds: Option<i64>,
@@ -44,15 +88,16 @@ pub struct UpdateCheckSettings {
 #[serde(rename_all = "camelCase")]
 pub struct PendingUpdate {
     pub version: String,
-    pub release_notes: Option<ReleaseNotes>,
+    pub release_notes: Option<ReleasePost>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReleaseNotes {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ReleasePost {
     pub version: String,
     pub title: String,
-    pub highlights: Vec<String>,
+    pub summary: String,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,9 +107,10 @@ pub struct LockedRegion {
     pub rect: RectDto,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AspectRatioMode {
+    #[default]
     Custom,
     Ratio9x16,
     Ratio16x9,
@@ -89,6 +135,11 @@ impl Default for AppSettings {
             update_check: UpdateCheckSettings::default(),
             aspect_ratio: AspectRatioMode::Custom,
             locked_regions: Vec::new(),
+            onboarding: OnboardingSettings::default(),
+            diagnostics: DiagnosticsSettings::default(),
+            color_defaults: ColorDefaultsSettings::default(),
+            show_capture_tips: true,
+            tip_rotation: TipRotationSettings::default(),
         }
     }
 }
@@ -115,9 +166,27 @@ impl Default for AutoSaveSettings {
     }
 }
 
-impl Default for AspectRatioMode {
+impl Default for ColorDefaultsSettings {
     fn default() -> Self {
-        Self::Custom
+        Self {
+            annotation: RgbDto::new(0xff, 0x3b, 0x30),
+            highlighter: RgbDto::new(0xff, 0xd6, 0x0a),
+            watermark: RgbDto::new(0xff, 0x3b, 0x30),
+        }
+    }
+}
+
+impl RgbDto {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    pub fn color(self) -> Color {
+        Color::rgb(self.r, self.g, self.b)
+    }
+
+    pub fn from_color(color: Color) -> Self {
+        Self::new(color.r, color.g, color.b)
     }
 }
 
@@ -213,14 +282,48 @@ impl RectDto {
     }
 }
 
-pub fn load_settings() -> AppSettings {
+pub struct LoadedSettings {
+    pub settings: AppSettings,
+    pub is_new_install: bool,
+}
+
+pub fn load_settings_state() -> LoadedSettings {
     let Ok(path) = settings_path() else {
-        return AppSettings::default();
+        return LoadedSettings {
+            settings: AppSettings::default(),
+            is_new_install: true,
+        };
     };
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<AppSettings>(&contents).ok())
-        .unwrap_or_default()
+    let is_new_install = !path.exists();
+    let contents = fs::read_to_string(&path).ok();
+    let had_onboarding_field = contents
+        .as_deref()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| object.contains_key("onboarding"))
+        })
+        .unwrap_or(false);
+    let mut settings = contents
+        .as_deref()
+        .and_then(|contents| serde_json::from_str::<AppSettings>(contents).ok())
+        .unwrap_or_default();
+
+    // A settings file proves the app already ran. Older builds did not have
+    // onboarding state, so upgrades must never be mistaken for new installs.
+    if !is_new_install && !had_onboarding_field {
+        settings.onboarding.completed = true;
+    }
+
+    LoadedSettings {
+        settings,
+        is_new_install,
+    }
+}
+
+pub fn load_settings() -> AppSettings {
+    load_settings_state().settings
 }
 
 pub fn save_settings(settings: &AppSettings) -> io::Result<()> {
@@ -233,12 +336,32 @@ pub fn save_settings(settings: &AppSettings) -> io::Result<()> {
     fs::write(path, json)
 }
 
+pub fn update_settings(update: impl FnOnce(&mut AppSettings)) -> io::Result<AppSettings> {
+    let mut settings = load_settings();
+    update(&mut settings);
+    save_settings(&settings)?;
+    Ok(settings)
+}
+
 pub fn default_auto_save_folder() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join("Pictures")
-        .join("Screen Cap'n")
+    known_folder(FOLDERID_Screenshots)
+        .or_else(|| known_folder(FOLDERID_Pictures).map(|path| path.join("Screenshots")))
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+                .join("Pictures")
+                .join("Screenshots")
+        })
+}
+
+fn known_folder(folder_id: windows::core::GUID) -> Option<PathBuf> {
+    unsafe {
+        let path = SHGetKnownFolderPath(&folder_id, KF_FLAG_DEFAULT, None).ok()?;
+        let result = path.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(path.as_ptr().cast()));
+        result
+    }
 }
 
 fn settings_path() -> io::Result<PathBuf> {
@@ -313,5 +436,67 @@ mod tests {
             .update_check
             .last_successful_check_unix_seconds
             .is_none());
+        assert_eq!(
+            settings.color_defaults.highlighter,
+            RgbDto::new(0xff, 0xd6, 0x0a)
+        );
+    }
+
+    #[test]
+    fn legacy_release_notes_cache_deserializes_as_incomplete_post() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+                "updateCheck": {
+                    "pending": {
+                        "version": "1.0.2.0",
+                        "releaseNotes": {
+                            "version": "1.0.2.0",
+                            "title": "Legacy notes",
+                            "highlights": ["Old format"]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let post = settings
+            .update_check
+            .pending
+            .and_then(|pending| pending.release_notes)
+            .expect("legacy cache should remain readable");
+        assert_eq!(post.title, "Legacy notes");
+        assert!(post.summary.is_empty());
+        assert!(post.url.is_empty());
+    }
+
+    #[test]
+    fn color_defaults_are_independent_and_backward_compatible() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            settings.color_defaults.annotation.color(),
+            Color::rgb(0xff, 0x3b, 0x30)
+        );
+        assert_eq!(
+            settings.color_defaults.highlighter.color(),
+            Color::rgb(0xff, 0xd6, 0x0a)
+        );
+        assert_eq!(
+            settings.color_defaults.watermark.color(),
+            Color::rgb(0xff, 0x3b, 0x30)
+        );
+    }
+
+    #[test]
+    fn capture_tips_default_on_for_existing_settings() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+
+        assert!(settings.show_capture_tips);
+    }
+
+    #[test]
+    fn capture_tips_explicitly_disabled_remain_disabled() {
+        let settings: AppSettings = serde_json::from_str(r#"{"showCaptureTips": false}"#).unwrap();
+
+        assert!(!settings.show_capture_tips);
     }
 }

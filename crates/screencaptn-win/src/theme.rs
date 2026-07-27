@@ -1,6 +1,7 @@
 use screencaptn_core::Color;
 use std::fs;
 use std::path::PathBuf;
+use windows::UI::ViewManagement::{UIColorType, UISettings};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppTheme {
@@ -56,6 +57,18 @@ pub fn load_theme() -> AppTheme {
     };
     match fs::read_to_string(path).ok().as_deref().map(str::trim) {
         Some("dark") => AppTheme::Dark,
+        _ => AppTheme::Light,
+    }
+}
+
+pub fn windows_theme() -> AppTheme {
+    let background = UISettings::new()
+        .and_then(|settings| settings.GetColorValue(UIColorType::Background))
+        .ok();
+    match background {
+        Some(color) if u16::from(color.R) + u16::from(color.G) + u16::from(color.B) < 384 => {
+            AppTheme::Dark
+        }
         _ => AppTheme::Light,
     }
 }

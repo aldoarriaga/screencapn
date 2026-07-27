@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Lexical selection anchor property in the generated Web bundle"
+regexTarget = "match"
+regexes = ['''anchor\.key''']

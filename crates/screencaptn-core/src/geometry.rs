@@ -132,13 +132,38 @@ impl Rect {
             (ResizeHandle::West, Point::new(self.x, self.center().y)),
         ];
 
+        let radius_squared = radius.max(0.0).powi(2);
         handles
             .into_iter()
-            .find(|(_, handle_point)| {
-                (point.x - handle_point.x).abs() <= radius
-                    && (point.y - handle_point.y).abs() <= radius
+            .enumerate()
+            .filter_map(|(priority, (handle, handle_point))| {
+                let dx = point.x - handle_point.x;
+                let dy = point.y - handle_point.y;
+                let distance_squared = dx * dx + dy * dy;
+                (distance_squared <= radius_squared).then_some((
+                    distance_squared,
+                    resize_handle_priority(handle),
+                    priority,
+                    handle,
+                ))
             })
-            .map(|(handle, _)| handle)
+            .min_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.cmp(&right.2))
+            })
+            .map(|(_, _, _, handle)| handle)
+    }
+}
+
+fn resize_handle_priority(handle: ResizeHandle) -> u8 {
+    match handle {
+        ResizeHandle::NorthWest
+        | ResizeHandle::NorthEast
+        | ResizeHandle::SouthEast
+        | ResizeHandle::SouthWest => 0,
+        ResizeHandle::North | ResizeHandle::East | ResizeHandle::South | ResizeHandle::West => 1,
     }
 }
 
@@ -170,5 +195,37 @@ mod tests {
         let resized = rect.resize_from_handle(ResizeHandle::West, Point::new(500.0, 20.0), 24.0);
         assert_eq!(resized.width, 24.0);
         assert_eq!(resized.right(), rect.right());
+    }
+
+    #[test]
+    fn overlapping_handle_targets_choose_the_nearest_handle() {
+        let rect = Rect::new(10.0, 10.0, 24.0, 24.0);
+
+        assert_eq!(
+            rect.hit_resize_handle(Point::new(22.0, 11.0), 20.0),
+            Some(ResizeHandle::North)
+        );
+        assert_eq!(
+            rect.hit_resize_handle(Point::new(33.0, 22.0), 20.0),
+            Some(ResizeHandle::East)
+        );
+        assert_eq!(
+            rect.hit_resize_handle(Point::new(22.0, 33.0), 20.0),
+            Some(ResizeHandle::South)
+        );
+        assert_eq!(
+            rect.hit_resize_handle(Point::new(11.0, 22.0), 20.0),
+            Some(ResizeHandle::West)
+        );
+    }
+
+    #[test]
+    fn exact_handle_ties_prefer_corners() {
+        let rect = Rect::new(0.0, 0.0, 24.0, 24.0);
+
+        assert_eq!(
+            rect.hit_resize_handle(Point::new(6.0, 0.0), 20.0),
+            Some(ResizeHandle::NorthWest)
+        );
     }
 }

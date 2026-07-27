@@ -1,5 +1,5 @@
 use crate::overlay::AppTheme;
-use crate::settings::PendingUpdate;
+use crate::settings::{PendingUpdate, ReleasePost};
 use crate::theme::toolbar_palette;
 use crate::util::colorref;
 use screencaptn_core::{Color, Point, Rect};
@@ -71,10 +71,8 @@ pub fn show_update_dialog(
         );
         let width = window_rect.right - window_rect.left;
         let height = window_rect.bottom - window_rect.top;
-        let details_rect = pending
-            .release_notes
-            .as_ref()
-            .map(|_| Rect::new(40.0, 274.0, 124.0, 40.0));
+        let details_rect =
+            display_release_post(&pending).map(|_| Rect::new(40.0, 274.0, 124.0, 40.0));
         let mut state = Box::new(UpdateWindowState {
             theme,
             pending,
@@ -216,7 +214,7 @@ unsafe fn draw_update_window(hdc: HDC, state: &UpdateWindowState) {
         DT_LEFT | DT_SINGLELINE,
     );
 
-    if let Some(notes) = &state.pending.release_notes {
+    if let Some(notes) = display_release_post(&state.pending) {
         draw_text(
             hdc,
             Rect::new(40.0, 118.0, 440.0, 32.0),
@@ -226,19 +224,15 @@ unsafe fn draw_update_window(hdc: HDC, state: &UpdateWindowState) {
             true,
             DT_LEFT | DT_SINGLELINE,
         );
-        let mut y = 158.0;
-        for highlight in &notes.highlights {
-            draw_text(
-                hdc,
-                Rect::new(54.0, y, 416.0, 28.0),
-                &format!("- {highlight}"),
-                13,
-                palette.icon,
-                false,
-                DT_LEFT | DT_WORDBREAK,
-            );
-            y += 31.0;
-        }
+        draw_text(
+            hdc,
+            Rect::new(40.0, 158.0, 430.0, 88.0),
+            &notes.summary,
+            13,
+            palette.icon,
+            false,
+            DT_LEFT | DT_WORDBREAK,
+        );
     } else {
         draw_text(
             hdc,
@@ -274,6 +268,15 @@ unsafe fn draw_update_window(hdc: HDC, state: &UpdateWindowState) {
         palette.accent,
         Color::WHITE,
     );
+}
+
+fn display_release_post(pending: &PendingUpdate) -> Option<&ReleasePost> {
+    pending.release_notes.as_ref().filter(|post| {
+        post.version == pending.version
+            && !post.title.trim().is_empty()
+            && !post.summary.trim().is_empty()
+            && !post.url.trim().is_empty()
+    })
 }
 
 unsafe fn draw_button(hdc: HDC, rect: Rect, label: &str, background: Color, foreground: Color) {

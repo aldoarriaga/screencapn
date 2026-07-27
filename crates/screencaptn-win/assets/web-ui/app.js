@@ -84,6 +84,9 @@
   let pendingCommittedDiff = null;
   let textEditorSession = null;
   let textDraftTimer = null;
+  let captureTipHoverId = null;
+  let captureTipLabelTimer = null;
+  let captureTipRenderedId = null;
   const perf = {
     enabled: false,
     counters: new Map(),
@@ -95,7 +98,7 @@
     preview: true,
   };
 
-  const tools = [
+  const baseToolbarItems = [
     { action: "grip", width: 36, icon: "grip" },
     { action: "numbering", width: 24, icon: "numbering" },
     { tool: "rectangle", width: 36, icon: "rectangle" },
@@ -109,11 +112,18 @@
     { tool: "watermark", width: 36, icon: "watermark" },
     { tool: "mosaic", width: 36, icon: "mosaic" },
     { divider: true, width: 12 },
-    { action: "undo", width: 36, icon: "undo" },
-    { action: "copy", width: 36, icon: "copy" },
-    { action: "save", width: 36, icon: "save" },
-    { action: "cancel", width: 36, icon: "cancel" },
   ];
+
+  function toolbarItems() {
+    return [
+      ...baseToolbarItems,
+      { action: "undo", width: 36, icon: "undo" },
+      { action: "copy", width: 36, icon: "copy" },
+      { action: "save", width: 36, icon: "save" },
+      ...(state && state.updateAvailable ? [{ action: "update", width: 36, icon: "update", status: true }] : []),
+      { action: "cancel", width: 36, icon: "cancel" },
+    ];
+  }
 
   const colors = ["#FF3B30", "#0A84FF", "#FFD60A", "#00C853", "#BF5AF2"];
   const TOOL_HOVER_EFFECT = {
@@ -158,8 +168,6 @@
     return {
       x: point.x / s,
       y: point.y / s,
-      rawX: point.x,
-      rawY: point.y,
     };
   }
 
@@ -235,15 +243,24 @@
   }
 
   function currentFontSize() {
+    const fallback = renderStyle().fontDefaultSize || 27;
     const selected = selectedAnnotation();
     const kind = selected && selected.kind;
     if (state && state.activeSubmenu === "watermark") {
-      return state.watermarkFontSize || 27;
+      return state.watermarkFontSize || fallback;
     }
     if ((kind && kind.type === "text") || (kind && kind.type === "tag")) {
-      return kind.fontSize || state.fontSize || 27;
+      return kind.fontSize || state.fontSize || fallback;
     }
-    return state ? state.fontSize || 27 : 27;
+    return state ? state.fontSize || fallback : fallback;
+  }
+
+  function fontSliderRange(tool) {
+    const style = renderStyle();
+    return {
+      min: tool === "watermark" ? 8 : style.fontMinSize || 12,
+      max: style.fontMaxSize || 56,
+    };
   }
 
   function sliderAllowedForActiveTool(slider) {
@@ -266,10 +283,10 @@
     }
     const tool = state.activeSubmenu;
     if (tool === "watermark") {
-      return { kind: "font", min: 8, max: 56 };
+      return { kind: "font", ...fontSliderRange(tool) };
     }
     if (tool === "text" || tool === "tag") {
-      return { kind: "font", min: 27, max: 56 };
+      return { kind: "font", ...fontSliderRange(tool) };
     }
     if (["rectangle", "oval", "line", "arrow", "pen", "highlighter"].includes(tool)) {
       return { kind: "stroke", min: 1, max: 24 };
@@ -351,17 +368,22 @@
     return null;
   }
 
-  function colorAtSwatchPoint(point) {
+  function colorZoneAtSwatchPoint(point) {
     if (!point) {
       return null;
     }
     for (let i = colorSwatchHotzones.length - 1; i >= 0; i -= 1) {
       const zone = colorSwatchHotzones[i];
       if (pointInRect(point, zone.rect, 0)) {
-        return zone.color;
+        return zone;
       }
     }
     return null;
+  }
+
+  function colorAtSwatchPoint(point) {
+    const zone = colorZoneAtSwatchPoint(point);
+    return zone ? zone.color : null;
   }
 
   function selectedAnnotation() {
@@ -663,6 +685,8 @@
       uiScale: value.uiScale,
       captureRegion: value.captureRegion,
       toolbar: value.toolbar,
+      updateAvailable: value.updateAvailable,
+      activeTip: value.activeTip,
       regionControls: value.regionControls,
       currentStroke: value.currentStroke,
       fontSize: value.fontSize,
@@ -698,6 +722,8 @@
       editingTextId: value.editingTextId,
       editingTextCaret: value.editingTextCaret,
       editingStepNumberId: value.editingStepNumberId,
+      editingStepNumberBuffer: value.editingStepNumberBuffer,
+      editingStepNumberSelectAll: value.editingStepNumberSelectAll,
       viewportScale: viewportScaleFor(value),
       uiScale: value.uiScale,
     });
@@ -1257,6 +1283,7 @@
       drawRegionResizeHandles();
       drawToolbar(rect);
       drawSubmenu(rect);
+      drawCaptureTip(rect);
       uiLayer.batchDraw();
     }
     syncTextEditorOverlay();
@@ -1302,9 +1329,10 @@
     drawGradientBorder(group, 0.5, 0.5, rect.width - 1, rect.height - 1, radius, p, s);
 
     let x = 0;
-    for (const item of tools) {
+    for (const item of toolbarItems()) {
       const w = item.width * s;
       let hoverEffect = null;
+      let tooltipEffect = null;
       if (item.divider) {
         group.add(new Konva.Line({ points: [x + w / 2, 8 * s, x + w / 2, rect.height - 8 * s], stroke: p.separator, strokeWidth: Math.max(1, 1 * s), name: "ui" }));
         x += w;
@@ -1366,8 +1394,64 @@
         });
         button.on("mouseenter", () => (container.style.cursor = "grab"));
       } else {
-        const iconSize = 24 * s;
-        hoverEffect = drawHoverableToolbarIcon(button, item.icon, (w - iconSize) / 2, (rect.height - iconSize) / 2, iconSize, p.icon, activeColor(), selected, s);
+        const iconSize = (item.status ? 26.4 : 24) * s;
+        hoverEffect = drawHoverableToolbarIcon(
+          button,
+          item.icon,
+          (w - iconSize) / 2,
+          (rect.height - iconSize) / 2,
+          iconSize,
+          item.status ? "#C85750" : p.icon,
+          item.status ? "#FF3B30" : activeColor(),
+          selected,
+          s
+        );
+        if (item.status && item.action === "update") {
+          const halo = new Konva.Circle({
+            x: w / 2,
+            y: rect.height - 4.5 * s,
+            radius: 4.2 * s,
+            fill: "#FF3B30",
+            opacity: 0,
+            listening: false,
+            name: "ui",
+          });
+          const dot = new Konva.Circle({
+            x: w / 2,
+            y: rect.height - 4.5 * s,
+            radius: 1.8 * s,
+            fill: "#FF3B30",
+            listening: false,
+            name: "ui",
+          });
+          button.add(halo);
+          button.add(dot);
+          tooltipEffect = createToolbarTooltip(
+            group,
+            x + w / 2,
+            rect,
+            "Update available",
+            p,
+            s
+          );
+          const baseHover = hoverEffect;
+          hoverEffect = {
+            enter() {
+              if (baseHover) {
+                baseHover.enter();
+              }
+              halo.to({ opacity: 0.56, scaleX: 1.45, scaleY: 1.45, duration: 0.12 });
+              dot.to({ scaleX: 1.16, scaleY: 1.16, duration: 0.12 });
+            },
+            leave() {
+              if (baseHover) {
+                baseHover.leave();
+              }
+              halo.to({ opacity: 0, scaleX: 1, scaleY: 1, duration: 0.16 });
+              dot.to({ scaleX: 1, scaleY: 1, duration: 0.16 });
+            },
+          };
+        }
         if (item.tool) {
           button.on("click tap", () => {
             if (textEditorSession) {
@@ -1390,14 +1474,314 @@
         if (hoverEffect) {
           hoverEffect.enter();
         }
+        if (tooltipEffect) {
+          tooltipEffect.enter();
+        }
       });
       button.on("mouseleave", () => {
         if (hoverEffect) {
           hoverEffect.leave();
         }
+        if (tooltipEffect) {
+          tooltipEffect.leave();
+        }
         updateDefaultCursor();
       });
       x += w;
+    }
+  }
+
+  function createToolbarTooltip(group, centerX, toolbar, text, p, s) {
+    let timer = null;
+    const below = toolbar.y + toolbar.height + 34 * s <= window.innerHeight;
+    const label = new Konva.Label({
+      x: centerX,
+      y: below ? toolbar.height + 7 * s : -7 * s,
+      opacity: 0,
+      visible: false,
+      listening: false,
+      name: "ui",
+    });
+    label.add(
+      new Konva.Tag({
+        fill: p.bg,
+        stroke: p.separator,
+        strokeWidth: Math.max(1, s),
+        cornerRadius: 4 * s,
+        pointerDirection: below ? "up" : "down",
+        pointerWidth: 7 * s,
+        pointerHeight: 4 * s,
+        shadowColor: "rgba(0,0,0,0.28)",
+        shadowBlur: 8 * s,
+        shadowOffsetY: 3 * s,
+      })
+    );
+    label.add(
+      new Konva.Text({
+        text,
+        fill: p.icon,
+        fontFamily: "Segoe UI Variable, Segoe UI, sans-serif",
+        fontSize: 11 * s,
+        padding: 7 * s,
+      })
+    );
+    group.add(label);
+    return {
+      enter() {
+        window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          label.visible(true);
+          label.opacity(1);
+          uiLayer.batchDraw();
+        }, 450);
+      },
+      leave() {
+        window.clearTimeout(timer);
+        label.opacity(0);
+        label.visible(false);
+        uiLayer.batchDraw();
+      },
+    };
+  }
+
+  function captureTipSegments(text) {
+    const segments = [];
+    let start = 0;
+    let shortcut = false;
+    const value = String(text || "");
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value[index];
+      if ((character === "{" && !shortcut) || (character === "}" && shortcut)) {
+        if (start < index) {
+          segments.push({ text: value.slice(start, index), shortcut });
+        }
+        shortcut = character === "{";
+        start = index + 1;
+      }
+    }
+    if (start < value.length) {
+      segments.push({ text: value.slice(start), shortcut });
+    }
+    return segments;
+  }
+
+  function drawCaptureTip(toolbar) {
+    const tip = state && state.activeTip;
+    window.clearTimeout(captureTipLabelTimer);
+    captureTipLabelTimer = null;
+    if (!tip || !toolbar) {
+      captureTipHoverId = null;
+      captureTipRenderedId = null;
+      return;
+    }
+
+    const s = scale();
+    const fontSize = Math.max(10, 11.5 * s);
+    const iconSize = 18.7 * s;
+    const horizontalPadding = 12 * s;
+    const gap = 7 * s;
+    const height = 34 * s;
+    const margin = 8 * s;
+    const segments = captureTipSegments(tip.text);
+    const segmentWidths = segments.map((segment) => measureTextWidth(segment.text, fontSize, false));
+    const textWidth = segmentWidths.reduce((sum, width) => sum + width, 0);
+    const width = Math.max(
+      120 * s,
+      Math.min(horizontalPadding * 2 + iconSize + gap + textWidth, window.innerWidth - margin * 2)
+    );
+    const centerX = toolbar.x + toolbar.width / 2;
+    const belowOffset = state.activeSubmenu ? 64 * s : margin;
+    const preferredY = toolbar.y + toolbar.height + belowOffset;
+    const below = preferredY + height + margin <= window.innerHeight;
+    const y = below ? preferredY : Math.max(margin, toolbar.y - height - margin);
+    const x = Math.max(margin, Math.min(centerX - width / 2, window.innerWidth - width - margin));
+    const isNewTip = captureTipRenderedId !== tip.id;
+    captureTipRenderedId = tip.id;
+
+    const group = new Konva.Group({
+      x,
+      y,
+      opacity: isNewTip ? 0 : 1,
+      name: "ui",
+    });
+    uiLayer.add(group);
+    group.add(
+      new Konva.Rect({
+        x: 0,
+        y: 0,
+        width,
+        height,
+        cornerRadius: height / 2,
+        fillLinearGradientStartPoint: { x: 0, y: 0 },
+        fillLinearGradientEndPoint: { x: width, y: 0 },
+        fillLinearGradientColorStops: [
+          0,
+          "rgba(0,0,0,0.70)",
+          1,
+          "rgba(51,51,51,0.70)",
+        ],
+        name: "ui",
+      })
+    );
+
+    const iconX = horizontalPadding;
+    const iconY = (height - iconSize) / 2;
+    const iconGroup = new Konva.Group({ x: iconX, y: iconY, name: "ui" });
+    group.add(iconGroup);
+    iconGroup.add(
+      new Konva.Rect({
+        x: -4 * s,
+        y: -4 * s,
+        width: iconSize + 8 * s,
+        height: iconSize + 8 * s,
+        fill: "rgba(0,0,0,0)",
+        name: "ui",
+      })
+    );
+    const tipIcon = drawIcon(iconGroup, "captureTip", 0, 0, iconSize, "#FFFFFF", 0.94);
+    const checkboxSize = 11.5 * s;
+    const checkboxX = (iconSize - checkboxSize) / 2;
+    const checkboxY = (iconSize - checkboxSize) / 2;
+    const checkbox = new Konva.Rect({
+      x: checkboxX,
+      y: checkboxY,
+      width: checkboxSize,
+      height: checkboxSize,
+      cornerRadius: 2 * s,
+      stroke: "#FFFFFF",
+      strokeWidth: Math.max(1, 1.15 * s),
+      opacity: 0.92,
+      visible: captureTipHoverId === tip.id,
+      name: "ui",
+    });
+    const checkmark = new Konva.Line({
+      points: [
+        checkboxX + checkboxSize * 0.18,
+        checkboxY + checkboxSize * 0.52,
+        checkboxX + checkboxSize * 0.42,
+        checkboxY + checkboxSize * 0.74,
+        checkboxX + checkboxSize * 0.82,
+        checkboxY + checkboxSize * 0.27,
+      ],
+      stroke: "#FFFFFF",
+      strokeWidth: Math.max(1.1, 1.35 * s),
+      lineCap: "round",
+      lineJoin: "round",
+      visible: captureTipHoverId === tip.id,
+      name: "ui",
+    });
+    iconGroup.add(checkbox);
+    iconGroup.add(checkmark);
+    if (tipIcon) {
+      tipIcon.opacity(captureTipHoverId === tip.id ? 0 : 0.94);
+    }
+
+    let textX = iconX + iconSize + gap;
+    const textY = (height - fontSize * 1.28) / 2;
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index];
+      group.add(
+        new Konva.Text({
+          x: textX,
+          y: textY,
+          text: segment.text,
+          fill: "#FFFFFF",
+          opacity: 0.96,
+          fontFamily: "Segoe UI Variable, Segoe UI, sans-serif",
+          fontSize,
+          textDecoration: segment.shortcut ? "underline" : "",
+          listening: false,
+          name: "ui",
+        })
+      );
+      textX += segmentWidths[index];
+    }
+
+    const label = new Konva.Label({
+      x: iconX + iconSize / 2,
+      y: below ? -5 * s : height + 5 * s,
+      opacity: 0,
+      visible: false,
+      listening: false,
+      name: "ui",
+    });
+    label.add(
+      new Konva.Tag({
+        fill: palette().bg,
+        stroke: palette().separator,
+        strokeWidth: Math.max(1, s),
+        cornerRadius: 4 * s,
+        pointerDirection: below ? "down" : "up",
+        pointerWidth: 7 * s,
+        pointerHeight: 4 * s,
+        shadowColor: "rgba(0,0,0,0.28)",
+        shadowBlur: 8 * s,
+        shadowOffsetY: 3 * s,
+      })
+    );
+    label.add(
+      new Konva.Text({
+        text: "Click to hide tips",
+        fill: palette().icon,
+        fontFamily: "Segoe UI Variable, Segoe UI, sans-serif",
+        fontSize: 11 * s,
+        padding: 7 * s,
+      })
+    );
+    group.add(label);
+
+    const setHovered = (hovered) => {
+      const changed = hovered !== (captureTipHoverId === tip.id);
+      captureTipHoverId = hovered ? tip.id : null;
+      if (tipIcon) {
+        tipIcon.opacity(hovered ? 0 : 0.94);
+      }
+      checkbox.visible(hovered);
+      checkmark.visible(hovered);
+      window.clearTimeout(captureTipLabelTimer);
+      captureTipLabelTimer = null;
+      label.opacity(0);
+      label.visible(false);
+      if (hovered) {
+        captureTipLabelTimer = window.setTimeout(() => {
+          label.visible(true);
+          label.opacity(1);
+          uiLayer.batchDraw();
+        }, 450);
+      }
+      if (changed) {
+        command("setTipHovered", { hovered });
+      }
+      uiLayer.batchDraw();
+    };
+
+    group.on("mouseenter", () => {
+      container.style.cursor = "default";
+      setHovered(true);
+    });
+    group.on("mouseleave", () => {
+      setHovered(false);
+      updateDefaultCursor();
+    });
+    iconGroup.on("mouseenter", () => {
+      container.style.cursor = "pointer";
+    });
+    iconGroup.on("click tap", (event) => {
+      event.cancelBubble = true;
+      window.clearTimeout(captureTipLabelTimer);
+      captureTipLabelTimer = null;
+      captureTipHoverId = null;
+      group.destroy();
+      uiLayer.batchDraw();
+      command("hideCaptureTips");
+    });
+
+    if (isNewTip) {
+      group.to({
+        opacity: 1,
+        duration: 0.18,
+        easing: Konva.Easings.EaseInOut,
+      });
     }
   }
 
@@ -1415,7 +1799,15 @@
     const dividerHeight = 22 * s;
     const controlsWidth = lockIconSize + ratioIconSize + gap * 2;
     const left = Math.max(6 * s, Math.min(region.x + region.width / 2 - controlsWidth / 2, window.innerWidth - controlsWidth - 6 * s));
-    const top = Math.max(8 * s, Math.min(region.y + margin, window.innerHeight - iconSize - 8 * s));
+    const needsOutside = region.width < controlsWidth + 48 * s || region.height < iconSize + margin * 2 + 36 * s;
+    const outsideAbove = region.y - iconSize - 14 * s;
+    const outsideBelow = region.y + region.height + 14 * s;
+    const preferredTop = needsOutside
+      ? outsideAbove >= 8 * s
+        ? outsideAbove
+        : outsideBelow
+      : region.y + margin;
+    const top = Math.max(8 * s, Math.min(preferredTop, window.innerHeight - iconSize - 8 * s));
     const lockName = state.regionControls && state.regionControls.locked ? "regionLocked" : "regionUnlocked";
     const ratioName = ratioIconName(state.regionControls && state.regionControls.aspectRatio);
     const normal = "#FFFFFF";
@@ -1524,33 +1916,13 @@
     const s = scale();
     const size = Math.max(5, 4.5 * s);
     const half = size / 2;
-    const hitPad = 13 * s;
-    const handles = [
-      { key: "nw", cursor: "nwse-resize", x: region.x, y: region.y },
-      { key: "n", cursor: "ns-resize", x: region.x + region.width / 2, y: region.y },
-      { key: "ne", cursor: "nesw-resize", x: region.x + region.width, y: region.y },
-      { key: "e", cursor: "ew-resize", x: region.x + region.width, y: region.y + region.height / 2 },
-      { key: "se", cursor: "nwse-resize", x: region.x + region.width, y: region.y + region.height },
-      { key: "s", cursor: "ns-resize", x: region.x + region.width / 2, y: region.y + region.height },
-      { key: "sw", cursor: "nesw-resize", x: region.x, y: region.y + region.height },
-      { key: "w", cursor: "ew-resize", x: region.x, y: region.y + region.height / 2 },
-    ];
+    const handles = regionResizeHandles(region);
     handles.forEach((handle) => {
       const x = Math.max(half, Math.min(window.innerWidth - half, handle.x));
       const y = Math.max(half, Math.min(window.innerHeight - half, handle.y));
-      const group = new Konva.Group({ x: x - half, y: y - half, name: "ui" });
-      uiLayer.add(group);
-      group.add(new Konva.Rect({
-        x: -hitPad,
-        y: -hitPad,
-        width: size + hitPad * 2,
-        height: size + hitPad * 2,
-        fill: "rgba(0,0,0,0)",
-        name: "ui",
-      }));
-      group.add(new Konva.Rect({
-        x: 0,
-        y: 0,
+      uiLayer.add(new Konva.Rect({
+        x: x - half,
+        y: y - half,
         width: size,
         height: size,
         fill: "#FF3B30",
@@ -1561,29 +1933,34 @@
         shadowBlur: 10 * s,
         shadowOpacity: 0.58,
         name: "ui",
+        listening: false,
       }));
-      group.on("mouseenter", () => {
-        container.style.cursor = handle.cursor;
-      });
-      group.on("mouseleave", updateDefaultCursor);
-      group.on("mousedown touchstart", (evt) => {
-        evt.cancelBubble = true;
-        captureBrowserPointer(evt);
-        const point = pointerPosition() || { x, y };
-        regionResizeDrag = true;
-        if (state.regionControls && state.regionControls.aspectRatio !== "custom" && !isCornerRegionHandle(handle.key)) {
-          state = {
-            ...state,
-            regionControls: {
-              ...state.regionControls,
-              aspectRatio: "custom",
-            },
-          };
-          scheduleRender(state, { ui: true });
-        }
-        command("pointerDown", cssToPhysicalPoint(point));
-      });
     });
+  }
+
+  function regionResizeHandles(region) {
+    return [
+      { key: "nw", cursor: "nwse-resize", x: region.x, y: region.y, priority: 0 },
+      { key: "n", cursor: "ns-resize", x: region.x + region.width / 2, y: region.y, priority: 1 },
+      { key: "ne", cursor: "nesw-resize", x: region.x + region.width, y: region.y, priority: 0 },
+      { key: "e", cursor: "ew-resize", x: region.x + region.width, y: region.y + region.height / 2, priority: 1 },
+      { key: "se", cursor: "nwse-resize", x: region.x + region.width, y: region.y + region.height, priority: 0 },
+      { key: "s", cursor: "ns-resize", x: region.x + region.width / 2, y: region.y + region.height, priority: 1 },
+      { key: "sw", cursor: "nesw-resize", x: region.x, y: region.y + region.height, priority: 0 },
+      { key: "w", cursor: "ew-resize", x: region.x, y: region.y + region.height / 2, priority: 1 },
+    ];
+  }
+
+  function regionResizeHandleAtPoint(point) {
+    if (!state || !state.captureRegion || !point) {
+      return null;
+    }
+    const region = physicalToCssRect(state.captureRegion);
+    const radius = Math.max(12, physicalScalar(renderStyle().regionHandleHitRadius || 20));
+    return regionResizeHandles(region)
+      .map((handle, order) => ({ ...handle, order, distance: Math.hypot(point.x - handle.x, point.y - handle.y) }))
+      .filter((handle) => handle.distance <= radius)
+      .sort((left, right) => left.distance - right.distance || left.priority - right.priority || left.order - right.order)[0] || null;
   }
 
   function hasUserAnnotations() {
@@ -1983,13 +2360,15 @@
         command("setTextFilled", { filled: true });
       }, p, s);
       x = drawDivider(group, x, p, s);
-      x = drawSlider(group, x, 0, "font", 27, 56, currentFontSize(), p, s);
+      const range = fontSliderRange(tool);
+      x = drawSlider(group, x, 0, "font", range.min, range.max, currentFontSize(), p, s);
       x = drawDivider(group, x, p, s);
       x = drawColors(group, x, p, s);
     } else if (tool === "tag") {
       x = drawSlider(group, x, 0, "stroke", 6, 24, Math.max(6, currentWidth()), p, s);
       x = drawDivider(group, x, p, s);
-      x = drawSlider(group, x, 0, "font", 27, 56, currentFontSize(), p, s);
+      const range = fontSliderRange(tool);
+      x = drawSlider(group, x, 0, "font", range.min, range.max, currentFontSize(), p, s);
       x = drawDivider(group, x, p, s);
       x = drawColors(group, x, p, s);
     } else if (tool === "watermark") {
@@ -2001,7 +2380,8 @@
         command("clearWatermark");
       }, p, s);
       x = drawDivider(group, x, p, s);
-      x = drawSlider(group, x, 0, "font", 8, 56, currentFontSize(), p, s);
+      const range = fontSliderRange(tool);
+      x = drawSlider(group, x, 0, "font", range.min, range.max, currentFontSize(), p, s);
       positionWatermarkInput(layout.x + x, layout.y + 3 * s, 122 * s, 18 * s);
       x += 132 * s;
       x = drawDivider(group, x, p, s);
@@ -2023,6 +2403,37 @@
         applyLocalColor(color);
       }
       command("setColor", { color, ...cssToPhysicalPoint(point) });
+    });
+    group.on("dblclick dbltap", (evt) => {
+      const point = stagePointFromKonvaEvent(evt);
+      const zone = colorZoneAtSwatchPoint(point);
+      evt.cancelBubble = true;
+      if (evt.evt && evt.evt.preventDefault) {
+        evt.evt.preventDefault();
+      }
+      if (!zone) {
+        return;
+      }
+      zone.node.to({
+        scaleX: 1.22,
+        scaleY: 1.22,
+        shadowColor: "#FF3B30",
+        shadowBlur: 10 * s,
+        shadowOpacity: 0.75,
+        duration: 0.11,
+        easing: Konva.Easings.EaseOut,
+        onFinish: () => {
+          zone.node.to({
+            scaleX: 1,
+            scaleY: 1,
+            shadowBlur: 0,
+            shadowOpacity: 0,
+            duration: 0.14,
+            easing: Konva.Easings.EaseInOut,
+          });
+        },
+      });
+      command("setDefaultColor", { color: zone.color });
     });
   }
 
@@ -2068,7 +2479,7 @@
 
   function toolbarButtonCenter(toolbar, tool) {
     let x = toolbar.x;
-    for (const item of tools) {
+    for (const item of toolbarItems()) {
       const w = item.width * scale();
       if (item.tool === tool || ((tool === "numbering" || tool === "step") && item.action === "numbering")) {
         return x + w / 2;
@@ -2110,7 +2521,11 @@
       const swatch = new Konva.Rect({ x: 0, y: 0, width: box, height: box, cornerRadius: 1.5 * s, fill: color, stroke: selected ? p.swatchBorder : null, strokeWidth: selected ? 3 : 0, name: "ui" });
       hit.add(swatch);
       const swatchOrigin = swatch.getAbsolutePosition();
-      colorSwatchHotzones.push({ color, rect: { x: swatchOrigin.x, y: swatchOrigin.y, width: box, height: box } });
+      colorSwatchHotzones.push({
+        color,
+        node: swatch,
+        rect: { x: swatchOrigin.x, y: swatchOrigin.y, width: box, height: box },
+      });
       swatch.on("mouseenter", () => (container.style.cursor = "pointer"));
       swatch.on("mouseleave", updateDefaultCursor);
       x += 21 * s;
@@ -2244,18 +2659,30 @@
     return null;
   }
 
+  function selectedAnnotationAtPoint(point) {
+    const selected = selectedAnnotation();
+    return selected && annotationContainsPoint(selected, point) ? selected : null;
+  }
+
   function selectedHandleAtPoint(point) {
     const annotation = selectedAnnotation();
     if (!annotation || !point) {
       return null;
     }
     const kind = annotation.kind || {};
-    const hit = Math.max(12, physicalScalar(26));
-    const near = (candidate) => Math.abs(point.x - candidate.x) <= hit && Math.abs(point.y - candidate.y) <= hit;
+    const hit = Math.max(12, physicalScalar(renderStyle().annotationHandleHitRadius || 26));
+    const nearest = (candidates) => candidates
+      .map((candidate, order) => ({ ...candidate, order, distance: Math.hypot(point.x - candidate.x, point.y - candidate.y) }))
+      .filter((candidate) => candidate.distance <= hit)
+      .sort((left, right) => left.distance - right.distance || left.priority - right.priority || left.order - right.order)[0] || null;
     if (kind.type === "line" || kind.type === "arrow" || (kind.type === "highlighter" && kind.shape === "line")) {
-      if (near(physicalToCssPoint(kind.start))) return { cursor: "move", key: "lineStart", id: annotation.id };
-      if (near(physicalToCssPoint(kind.end))) return { cursor: "move", key: "lineEnd", id: annotation.id };
-      return null;
+      const start = physicalToCssPoint(kind.start);
+      const end = physicalToCssPoint(kind.end);
+      const handle = nearest([
+        { ...start, cursor: "move", key: "lineStart", priority: 0 },
+        { ...end, cursor: "move", key: "lineEnd", priority: 0 },
+      ]);
+      return handle ? { cursor: handle.cursor, key: handle.key, id: annotation.id } : null;
     }
     if (kind.type === "pen" || kind.type === "penArrow") {
       return null;
@@ -2268,32 +2695,29 @@
     const y1 = selectionBounds.y;
     const y2 = selectionBounds.y + selectionBounds.height / 2;
     const y3 = selectionBounds.y + selectionBounds.height;
-    const handles = kind.type === "text"
+    const handles = (kind.type === "text" || kind.type === "tag"
       ? [
-          [{ x: x1, y: y1 }, "nwse-resize", "northWest"],
-          [{ x: x3, y: y1 }, "nesw-resize", "northEast"],
-          [{ x: x3, y: y3 }, "nwse-resize", "southEast"],
-          [{ x: x1, y: y3 }, "nesw-resize", "southWest"],
-          [{ x: x2, y: y1 }, "ns-resize", "north"],
-          [{ x: x3, y: y2 }, "ew-resize", "east"],
-          [{ x: x2, y: y3 }, "ns-resize", "south"],
-          [{ x: x1, y: y2 }, "ew-resize", "west"],
+          { x: x1, y: y1, cursor: "nwse-resize", key: "northWest", priority: 1 },
+          { x: x3, y: y1, cursor: "nesw-resize", key: "northEast", priority: 1 },
+          { x: x3, y: y3, cursor: "nwse-resize", key: "southEast", priority: 1 },
+          { x: x1, y: y3, cursor: "nesw-resize", key: "southWest", priority: 1 },
+          { x: x2, y: y1, cursor: "ns-resize", key: "north", priority: 2 },
+          { x: x3, y: y2, cursor: "ew-resize", key: "east", priority: 2 },
+          { x: x2, y: y3, cursor: "ns-resize", key: "south", priority: 2 },
+          { x: x1, y: y2, cursor: "ew-resize", key: "west", priority: 2 },
         ]
       : [
-          [{ x: x1, y: y1 }, "nwse-resize", "northWest"],
-          [{ x: x3, y: y1 }, "nesw-resize", "northEast"],
-          [{ x: x3, y: y3 }, "nwse-resize", "southEast"],
-          [{ x: x1, y: y3 }, "nesw-resize", "southWest"],
-        ];
-    for (const [candidate, cursor, key] of handles) {
-      if (near(candidate)) {
-        return { cursor, key, id: annotation.id };
-      }
+          { x: x1, y: y1, cursor: "nwse-resize", key: "northWest", priority: 1 },
+          { x: x3, y: y1, cursor: "nesw-resize", key: "northEast", priority: 1 },
+          { x: x3, y: y3, cursor: "nwse-resize", key: "southEast", priority: 1 },
+          { x: x1, y: y3, cursor: "nesw-resize", key: "southWest", priority: 1 },
+        ]);
+    if (kind.type === "tag") {
+      const anchor = physicalToCssPoint(kind.anchor);
+      handles.push({ x: anchor.x, y: anchor.y, cursor: "move", key: "tagAnchor", priority: 0 });
     }
-    if (kind.type === "tag" && near(physicalToCssPoint(kind.anchor))) {
-      return { cursor: "move", key: "tagAnchor", id: annotation.id };
-    }
-    return null;
+    const handle = nearest(handles);
+    return handle ? { cursor: handle.cursor, key: handle.key, id: annotation.id } : null;
   }
 
   function updateCanvasCursor(point) {
@@ -2304,10 +2728,13 @@
     const handle = selectedHandleAtPoint(point);
     if (handle) {
       container.style.cursor = handle.cursor;
-    } else if (annotationAtPoint(point)) {
+    } else if (stepBadgeHitTest(point) != null) {
+      container.style.cursor = "move";
+    } else if (selectedAnnotationAtPoint(point) || annotationAtPoint(point)) {
       container.style.cursor = "move";
     } else {
-      updateDefaultCursor();
+      const regionHandle = regionResizeHandleAtPoint(point);
+      container.style.cursor = regionHandle ? regionHandle.cursor : "crosshair";
     }
   }
 
@@ -2478,7 +2905,7 @@
   }
 
   function shouldStartPreview(point) {
-    return state && state.captureRegion && !selectedHandleAtPoint(point) && !annotationHitTest(point) && !regionControlHitTest(point) && stepBadgeHitTest(point) == null;
+    return state && state.captureRegion && !selectedHandleAtPoint(point) && !annotationHitTest(point) && !regionResizeHandleAtPoint(point) && !regionControlHitTest(point) && stepBadgeHitTest(point) == null;
   }
 
   function constrainedPreviewPoint(start, point, evt) {
@@ -2514,15 +2941,26 @@
       return;
     }
     showCaretNow();
-    if (stepBadgeHitTest(point) != null) {
+    const payload = cssToPhysicalPoint(point);
+    const stepBadgeId = stepBadgeHitTest(point);
+    if (stepBadgeId != null) {
       if (textEditorSession) {
         commitTextEditor(false);
       }
+      state = {
+        ...state,
+        selectedAnnotationId: stepBadgeId,
+        editingStepNumberId: null,
+        editingStepNumberBuffer: null,
+        editingStepNumberSelectAll: false,
+      };
+      preview = null;
+      command("pointerDownAnnotation", { ...payload, id: stepBadgeId });
+      scheduleRender(state, { committed: true, selection: true });
       return;
     }
-    const payload = cssToPhysicalPoint(point);
     const selectedHandle = selectedHandleAtPoint(point);
-    const targetAnnotation = selectedHandle ? null : annotationAtPoint(point);
+    const targetAnnotation = selectedHandle ? null : selectedAnnotationAtPoint(point) || annotationAtPoint(point);
     if (textEditorSession) {
       const editingId = textEditorSession.id;
       const keepsCurrentAnnotation =
@@ -2548,6 +2986,24 @@
         id: targetAnnotation.id,
         ...(caretIndex != null ? { caretIndex } : {}),
       });
+      schedulePreviewRender();
+      return;
+    }
+    const regionHandle = regionResizeHandleAtPoint(point);
+    if (regionHandle) {
+      preview = null;
+      regionResizeDrag = true;
+      if (state.regionControls && state.regionControls.aspectRatio !== "custom" && !isCornerRegionHandle(regionHandle.key)) {
+        state = {
+          ...state,
+          regionControls: {
+            ...state.regionControls,
+            aspectRatio: "custom",
+          },
+        };
+        scheduleRender(state, { ui: true });
+      }
+      command("pointerDown", payload);
       schedulePreviewRender();
       return;
     }
@@ -2640,7 +3096,18 @@
     const id = stepBadgeHitTest(pointerPosition());
     if (id != null) {
       evt.cancelBubble = true;
+      const annotation = (state.annotations || []).find((item) => item.id === id);
+      const number = annotation && displayStepNumber(annotation);
+      state = {
+        ...state,
+        selectedAnnotationId: id,
+        editingStepNumberId: id,
+        editingStepNumberBuffer: number == null ? "" : String(number),
+        editingStepNumberSelectAll: true,
+      };
       command("editStepNumber", { id });
+      showCaretNow();
+      scheduleRender(state, { committed: true, selection: true });
     }
   });
 
@@ -2769,6 +3236,9 @@
       renderStyle: renderStyle(),
       editingTextId: state && state.editingTextId,
       editingStepNumberId: state && state.editingStepNumberId,
+      editingStepNumberBuffer: state && state.editingStepNumberBuffer,
+      editingStepNumberSelectAll: state && state.editingStepNumberSelectAll,
+      selectedAnnotationId: state && state.selectedAnnotationId,
           });
   }
 
@@ -3492,7 +3962,7 @@
       }
     } else {
       const selectionBounds = kind.type === "text" && !kind.framed ? inlineTextHitBounds(bounds, kind) : bounds;
-      if (kind.type === "text") {
+      if (kind.type === "text" || kind.type === "tag") {
         selectionLayer.add(new Konva.Rect({ x: selectionBounds.x, y: selectionBounds.y, width: selectionBounds.width, height: selectionBounds.height, dash: [5, 4], stroke: color, strokeWidth: Math.max(1, physicalScalar(1)) }));
       } else {
         selectionLayer.add(new Konva.Rect({ x: selectionBounds.x, y: selectionBounds.y, width: selectionBounds.width, height: selectionBounds.height, stroke: color, strokeWidth: Math.max(1, physicalScalar(1)) }));
@@ -3501,7 +3971,7 @@
       drawHandle({ x: selectionBounds.x + selectionBounds.width, y: selectionBounds.y }, color);
       drawHandle({ x: selectionBounds.x + selectionBounds.width, y: selectionBounds.y + selectionBounds.height }, color);
       drawHandle({ x: selectionBounds.x, y: selectionBounds.y + selectionBounds.height }, color);
-      if (kind.type === "text") {
+      if (kind.type === "text" || kind.type === "tag") {
         drawHandle({ x: selectionBounds.x + selectionBounds.width / 2, y: selectionBounds.y }, color, true);
         drawHandle({ x: selectionBounds.x + selectionBounds.width, y: selectionBounds.y + selectionBounds.height / 2 }, color, true);
         drawHandle({ x: selectionBounds.x + selectionBounds.width / 2, y: selectionBounds.y + selectionBounds.height }, color, true);
@@ -3530,9 +4000,25 @@
     const size = physicalScalar(style.stepBadgeSize || 24);
     const fontSize = physicalScalar(style.stepBadgeFontSize || 14);
     const fill = backgroundColor || activeColor();
+    const selected = state.selectedAnnotationId === id;
+    const editing = state.editingStepNumberId === id;
+    const displayedNumber = editing
+      ? state.editingStepNumberBuffer == null
+        ? String(number)
+        : String(state.editingStepNumberBuffer)
+      : String(number);
     addCommitted(new Konva.Circle({ x: center.x, y: center.y, radius: size / 2, fill }));
-    if (state.editingStepNumberId === id) {
-      addCommitted(new Konva.Circle({ x: center.x, y: center.y, radius: size / 2 + Math.max(1, 2 * scale()), stroke: "#FFFFFF", strokeWidth: Math.max(1, 1.4 * scale()), shadowColor: fill, shadowBlur: 6 * scale(), shadowOpacity: 0.5 }));
+    if (selected) {
+      addCommitted(new Konva.Circle({
+        x: center.x,
+        y: center.y,
+        radius: size / 2 + Math.max(2, 2.4 * scale()),
+        stroke: editing ? "#FFFFFF" : selectionColor(),
+        strokeWidth: Math.max(1.25, (editing ? 2 : 1.5) * scale()),
+        shadowColor: editing ? fill : selectionColor(),
+        shadowBlur: editing ? 8 * scale() : 4 * scale(),
+        shadowOpacity: editing ? 0.7 : 0.35,
+      }));
     }
     addCommitted(
       new Konva.Text({
@@ -3543,13 +4029,32 @@
         align: "center",
         verticalAlign: "middle",
         lineHeight: 1,
-        text: String(number),
+        text: displayedNumber,
         fontFamily: "Segoe UI",
         fontStyle: "700",
         fontSize,
         fill: contrastTextColor(fill),
       })
     );
+    if (editing && (caretVisible || Date.now() < caretForceVisibleUntil)) {
+      const textWidth = displayedNumber ? measureTextWidth(displayedNumber, fontSize, true) : 0;
+      const caretX = Math.min(center.x + size * 0.34, center.x + textWidth / 2 + Math.max(1, scale()));
+      const caretHeight = fontSize * 0.9;
+      addCommitted(new Konva.Line({
+        points: [caretX, center.y - caretHeight / 2, caretX, center.y + caretHeight / 2],
+        stroke: contrastTextColor(fill),
+        strokeWidth: Math.max(1, physicalScalar(1.2)),
+        lineCap: "round",
+      }));
+    }
+  }
+
+  function displayStepNumber(annotation) {
+    const kind = (annotation && annotation.kind) || {};
+    if (annotation && annotation.stepNumber != null) {
+      return annotation.stepNumber;
+    }
+    return kind.type === "step" ? kind.number : null;
   }
 
   function autoStepBadgeCenter(annotation) {
@@ -3815,6 +4320,32 @@
     };
   }
 
+  function cycleAnnotationTool(backward) {
+    if (!state || !state.captureRegion) {
+      return false;
+    }
+    const tools = ["step", "rectangle", "oval", "line", "arrow", "pen", "highlighter", "text", "tag", "watermark", "mosaic"];
+    const activeIndex = tools.indexOf(state.activeTool);
+    const current = activeIndex >= 0 ? activeIndex : tools.indexOf("rectangle");
+    const offset = backward ? -1 : 1;
+    const next = tools[(current + offset + tools.length) % tools.length];
+    if (textEditorSession) {
+      commitTextEditor(false);
+    }
+    watermarkInput.blur();
+    applyLocalDeselect();
+    state = {
+      ...state,
+      activeTool: next,
+      activeSubmenu: ["rectangle", "oval", "line", "arrow", "pen", "highlighter", "text", "tag", "watermark"].includes(next)
+        ? next
+        : null,
+    };
+    scheduleRender(state, { ui: true });
+    command("selectTool", { tool: next });
+    return true;
+  }
+
   function flattenPoints(points) {
     const out = [];
     for (const p of points) {
@@ -3825,6 +4356,15 @@
 
   document.addEventListener("keydown", (event) => {
     if (event.ctrlKey && ["+", "-", "=", "0"].includes(event.key)) {
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Tab" && event.ctrlKey) {
+      command("cycleColor", { shiftKey: !!event.shiftKey });
+      event.preventDefault();
+      return;
+    }
+    if (event.key === "Tab" && cycleAnnotationTool(event.shiftKey)) {
       event.preventDefault();
       return;
     }
@@ -4011,7 +4551,7 @@
     } else {
       caretVisible = true;
     }
-    if (state && state.editingTextId) {
+    if (state && (state.editingTextId || state.editingStepNumberId != null)) {
       scheduleRender(null, { committed: true });
     }
   }, 500);
@@ -4037,6 +4577,8 @@
       editingTextId: null,
       editingTextCaret: 0,
       editingStepNumberId: null,
+      editingStepNumberBuffer: null,
+      editingStepNumberSelectAll: false,
       editingWatermarkText: false,
     };
     watermarkInput.blur();

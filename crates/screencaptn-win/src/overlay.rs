@@ -1,6 +1,11 @@
+use crate::capture_interaction::{
+    resolve_pointer_intent, CapturePhase, PointerClaims, PointerIntent, ResponsiveMetrics,
+};
 use crate::diagnostics;
-use crate::settings::{save_settings, AppSettings, AspectRatioMode};
+use crate::native_svg::{draw_svg, recolor_svg};
+use crate::settings::{update_settings, AppSettings, AspectRatioMode, RgbDto};
 use crate::theme::ToolbarPalette;
+use crate::tips::{self, TipDefinition};
 use crate::util::{point_from_lparam, rect_to_rect, SelectedPen, SelectedStockObject};
 use screencaptn_core::{
     Annotation, AnnotationId, AnnotationKind, CaptureSession, Color, HighlightShape, MosaicMode,
@@ -12,7 +17,7 @@ use std::ffi::c_void;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, Result, PCWSTR, PWSTR};
@@ -21,13 +26,13 @@ use windows::Win32::Globalization::{GetDateFormatEx, DATE_SHORTDATE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, FillRect, FrameRect, GetDC,
-    GetDIBits, GetMonitorInfoW, GetPixel, GetTextExtentPoint32W, InvalidateRect, LineTo,
-    MonitorFromPoint, MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetStretchBltMode,
-    SetTextColor, StretchBlt, TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, BLENDFUNCTION, COLORONCOLOR, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE,
-    DT_VCENTER, DT_WORDBREAK, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    SRCCOPY, TRANSPARENT,
+    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, FillRect, FrameRect, GetDC, GetDIBits,
+    GetMonitorInfoW, GetPixel, GetTextExtentPoint32W, InvalidateRect, LineTo, MonitorFromPoint,
+    MoveToEx, Rectangle, ReleaseDC, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor,
+    StretchBlt, TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, COLORONCOLOR, DIB_RGB_COLORS, DT_CENTER, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    DT_WORDBREAK, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::DataExchange::{
@@ -38,10 +43,9 @@ use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OFN_EXPLORER, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DOWN, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
@@ -53,24 +57,26 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetMessageW, GetShellWindow, GetSystemMetrics, GetWindow, GetWindowLongW,
     GetWindowRect, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, MessageBoxW, PostMessageW,
     RegisterClassW, SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_USERDATA, GWL_EXSTYLE,
-    GWL_STYLE, GW_OWNER, HMENU, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW,
-    IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MB_ICONERROR, MB_ICONWARNING, MB_OK, MSG,
+    TranslateMessage, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_USERDATA,
+    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HCURSOR, HMENU, IDC_CROSS, IDC_HAND, IDC_SIZEALL,
+    IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, MB_ICONERROR, MB_ICONWARNING, MB_OK, MSG,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_SHOW,
-    WM_APP, WM_CHAR, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_CAPTION,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
+    WM_APP, WM_CHAR, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR, WM_TIMER,
+    WNDCLASSW, WS_CAPTION, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_THICKFRAME,
 };
 
 const OVERLAY_CLASS: windows::core::PCWSTR = w!("ScreenCaptnCaptureOverlay");
 const WM_OVERLAY_CLOSE_REQUEST: u32 = WM_APP + 0x40;
+pub const WM_OVERLAY_OPENED: u32 = WM_APP + 0x60;
+pub const WM_OVERLAY_CLOSED: u32 = WM_APP + 0x61;
+pub const WM_OVERLAY_UPDATE_CHANGED: u32 = WM_APP + 0x62;
+pub const WM_OVERLAY_SHOW_UPDATE: u32 = WM_APP + 0x63;
 const CF_BITMAP_FORMAT: u32 = 2;
 const HANDLE_RADIUS: f32 = 6.0;
-const REGION_RESIZE_HIT_RADIUS: f32 = 38.0;
 const MIN_REGION_SIZE: f32 = 24.0;
 const TOOLBAR_BUTTON: f32 = 36.0;
 const TOOLBAR_HEIGHT: f32 = 36.0;
-const FRAME_HIT_WIDTH: f32 = 32.0;
 const CLICK_DRAG_THRESHOLD: f32 = 5.0;
 const ALL_SCREENS_TOP_EDGE_THRESHOLD_PX: f32 = 4.0;
 const CURRENT_SCREEN_TOP_THRESHOLD_PX: f32 = 32.0;
@@ -85,8 +91,20 @@ const TOOL_ICON_SIZE: f32 = 24.0;
 const TOOL_ICON_SELECTED_RADIUS: f32 = 3.0;
 const HIGHLIGHTER_RADIUS: f32 = 4.0;
 const PEN_POINT_SPACING: f32 = 5.5;
-const DEFAULT_TEXT_FONT_SIZE: f32 = 27.0;
 const INLINE_TEXT_PADDING: f32 = 8.0;
+const ANNOTATION_TOOL_CYCLE: [ToolKind; 11] = [
+    ToolKind::StepNumber,
+    ToolKind::Rectangle,
+    ToolKind::Oval,
+    ToolKind::Line,
+    ToolKind::Arrow,
+    ToolKind::Pen,
+    ToolKind::Highlighter,
+    ToolKind::Text,
+    ToolKind::Tag,
+    ToolKind::Watermark,
+    ToolKind::Mosaic,
+];
 const INLINE_TEXT_ASCENT: f32 = 1.12;
 const INLINE_TEXT_LINE_HEIGHT: f32 = 1.22;
 const INLINE_TEXT_WIDTH_CACHE_LIMIT: usize = 256;
@@ -97,6 +115,7 @@ const TAG_RADIUS: f32 = 5.0;
 const CARET_TIMER_ID: usize = 1;
 const NUMBERING_TOGGLE_TIMER_ID: usize = 2;
 const REGION_BORDER_TIMER_ID: usize = 3;
+const CAPTURE_TIP_TIMER_ID: usize = 4;
 const SUBMENU_HEIGHT: f32 = 24.0;
 const SUBMENU_RADIUS: f32 = 4.0;
 const SUBMENU_NOTCH: f32 = 10.0;
@@ -107,7 +126,6 @@ const SUBMENU_EDGE_PAD: f32 = 6.0;
 const MIN_STROKE_WIDTH: f32 = 1.0;
 const MAX_STROKE_WIDTH: f32 = 24.0;
 const MIN_TAG_STROKE_WIDTH: f32 = 6.0;
-const MIN_FONT_SIZE: f32 = 27.0;
 const MAX_FONT_SIZE: f32 = 56.0;
 const MIN_WATERMARK_FONT_SIZE: f32 = 8.0;
 const WATERMARK_OPACITY: f32 = 0.5;
@@ -119,17 +137,18 @@ const REGION_CONTROL_MARGIN: f32 = 18.0;
 const REGION_CONTROL_DIVIDER_HEIGHT: f32 = 22.0;
 const MAGNIFIER_SIZE: f32 = 104.0;
 const MAGNIFIER_SAMPLE_SIZE: f32 = 18.0;
+const CAPTURE_TIP_DURATION: Duration = Duration::from_secs(5);
 
 pub use crate::theme::AppTheme;
 
-pub fn open_capture_overlay(theme: AppTheme, settings: AppSettings) -> Result<()> {
+pub fn open_capture_overlay(owner: HWND, theme: AppTheme, settings: AppSettings) -> Result<()> {
     unsafe {
         let instance = GetModuleHandleW(None)?;
         let class = WNDCLASSW {
             hCursor: LoadCursorW(None, IDC_CROSS)?,
             hInstance: instance.into(),
             lpszClassName: OVERLAY_CLASS,
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(overlay_wnd_proc),
             ..Default::default()
         };
@@ -155,13 +174,18 @@ pub fn open_capture_overlay(theme: AppTheme, settings: AppSettings) -> Result<()
             .map(|candidate| candidate.rect)
             .unwrap_or(screen_bounds);
         let mut state = Box::new(OverlayState::new(
+            owner,
             screen_bounds,
             background_bitmap,
             detected_regions,
             theme,
             settings,
         ));
-        state.ui_scale = ui_scale_for_screen(initial_monitor);
+        state.responsive_metrics = ResponsiveMetrics::for_screen(initial_monitor);
+        state.current_stroke.width = state.responsive_metrics.default_stroke;
+        state.tool_stroke_widths = [state.current_stroke.width; 11];
+        state.font_size = state.responsive_metrics.font_default;
+        state.watermark_font_size = state.responsive_metrics.font_default;
         state.ui_scale_monitor_id = Some(monitor_id(initial_monitor));
         state.cursor_position = state.screen_to_overlay(cursor_screen);
         state.smart_region = initial_candidate;
@@ -183,6 +207,10 @@ pub fn open_capture_overlay(theme: AppTheme, settings: AppSettings) -> Result<()
             Some(state_ptr.cast()),
         )?;
         state.hwnd = hwnd;
+        if state.session.document.capture_region.is_some() {
+            activate_capture_tip(&mut state);
+        }
+        let _ = PostMessageW(owner, WM_OVERLAY_OPENED, WPARAM(hwnd.0 as usize), LPARAM(0));
         match crate::web_ui::WebUi::create(hwnd, state_ptr.cast::<c_void>(), overlay_web_message) {
             Ok(web_ui) => {
                 state.web_ui = Some(web_ui);
@@ -199,7 +227,7 @@ pub fn open_capture_overlay(theme: AppTheme, settings: AppSettings) -> Result<()
         let _ = SetFocus(hwnd);
 
         let mut msg = MSG::default();
-        while BOOL::from(GetMessageW(&mut msg, None, 0, 0)).as_bool() {
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
             if !windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() {
@@ -212,6 +240,7 @@ pub fn open_capture_overlay(theme: AppTheme, settings: AppSettings) -> Result<()
 
 struct OverlayState {
     hwnd: HWND,
+    owner: HWND,
     screen_bounds: Rect,
     background_bitmap: HBITMAP,
     detected_regions: Vec<DetectedRegion>,
@@ -226,6 +255,7 @@ struct OverlayState {
     current_stroke: StrokeStyle,
     tool_stroke_widths: [f32; 11],
     normal_stroke_color: Color,
+    highlighter_stroke_color: Color,
     highlighter_opacity: f32,
     mosaic_brush_size: f32,
     font_size: f32,
@@ -234,7 +264,9 @@ struct OverlayState {
     editing_text_id: Option<AnnotationId>,
     editing_text_caret: usize,
     editing_step_number_id: Option<AnnotationId>,
-    editing_step_number_replace: bool,
+    editing_step_number_buffer: String,
+    editing_step_number_select_all: bool,
+    editing_step_number_original: Option<u32>,
     style_edit_in_progress: bool,
     toolbar_origin: Option<Point>,
     drag: Option<DragState>,
@@ -254,7 +286,7 @@ struct OverlayState {
     watermark_image_bitmap: Option<WatermarkBitmap>,
     watermark_image_data_url: Option<String>,
     editing_watermark_text: bool,
-    ui_scale: f32,
+    responsive_metrics: ResponsiveMetrics,
     ui_scale_monitor_id: Option<String>,
     theme: AppTheme,
     web_ui: Option<crate::web_ui::WebUi>,
@@ -262,7 +294,6 @@ struct OverlayState {
     web_toolbar_ready: bool,
     web_toolbar_waiting_for_revision: Option<u64>,
     close_requested: bool,
-    web_pointer_raw_mode: bool,
     web_revision: u64,
     web_sync_baseline: Option<WebSyncBaseline>,
     force_web_full_snapshot: bool,
@@ -273,10 +304,13 @@ struct OverlayState {
     region_control_buttons: Vec<RegionControlButton>,
     region_control_bounds: Option<Rect>,
     hovered_region_control: Option<RegionControlKind>,
+    update_available: bool,
+    active_tip: Option<ActiveTip>,
 }
 
 impl OverlayState {
     fn new(
+        owner: HWND,
         screen_bounds: Rect,
         background_bitmap: HBITMAP,
         detected_regions: Vec<DetectedRegion>,
@@ -284,10 +318,19 @@ impl OverlayState {
         mut settings: AppSettings,
     ) -> Self {
         settings.aspect_ratio = AspectRatioMode::Custom;
-        let ui_scale = ui_scale_for_screen(screen_bounds);
-        let current_stroke = StrokeStyle::default();
+        let responsive_metrics = ResponsiveMetrics::for_screen(screen_bounds);
+        let annotation_color = settings.color_defaults.annotation.color();
+        let highlighter_stroke_color = settings.color_defaults.highlighter.color();
+        let watermark_color = settings.color_defaults.watermark.color();
+        let current_stroke = StrokeStyle {
+            color: annotation_color,
+            width: responsive_metrics.default_stroke,
+            opacity: 1.0,
+        };
+        let update_available = settings.update_check.pending.is_some();
         Self {
             hwnd: HWND::default(),
+            owner,
             screen_bounds,
             background_bitmap,
             detected_regions,
@@ -300,17 +343,20 @@ impl OverlayState {
             numbering_enabled: false,
             numbering_toggle_progress: 0.0,
             normal_stroke_color: current_stroke.color,
+            highlighter_stroke_color,
             current_stroke,
             tool_stroke_widths: [current_stroke.width; 11],
             highlighter_opacity: 0.30,
             mosaic_brush_size: 16.0,
-            font_size: DEFAULT_TEXT_FONT_SIZE,
-            watermark_font_size: DEFAULT_TEXT_FONT_SIZE,
+            font_size: responsive_metrics.font_default,
+            watermark_font_size: responsive_metrics.font_default,
             next_step_number: 1,
             editing_text_id: None,
             editing_text_caret: 0,
             editing_step_number_id: None,
-            editing_step_number_replace: false,
+            editing_step_number_buffer: String::new(),
+            editing_step_number_select_all: false,
+            editing_step_number_original: None,
             style_edit_in_progress: false,
             toolbar_origin: None,
             drag: None,
@@ -325,12 +371,12 @@ impl OverlayState {
             watermark_mode: WatermarkMode::Text,
             watermark_date_enabled: false,
             watermark_text: String::new(),
-            watermark_color: current_stroke.color,
+            watermark_color,
             watermark_image_path: None,
             watermark_image_bitmap: None,
             watermark_image_data_url: None,
             editing_watermark_text: false,
-            ui_scale,
+            responsive_metrics,
             ui_scale_monitor_id: None,
             theme,
             web_ui: None,
@@ -338,7 +384,6 @@ impl OverlayState {
             web_toolbar_ready: false,
             web_toolbar_waiting_for_revision: None,
             close_requested: false,
-            web_pointer_raw_mode: false,
             web_revision: 0,
             web_sync_baseline: None,
             force_web_full_snapshot: true,
@@ -349,6 +394,8 @@ impl OverlayState {
             region_control_buttons: Vec::new(),
             region_control_bounds: None,
             hovered_region_control: None,
+            update_available,
+            active_tip: None,
         }
     }
 
@@ -385,10 +432,6 @@ struct WebUiMessage {
     revision: Option<u64>,
     x: Option<f32>,
     y: Option<f32>,
-    #[serde(rename = "rawX")]
-    raw_x: Option<f32>,
-    #[serde(rename = "rawY")]
-    raw_y: Option<f32>,
     tool: Option<String>,
     color: Option<String>,
     value: Option<f32>,
@@ -414,6 +457,7 @@ struct WebUiMessage {
     shift_key: Option<bool>,
     #[serde(rename = "ctrlKey")]
     ctrl_key: Option<bool>,
+    hovered: Option<bool>,
     reason: Option<String>,
     level: Option<String>,
     message: Option<String>,
@@ -464,6 +508,11 @@ struct RenderStyle {
     selection_handle_size: f32,
     step_badge_size: f32,
     step_badge_font_size: f32,
+    font_min_size: f32,
+    font_default_size: f32,
+    font_max_size: f32,
+    annotation_handle_hit_radius: f32,
+    region_handle_hit_radius: f32,
 }
 
 impl RenderStyle {
@@ -485,6 +534,11 @@ impl RenderStyle {
             selection_handle_size: scaled(state, 8.0),
             step_badge_size: scaled(state, 24.0),
             step_badge_font_size: scaled(state, 14.0),
+            font_min_size: state.responsive_metrics.font_min,
+            font_default_size: state.responsive_metrics.font_default,
+            font_max_size: state.responsive_metrics.font_max,
+            annotation_handle_hit_radius: state.responsive_metrics.annotation_handle_hit_radius,
+            region_handle_hit_radius: state.responsive_metrics.region_handle_hit_radius,
         }
     }
 }
@@ -534,7 +588,7 @@ fn web_message_needs_static_redraw(state: &OverlayState, message: &str) -> bool 
         "commitText" | "cancelText" | "setTextDraft" | "char" | "keyDown" | "setTextCaret" => true,
         "setWatermarkMode" | "clearWatermark" | "focusWatermarkText" | "blurWatermarkText"
         | "setWatermarkText" => true,
-        "setColor" => state.active_submenu == Some(ToolKind::Watermark),
+        "setColor" | "cycleColor" => state.active_submenu == Some(ToolKind::Watermark),
         "setFontSize" => {
             state.active_submenu == Some(ToolKind::Watermark)
                 || state.editing_watermark_text
@@ -559,7 +613,6 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
     match message.kind.as_str() {
         "webviewProcessFailed" => {
             state.web_ui_failed = true;
-            state.web_pointer_raw_mode = false;
             if let Some(web_ui) = &state.web_ui {
                 web_ui.set_visible(false);
             }
@@ -619,7 +672,6 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
         "pointerUp" => {
             if let Some(point) = web_pointer_point(state, &message) {
                 handle_mouse_up(state, point);
-                state.web_pointer_raw_mode = false;
                 true
             } else {
                 false
@@ -669,6 +721,13 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 false
             }
         }
+        "selectStepNumber" => {
+            if let Some(id) = message.id {
+                select_step_number(state, id)
+            } else {
+                false
+            }
+        }
         "toggleTheme" => {
             state.theme = crate::theme::toggled_theme(state.theme);
             crate::theme::save_theme(state.theme);
@@ -678,6 +737,21 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
             handle_toolbar_action(state, ToolbarAction::Undo);
             true
         }
+        "showUpdate" => {
+            handle_toolbar_action(state, ToolbarAction::Update);
+            false
+        }
+        "setTipHovered" => {
+            if let Some(active_tip) = state.active_tip.as_mut() {
+                let hovered = message.hovered.unwrap_or(false);
+                if active_tip.hovered && !hovered {
+                    active_tip.shown_at = Instant::now();
+                }
+                active_tip.hovered = hovered;
+            }
+            false
+        }
+        "hideCaptureTips" => set_capture_tips_enabled(state, false),
         "copy" => {
             handle_toolbar_action(state, ToolbarAction::Copy);
             false
@@ -713,6 +787,15 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
                 false
             }
         }
+        "setDefaultColor" => {
+            if let Some(color) = message.color.as_deref().and_then(color_from_hex) {
+                handle_submenu_action(state, SubmenuAction::Color(color));
+                persist_active_color_default(state, color)
+            } else {
+                false
+            }
+        }
+        "cycleColor" => cycle_active_color(state, message.shift_key.unwrap_or(false)),
         "setStrokeWidth" => {
             if let Some(value) = message.value {
                 handle_submenu_action(state, SubmenuAction::StrokeWidth(value));
@@ -816,11 +899,11 @@ fn handle_web_ui_message(state: &mut OverlayState, message: &str) -> bool {
             true
         }
         "focusWatermarkText" => {
+            finish_step_number_editing(state, true);
             state.watermark_mode = WatermarkMode::Text;
             state.editing_watermark_text = true;
             state.editing_text_id = None;
             state.editing_text_caret = 0;
-            state.editing_step_number_id = None;
             true
         }
         "blurWatermarkText" => {
@@ -1304,7 +1387,7 @@ fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
     });
     serde_json::json!({
         "theme": theme_name(state.theme),
-        "uiScale": state.ui_scale,
+        "uiScale": state.responsive_metrics.ui_scale,
         "screen": {
             "x": state.screen_bounds.x,
             "y": state.screen_bounds.y,
@@ -1317,6 +1400,11 @@ fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
             "aspectRatio": aspect_ratio_web_name(state.settings.aspect_ratio),
         },
         "toolbar": toolbar,
+        "updateAvailable": state.update_available,
+        "activeTip": state.active_tip.map(|active| serde_json::json!({
+            "id": active.definition.id,
+            "text": active.definition.text,
+        })),
         "activeTool": tool_web_name(state.active_tool),
         "activeSubmenu": state.active_submenu.map(tool_web_name),
         "numberingEnabled": state.numbering_enabled,
@@ -1335,13 +1423,15 @@ fn web_ui_state_patch(state: &OverlayState) -> serde_json::Value {
         "watermarkDateEnabled": state.watermark_date_enabled,
         "watermarkText": state.watermark_text,
         "watermarkColor": color_json(state.watermark_color),
-        "watermarkImageUrl": state.watermark_image_path.as_ref().map(watermark_file_url),
+        "watermarkImageUrl": state.watermark_image_path.as_deref().map(watermark_file_url),
         "watermarkImageDataUrl": state.watermark_image_data_url,
         "editingWatermarkText": state.editing_watermark_text,
         "selectedAnnotationId": state.session.document.selected_annotation_id,
         "editingTextId": state.editing_text_id,
         "editingTextCaret": state.editing_text_caret,
         "editingStepNumberId": state.editing_step_number_id,
+        "editingStepNumberBuffer": state.editing_step_number_id.map(|_| state.editing_step_number_buffer.as_str()),
+        "editingStepNumberSelectAll": state.editing_step_number_select_all,
         "renderStyle": web_render_style_json(state),
     })
 }
@@ -1356,7 +1446,7 @@ fn aspect_ratio_web_name(mode: AspectRatioMode) -> &'static str {
     }
 }
 
-fn watermark_file_url(path: &PathBuf) -> String {
+fn watermark_file_url(path: &Path) -> String {
     let path = path.to_string_lossy().replace('\\', "/");
     let mut encoded = String::from("file:///");
     for byte in path.as_bytes() {
@@ -1526,35 +1616,12 @@ fn message_point(message: &WebUiMessage) -> Option<Point> {
     Some(Point::new(message.x?, message.y?))
 }
 
-fn message_raw_point(message: &WebUiMessage) -> Option<Point> {
-    Some(Point::new(message.raw_x?, message.raw_y?))
+fn web_pointer_down_point(_state: &mut OverlayState, message: &WebUiMessage) -> Option<Point> {
+    message_point(message)
 }
 
-fn web_pointer_down_point(state: &mut OverlayState, message: &WebUiMessage) -> Option<Point> {
-    let scaled = message_point(message)?;
-    state.web_pointer_raw_mode = false;
-
-    let Some(raw) = message_raw_point(message) else {
-        return Some(scaled);
-    };
-    let Some(region) = state.region_overlay() else {
-        return Some(scaled);
-    };
-
-    if !region.contains(scaled) && region.contains(raw) {
-        state.web_pointer_raw_mode = true;
-        Some(raw)
-    } else {
-        Some(scaled)
-    }
-}
-
-fn web_pointer_point(state: &OverlayState, message: &WebUiMessage) -> Option<Point> {
-    if state.web_pointer_raw_mode {
-        message_raw_point(message).or_else(|| message_point(message))
-    } else {
-        message_point(message)
-    }
+fn web_pointer_point(_state: &OverlayState, message: &WebUiMessage) -> Option<Point> {
+    message_point(message)
 }
 
 fn begin_web_annotation_edit(state: &mut OverlayState, message: &WebUiMessage) -> bool {
@@ -1578,14 +1645,13 @@ fn begin_web_annotation_edit(state: &mut OverlayState, message: &WebUiMessage) -
         return false;
     }
 
+    finish_step_number_editing(state, true);
     state.cursor_position = point;
     state.session.select_annotation(Some(id));
     sync_selected_annotation_controls(state, id);
     state.checkpoint();
     state.editing_text_id = None;
     state.editing_text_caret = 0;
-    state.editing_step_number_id = None;
-    state.editing_step_number_replace = false;
     state.drag = Some(DragState::EditingAnnotation { id, edit, original });
     true
 }
@@ -1602,11 +1668,10 @@ fn begin_web_annotation_interaction(state: &mut OverlayState, message: &WebUiMes
     };
     let screen_point = state.overlay_to_screen(point);
 
+    finish_step_number_editing(state, true);
     state.cursor_position = point;
     state.session.select_annotation(Some(id));
     sync_selected_annotation_controls(state, id);
-    state.editing_step_number_id = None;
-    state.editing_step_number_replace = false;
     if matches!(
         original.kind,
         AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
@@ -1808,10 +1873,6 @@ struct RenderCache {
     static_old: HGDIOBJ,
 }
 
-fn ui_scale_for_screen(screen_bounds: Rect) -> f32 {
-    ((screen_bounds.height / 1080.0) * 1.38).clamp(1.38, 2.76)
-}
-
 fn refresh_ui_scale(state: &mut OverlayState) {
     let anchor = active_region_rect(state)
         .map(|region| region.center())
@@ -1823,7 +1884,7 @@ fn refresh_ui_scale(state: &mut OverlayState) {
     if state.ui_scale_monitor_id.as_deref() == Some(id.as_str()) {
         return;
     }
-    state.ui_scale = ui_scale_for_screen(monitor);
+    state.responsive_metrics = ResponsiveMetrics::for_screen(monitor);
     state.ui_scale_monitor_id = Some(id);
     if let Some(region) = state.region_overlay() {
         state.toolbar_origin = Some(default_toolbar_origin(state, region));
@@ -1833,7 +1894,7 @@ fn refresh_ui_scale(state: &mut OverlayState) {
 }
 
 fn scaled(state: &OverlayState, value: f32) -> f32 {
-    value * state.ui_scale
+    value * state.responsive_metrics.ui_scale
 }
 
 fn top_chrome_height(window: Rect) -> f32 {
@@ -1918,12 +1979,13 @@ enum SubmenuSliderKind {
     FontSize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ToolbarAction {
     Grip,
     Numbering,
     Tool(ToolKind),
     Divider,
+    Update,
     Undo,
     Copy,
     Save,
@@ -2035,6 +2097,14 @@ unsafe extern "system" fn overlay_wnd_proc(
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
+        WM_OVERLAY_UPDATE_CHANGED => {
+            state.update_available = wparam.0 != 0;
+            state.toolbar_origin = None;
+            state.force_web_full_snapshot = true;
+            let _ = InvalidateRect(hwnd, None, false);
+            sync_web_after_change(state);
+            LRESULT(0)
+        }
         WM_PAINT => {
             paint_overlay(state);
             LRESULT(0)
@@ -2056,6 +2126,16 @@ unsafe extern "system" fn overlay_wnd_proc(
                     || matches!(state.drag, Some(DragState::Selecting { .. })))
             {
                 let _ = InvalidateRect(hwnd, None, false);
+            } else if wparam.0 == CAPTURE_TIP_TIMER_ID {
+                let expired = state.active_tip.is_some_and(|tip| {
+                    !tip.hovered && tip.shown_at.elapsed() >= CAPTURE_TIP_DURATION
+                });
+                if expired {
+                    state.active_tip = None;
+                    let _ = KillTimer(hwnd, CAPTURE_TIP_TIMER_ID);
+                    sync_web_after_change(state);
+                }
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
@@ -2068,6 +2148,27 @@ unsafe extern "system" fn overlay_wnd_proc(
             SetCapture(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
             sync_web_after_change(state);
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            if web_ui_owns_pointer_input(state) {
+                return LRESULT(0);
+            }
+            let point = point_from_lparam(lparam);
+            let color = state
+                .submenu_buttons
+                .iter()
+                .find(|button| button.rect.contains(point))
+                .and_then(|button| match button.action {
+                    SubmenuAction::Color(color) => Some(color),
+                    _ => None,
+                });
+            if let Some(color) = color {
+                handle_submenu_action(state, SubmenuAction::Color(color));
+                let _ = persist_active_color_default(state, color);
+                let _ = InvalidateRect(hwnd, None, false);
+                sync_web_after_change(state);
+            }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -2155,6 +2256,12 @@ unsafe extern "system" fn overlay_wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let _ = PostMessageW(
+                state.owner,
+                WM_OVERLAY_CLOSED,
+                WPARAM(hwnd.0 as usize),
+                LPARAM(0),
+            );
             let _ = DeleteObject(state.background_bitmap);
             destroy_render_cache(state);
             let _ = Box::from_raw(state_ptr);
@@ -2239,109 +2346,95 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: O
     }
 
     if let Some(region) = state.region_overlay() {
-        if let Some(handle) = region.hit_resize_handle(point, REGION_RESIZE_HIT_RADIUS) {
-            finish_text_editing(state);
-            state.checkpoint();
-            if state.settings.aspect_ratio != AspectRatioMode::Custom
-                && !is_corner_resize_handle(handle)
-            {
-                state.settings.aspect_ratio = AspectRatioMode::Custom;
-            }
-            state.drag = Some(DragState::ResizingRegion {
-                handle,
-                original: state
-                    .session
-                    .document
-                    .capture_region
-                    .expect("overlay region maps from document region"),
-            });
-            return;
-        }
-
         let screen_point = state.overlay_to_screen(point);
-        if let Some(id) = state.session.document.selected_annotation_id {
-            if let Some(original) = state.session.document.annotation(id).cloned() {
-                if let Some(edit) = hit_annotation_edit_handle(state, &original, screen_point) {
-                    state.checkpoint();
-                    state.editing_text_id = None;
-                    state.editing_text_caret = 0;
-                    state.editing_step_number_id = None;
-                    state.editing_step_number_replace = false;
-                    state.drag = Some(DragState::EditingAnnotation { id, edit, original });
-                    return;
+        let selected_id = state.session.document.selected_annotation_id;
+        let selected_claim = selected_id.is_some_and(|id| {
+            state
+                .session
+                .document
+                .annotation(id)
+                .is_some_and(|annotation| {
+                    hit_annotation_edit_handle(state, annotation, screen_point).is_some()
+                        || annotation_hit_test(annotation, screen_point)
+                })
+        });
+        let annotation_id = annotation_id_at(state, screen_point);
+        let region_handle =
+            region.hit_resize_handle(point, state.responsive_metrics.region_handle_hit_radius);
+        let region_frame = region_frame_contains(state, region, point);
+        let intent = resolve_pointer_intent(
+            CapturePhase::Annotating,
+            PointerClaims {
+                selected_annotation: selected_claim,
+                annotation: annotation_id.is_some(),
+                region_handle: region_handle.is_some(),
+                region_frame,
+            },
+        );
+
+        match intent {
+            PointerIntent::SelectedAnnotation => {
+                if let Some(id) = selected_id {
+                    begin_annotation_pointer_interaction(state, id, screen_point, text_caret_index);
                 }
             }
-        }
-        if let Some(id) = select_annotation_at(state, screen_point) {
-            state.editing_step_number_id = None;
-            state.editing_step_number_replace = false;
-            if let Some(original) = state.session.document.annotation(id).cloned() {
-                if let Some(edit) = hit_annotation_edit_handle(state, &original, screen_point) {
-                    state.checkpoint();
-                    state.editing_text_id = None;
-                    state.editing_text_caret = 0;
-                    state.editing_step_number_id = None;
-                    state.editing_step_number_replace = false;
-                    state.drag = Some(DragState::EditingAnnotation { id, edit, original });
-                    return;
+            PointerIntent::Annotation => {
+                if let Some(id) = annotation_id {
+                    begin_annotation_pointer_interaction(state, id, screen_point, text_caret_index);
                 }
-                if matches!(
-                    original.kind,
-                    AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
-                ) {
-                    state.editing_text_id = None;
-                    state.editing_text_caret = 0;
-                    state.drag = Some(DragState::PendingTextInteraction {
-                        start: screen_point,
-                        id,
-                        original,
-                        caret_index: text_caret_index
-                            .or_else(|| text_caret_index_for_point(state, id, screen_point)),
-                        moved: false,
-                    });
+            }
+            PointerIntent::RegionHandle => {
+                let Some(handle) = region_handle else {
                     return;
-                }
+                };
+                finish_text_editing(state);
                 state.checkpoint();
-                state.editing_text_id = None;
-                state.editing_text_caret = 0;
-                state.drag = Some(DragState::MovingAnnotation {
-                    start: screen_point,
-                    id,
-                    original,
+                if state.settings.aspect_ratio != AspectRatioMode::Custom
+                    && !is_corner_resize_handle(handle)
+                {
+                    state.settings.aspect_ratio = AspectRatioMode::Custom;
+                }
+                state.drag = Some(DragState::ResizingRegion {
+                    handle,
+                    original: state
+                        .session
+                        .document
+                        .capture_region
+                        .expect("overlay region maps from document region"),
                 });
-                return;
             }
-        }
-
-        if region_frame_contains(region, point) {
-            finish_text_editing(state);
-            state.checkpoint();
-            state.drag = Some(DragState::MovingRegion {
-                start: point,
-                original: state
-                    .session
-                    .document
-                    .capture_region
-                    .expect("overlay region maps from document region"),
-            });
-            return;
-        }
-
-        if region.contains(point) {
-            if state.active_tool == ToolKind::Watermark {
-                return;
+            PointerIntent::RegionFrame => {
+                finish_text_editing(state);
+                state.checkpoint();
+                state.drag = Some(DragState::MovingRegion {
+                    start: point,
+                    original: state
+                        .session
+                        .document
+                        .capture_region
+                        .expect("overlay region maps from document region"),
+                });
             }
-            finish_text_editing(state);
-            let start = state.overlay_to_screen(point);
-            state.drag = Some(DragState::DrawingAnnotation {
-                start,
-                current: start,
-                points: vec![start],
-            });
-            return;
+            PointerIntent::AnnotationCanvas => {
+                if state.active_tool == ToolKind::Watermark {
+                    return;
+                }
+                finish_text_editing(state);
+                state.drag = Some(DragState::DrawingAnnotation {
+                    start: screen_point,
+                    current: screen_point,
+                    points: vec![screen_point],
+                });
+            }
+            PointerIntent::RegionSelection => unreachable!("a confirmed region is annotating"),
         }
+        return;
     }
 
+    debug_assert_eq!(
+        resolve_pointer_intent(CapturePhase::SelectingRegion, PointerClaims::default()),
+        PointerIntent::RegionSelection
+    );
     state.checkpoint();
     state.drag = Some(DragState::Selecting {
         start: point,
@@ -2349,12 +2442,57 @@ fn handle_mouse_down(state: &mut OverlayState, point: Point, text_caret_index: O
     });
 }
 
+fn begin_annotation_pointer_interaction(
+    state: &mut OverlayState,
+    id: AnnotationId,
+    screen_point: Point,
+    text_caret_index: Option<usize>,
+) {
+    finish_step_number_editing(state, true);
+    if state.session.select_annotation(Some(id)) {
+        sync_selected_annotation_controls(state, id);
+    }
+    let Some(original) = state.session.document.annotation(id).cloned() else {
+        return;
+    };
+    if let Some(edit) = hit_annotation_edit_handle(state, &original, screen_point) {
+        state.checkpoint();
+        state.editing_text_id = None;
+        state.editing_text_caret = 0;
+        state.drag = Some(DragState::EditingAnnotation { id, edit, original });
+        return;
+    }
+    if matches!(
+        original.kind,
+        AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
+    ) {
+        state.editing_text_id = None;
+        state.editing_text_caret = 0;
+        state.drag = Some(DragState::PendingTextInteraction {
+            start: screen_point,
+            id,
+            original,
+            caret_index: text_caret_index
+                .or_else(|| text_caret_index_for_point(state, id, screen_point)),
+            moved: false,
+        });
+        return;
+    }
+    state.checkpoint();
+    state.editing_text_id = None;
+    state.editing_text_caret = 0;
+    state.drag = Some(DragState::MovingAnnotation {
+        start: screen_point,
+        id,
+        original,
+    });
+}
+
 fn deselect_all(state: &mut OverlayState) {
+    finish_step_number_editing(state, true);
     state.session.deselect_annotation();
     state.editing_text_id = None;
     state.editing_text_caret = 0;
-    state.editing_step_number_id = None;
-    state.editing_step_number_replace = false;
     state.editing_watermark_text = false;
     state.drag = None;
     state.mark_static_dirty();
@@ -2376,14 +2514,15 @@ fn has_active_annotation_state(state: &OverlayState) -> bool {
         )
 }
 
-fn region_frame_contains(region: Rect, point: Point) -> bool {
+fn region_frame_contains(state: &OverlayState, region: Rect, point: Point) -> bool {
     if !region.contains(point) {
         return false;
     }
-    point.x <= region.x + FRAME_HIT_WIDTH
-        || point.x >= region.right() - FRAME_HIT_WIDTH
-        || point.y <= region.y + FRAME_HIT_WIDTH
-        || point.y >= region.bottom() - FRAME_HIT_WIDTH
+    let hit_width = state.responsive_metrics.region_frame_hit_width;
+    point.x <= region.x + hit_width
+        || point.x >= region.right() - hit_width
+        || point.y <= region.y + hit_width
+        || point.y >= region.bottom() - hit_width
 }
 
 fn is_corner_resize_handle(handle: ResizeHandle) -> bool {
@@ -2409,20 +2548,15 @@ fn region_control_chrome_hidden(state: &OverlayState) -> bool {
     has_user_annotations(state) || matches!(state.drag, Some(DragState::DrawingAnnotation { .. }))
 }
 
-fn select_annotation_at(state: &mut OverlayState, screen_point: Point) -> Option<AnnotationId> {
-    let hit = state
+fn annotation_id_at(state: &OverlayState, screen_point: Point) -> Option<AnnotationId> {
+    state
         .session
         .document
         .annotations
         .iter()
         .rev()
         .find(|annotation| annotation_hit_test(annotation, screen_point))
-        .map(|annotation| annotation.id);
-    state.session.select_annotation(hit);
-    if let Some(id) = hit {
-        sync_selected_annotation_controls(state, id);
-    }
-    hit
+        .map(|annotation| annotation.id)
 }
 
 fn sync_selected_annotation_controls(state: &mut OverlayState, id: AnnotationId) {
@@ -2887,15 +3021,26 @@ fn update_locked_region_if_needed(state: &mut OverlayState) {
 fn persist_locked_region_if_needed(state: &mut OverlayState) {
     let previous = state.settings.clone();
     update_locked_region_if_needed(state);
-    if let Err(error) = save_settings(&state.settings) {
-        state.settings = previous;
-        unsafe {
-            show_capture_message(
-                state.hwnd,
-                "Screen Cap'n Settings",
-                &format!("The locked region could not be saved.\n\n{error}"),
-                MB_ICONWARNING,
-            );
+    let locked_regions = state.settings.locked_regions.clone();
+    let aspect_ratio = state.settings.aspect_ratio;
+    match update_settings(|settings| {
+        settings.locked_regions = locked_regions;
+        settings.aspect_ratio = aspect_ratio;
+    }) {
+        Ok(settings) => {
+            state.settings.locked_regions = settings.locked_regions;
+            state.settings.aspect_ratio = settings.aspect_ratio;
+        }
+        Err(error) => {
+            state.settings = previous;
+            unsafe {
+                show_capture_message(
+                    state.hwnd,
+                    "Screen Cap'n Settings",
+                    &format!("The locked region could not be saved.\n\n{error}"),
+                    MB_ICONWARNING,
+                );
+            }
         }
     }
 }
@@ -2916,17 +3061,28 @@ fn toggle_region_lock(state: &mut OverlayState) {
             .settings
             .set_locked_region(monitor_id, monitor, region);
     }
-    if let Err(error) = save_settings(&state.settings) {
-        state.settings = previous;
-        unsafe {
-            show_capture_message(
-                state.hwnd,
-                "Screen Cap'n Settings",
-                &format!("The region lock could not be changed.\n\n{error}"),
-                MB_ICONWARNING,
-            );
+    let locked_regions = state.settings.locked_regions.clone();
+    let aspect_ratio = state.settings.aspect_ratio;
+    match update_settings(|settings| {
+        settings.locked_regions = locked_regions;
+        settings.aspect_ratio = aspect_ratio;
+    }) {
+        Ok(settings) => {
+            state.settings.locked_regions = settings.locked_regions;
+            state.settings.aspect_ratio = settings.aspect_ratio;
         }
-        return;
+        Err(error) => {
+            state.settings = previous;
+            unsafe {
+                show_capture_message(
+                    state.hwnd,
+                    "Screen Cap'n Settings",
+                    &format!("The region lock could not be changed.\n\n{error}"),
+                    MB_ICONWARNING,
+                );
+            }
+            return;
+        }
     }
     if unlocking {
         reset_to_auto_region_selection(state);
@@ -3173,7 +3329,7 @@ fn handle_mouse_wheel(
 }
 
 fn monitor_full_region_for_rect(state: &OverlayState, region: Rect) -> Option<Rect> {
-    unsafe { monitor_full_region_at(region.center()) }.or_else(|| Some(state.screen_bounds))
+    unsafe { monitor_full_region_at(region.center()) }.or(Some(state.screen_bounds))
 }
 
 unsafe extern "system" fn enum_detected_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -3198,7 +3354,7 @@ unsafe fn is_app_root_window(hwnd: HWND) -> bool {
         return false;
     }
 
-    if GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| owner.0 != std::ptr::null_mut()) {
+    if GetWindow(hwnd, GW_OWNER).is_ok_and(|owner| !owner.0.is_null()) {
         return false;
     }
 
@@ -3212,9 +3368,7 @@ unsafe fn is_app_root_window(hwnd: HWND) -> bool {
 }
 
 unsafe fn detected_region_from_hwnd(hwnd: HWND) -> Option<DetectedRegion> {
-    let Some(window) = frame_rect_for_window(hwnd) else {
-        return None;
-    };
+    let window = frame_rect_for_window(hwnd)?;
     if !window.is_visible() {
         return None;
     }
@@ -3573,66 +3727,75 @@ fn update_cursor_for_hover(state: &OverlayState, point: Point) {
             || state
                 .region_control_bounds
                 .is_some_and(|rect| rect.contains(point))
-        {
-            IDC_ARROW
-        } else if state
-            .toolbar_buttons
-            .iter()
-            .any(|button| matches!(button.tool, ToolbarAction::Grip) && button.rect.contains(point))
+            || state
+                .toolbar_buttons
+                .iter()
+                .any(|button| button.rect.contains(point))
         {
             IDC_HAND
-        } else if state
-            .toolbar_buttons
-            .iter()
-            .any(|button| button.rect.contains(point))
-        {
-            IDC_ARROW
         } else if let Some(region) = state.region_overlay() {
-            if let Some(handle) = region.hit_resize_handle(point, REGION_RESIZE_HIT_RADIUS) {
-                cursor_for_resize_handle(handle)
-            } else if region_frame_contains(region, point) {
-                IDC_SIZEALL
-            } else {
-                let screen_point = state.overlay_to_screen(point);
-                if let Some(annotation) = state
+            let screen_point = state.overlay_to_screen(point);
+            let selected_annotation = state
+                .session
+                .document
+                .selected_annotation_id
+                .and_then(|id| state.session.document.annotation(id))
+                .filter(|annotation| {
+                    hit_annotation_edit_handle(state, annotation, screen_point).is_some()
+                        || annotation_hit_test(annotation, screen_point)
+                });
+            let annotation = selected_annotation.or_else(|| {
+                state
                     .session
                     .document
                     .annotations
                     .iter()
                     .rev()
                     .find(|annotation| annotation_hit_test(annotation, screen_point))
-                {
-                    if let Some(edit) = hit_annotation_edit_handle(state, annotation, screen_point)
-                    {
-                        match edit {
-                            AnnotationEdit::BoxResize(handle) => cursor_for_resize_handle(handle),
-                            AnnotationEdit::LineStart
-                            | AnnotationEdit::LineEnd
-                            | AnnotationEdit::TagAnchor => IDC_SIZEALL,
-                        }
-                    } else {
-                        IDC_SIZEALL
+            });
+            if let Some(annotation) = annotation {
+                if let Some(edit) = hit_annotation_edit_handle(state, annotation, screen_point) {
+                    match edit {
+                        AnnotationEdit::BoxResize(handle) => cursor_for_resize_handle(handle),
+                        AnnotationEdit::LineStart
+                        | AnnotationEdit::LineEnd
+                        | AnnotationEdit::TagAnchor => IDC_SIZEALL,
                     }
-                } else if region.contains(point) {
-                    IDC_CROSS
                 } else {
-                    IDC_ARROW
+                    IDC_SIZEALL
                 }
+            } else if let Some(handle) =
+                region.hit_resize_handle(point, state.responsive_metrics.region_handle_hit_radius)
+            {
+                cursor_for_resize_handle(handle)
+            } else if region_frame_contains(state, region, point) {
+                IDC_SIZEALL
+            } else {
+                IDC_CROSS
             }
         } else {
             IDC_CROSS
         };
+        if cursor == IDC_CROSS && native_selection_crosshair_active(state) {
+            let _ = SetCursor(HCURSOR::default());
+            return;
+        }
         if let Ok(handle) = LoadCursorW(None, cursor) {
             let _ = SetCursor(handle);
         }
     }
 }
 
+fn native_selection_crosshair_active(state: &OverlayState) -> bool {
+    !web_ui_owns_pointer_input(state) && state.session.document.capture_region.is_none()
+}
+
 fn hit_annotation_edit_handle(
-    _state: &OverlayState,
+    state: &OverlayState,
     annotation: &Annotation,
     screen_point: Point,
 ) -> Option<AnnotationEdit> {
+    let hit_radius = state.responsive_metrics.annotation_handle_hit_radius;
     match &annotation.kind {
         AnnotationKind::Line { start, end }
         | AnnotationKind::Arrow { start, end }
@@ -3642,9 +3805,9 @@ fn hit_annotation_edit_handle(
             end,
             ..
         } => {
-            if near_point(screen_point, *start, HANDLE_RADIUS + 14.0) {
+            if near_point(screen_point, *start, hit_radius) {
                 Some(AnnotationEdit::LineStart)
-            } else if near_point(screen_point, *end, HANDLE_RADIUS + 14.0) {
+            } else if near_point(screen_point, *end, hit_radius) {
                 Some(AnnotationEdit::LineEnd)
             } else {
                 None
@@ -3652,11 +3815,10 @@ fn hit_annotation_edit_handle(
         }
         AnnotationKind::Tag { anchor, .. } => annotation
             .bounds
-            .hit_resize_handle(screen_point, HANDLE_RADIUS + 20.0)
+            .hit_resize_handle(screen_point, hit_radius)
             .map(AnnotationEdit::BoxResize)
             .or_else(|| {
-                near_point(screen_point, *anchor, HANDLE_RADIUS + 18.0)
-                    .then_some(AnnotationEdit::TagAnchor)
+                near_point(screen_point, *anchor, hit_radius).then_some(AnnotationEdit::TagAnchor)
             }),
         AnnotationKind::Text {
             text,
@@ -3664,12 +3826,12 @@ fn hit_annotation_edit_handle(
             framed,
             ..
         } => text_annotation_hit_bounds(annotation.bounds, text, *font_size, *framed)
-            .hit_resize_handle(screen_point, HANDLE_RADIUS + 20.0)
+            .hit_resize_handle(screen_point, hit_radius)
             .map(AnnotationEdit::BoxResize),
         AnnotationKind::Pen { .. } | AnnotationKind::PenArrow { .. } => None,
         _ => annotation
             .bounds
-            .hit_resize_handle(screen_point, HANDLE_RADIUS + 14.0)
+            .hit_resize_handle(screen_point, hit_radius)
             .map(AnnotationEdit::BoxResize),
     }
 }
@@ -3831,6 +3993,32 @@ mod annotation_edit_tests {
     }
 
     #[test]
+    fn tag_side_resize_changes_one_axis_and_keeps_anchor_fixed() {
+        let anchor = Point::new(340.0, 260.0);
+        let original = annotation(AnnotationKind::Tag {
+            label: "Review this".to_string(),
+            font_size: 27.0,
+            anchor,
+        });
+
+        let east = edited_annotation(
+            &original,
+            AnnotationEdit::BoxResize(ResizeHandle::East),
+            Point::new(360.0, 150.0),
+        );
+        assert_eq!(east.bounds, Rect::new(100.0, 100.0, 260.0, 100.0));
+        assert!(matches!(east.kind, AnnotationKind::Tag { anchor: next, .. } if next == anchor));
+
+        let south = edited_annotation(
+            &original,
+            AnnotationEdit::BoxResize(ResizeHandle::South),
+            Point::new(200.0, 240.0),
+        );
+        assert_eq!(south.bounds, Rect::new(100.0, 100.0, 200.0, 140.0));
+        assert!(matches!(south.kind, AnnotationKind::Tag { anchor: next, .. } if next == anchor));
+    }
+
+    #[test]
     fn unsupported_edit_operations_do_not_mutate_annotations() {
         let line = annotation(AnnotationKind::Line {
             start: Point::new(100.0, 100.0),
@@ -3881,6 +4069,30 @@ mod annotation_edit_tests {
         assert_eq!(submenu_content_width(ToolKind::Tag), 436.0);
         assert_eq!(submenu_content_width(ToolKind::Watermark), 516.0);
     }
+
+    #[test]
+    fn annotation_tool_cycle_advances_from_the_default_rectangle() {
+        assert_eq!(
+            next_annotation_tool(ToolKind::Rectangle, false),
+            ToolKind::Oval
+        );
+        assert_eq!(
+            next_annotation_tool(ToolKind::Rectangle, true),
+            ToolKind::StepNumber
+        );
+    }
+
+    #[test]
+    fn annotation_tool_cycle_wraps_in_both_directions() {
+        assert_eq!(
+            next_annotation_tool(ToolKind::Mosaic, false),
+            ToolKind::StepNumber
+        );
+        assert_eq!(
+            next_annotation_tool(ToolKind::StepNumber, true),
+            ToolKind::Mosaic
+        );
+    }
 }
 
 fn line_bounds(kind: &AnnotationKind) -> Rect {
@@ -3907,6 +4119,7 @@ fn cursor_for_resize_handle(handle: ResizeHandle) -> windows::core::PCWSTR {
 }
 
 fn handle_mouse_up(state: &mut OverlayState, point: Point) {
+    let had_capture_region = state.session.document.capture_region.is_some();
     let Some(drag) = state.drag.take() else {
         return;
     };
@@ -3963,7 +4176,9 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
                 state.editing_text_caret =
                     caret_index.unwrap_or_else(|| annotation_text_len(state, id));
                 state.editing_step_number_id = None;
-                state.editing_step_number_replace = false;
+                state.editing_step_number_buffer.clear();
+                state.editing_step_number_select_all = false;
+                state.editing_step_number_original = None;
                 state.editing_watermark_text = false;
             }
         }
@@ -4007,6 +4222,45 @@ fn handle_mouse_up(state: &mut OverlayState, point: Point) {
             }
         }
     }
+    if !had_capture_region && state.session.document.capture_region.is_some() {
+        activate_capture_tip(state);
+    }
+}
+
+fn activate_capture_tip(state: &mut OverlayState) {
+    let Some(definition) = tips::take_next_persisted_tip() else {
+        return;
+    };
+    state.active_tip = Some(ActiveTip {
+        definition,
+        shown_at: Instant::now(),
+        hovered: false,
+    });
+    unsafe {
+        let _ = SetTimer(state.hwnd, CAPTURE_TIP_TIMER_ID, 33, None);
+    }
+}
+
+fn set_capture_tips_enabled(state: &mut OverlayState, enabled: bool) -> bool {
+    if state.settings.show_capture_tips == enabled {
+        return false;
+    }
+    match update_settings(|settings| settings.show_capture_tips = enabled) {
+        Ok(settings) => {
+            state.settings = settings;
+            if !enabled {
+                state.active_tip = None;
+                unsafe {
+                    let _ = KillTimer(state.hwnd, CAPTURE_TIP_TIMER_ID);
+                }
+            }
+            true
+        }
+        Err(error) => {
+            diagnostics::log_event("settings", &format!("capture-tips-save-failed: {error}"));
+            false
+        }
+    }
 }
 
 fn shift_key_down() -> bool {
@@ -4017,8 +4271,33 @@ fn ctrl_key_down() -> bool {
     unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
 }
 
+fn next_annotation_tool(current: ToolKind, backward: bool) -> ToolKind {
+    let current_index = ANNOTATION_TOOL_CYCLE
+        .iter()
+        .position(|tool| *tool == current)
+        .unwrap_or(1);
+    let offset = if backward {
+        ANNOTATION_TOOL_CYCLE.len() - 1
+    } else {
+        1
+    };
+    ANNOTATION_TOOL_CYCLE[(current_index + offset) % ANNOTATION_TOOL_CYCLE.len()]
+}
+
+fn cycle_annotation_tool(state: &mut OverlayState, backward: bool) {
+    if state.session.document.capture_region.is_none() {
+        return;
+    }
+    let next = next_annotation_tool(state.active_tool, backward);
+    handle_toolbar_action(state, ToolbarAction::Tool(next));
+}
+
 fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     let ctrl_down = unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 };
+    if key == VK_TAB.0 as u32 && ctrl_down {
+        let _ = cycle_active_color(state, shift_down);
+        return;
+    }
     if state.editing_watermark_text && !ctrl_down {
         match key {
             0x1B => deselect_all(state),
@@ -4060,13 +4339,27 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
     }
     if state.editing_step_number_id.is_some() && !ctrl_down {
         match key {
-            0x1B => deselect_all(state),
-            key if key == VK_RETURN.0 as u32 => {
-                state.editing_step_number_id = None;
-                state.editing_step_number_replace = false;
+            0x1B => {
+                finish_step_number_editing(state, false);
+                deselect_all(state);
             }
-            0x08 => edit_selected_step_number(state, |number| number / 10),
-            0x2E => edit_selected_step_number(state, |_| 0),
+            key if key == VK_RETURN.0 as u32 => {
+                finish_step_number_editing(state, true);
+            }
+            0x08 => {
+                if state.editing_step_number_select_all {
+                    state.editing_step_number_buffer.clear();
+                } else {
+                    state.editing_step_number_buffer.pop();
+                }
+                state.editing_step_number_select_all = false;
+                state.mark_static_dirty();
+            }
+            0x2E => {
+                state.editing_step_number_buffer.clear();
+                state.editing_step_number_select_all = false;
+                state.mark_static_dirty();
+            }
             _ => {}
         }
         return;
@@ -4082,6 +4375,7 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
                 }
             }
         }
+        key if key == VK_TAB.0 as u32 => cycle_annotation_tool(state, shift_down),
         key if key == VK_RETURN.0 as u32 => {
             if state.session.document.capture_region.is_none() {
                 if let Some(region) = state.smart_region.as_ref().map(|candidate| candidate.rect) {
@@ -4091,6 +4385,7 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
                     state.toolbar_origin = Some(default_toolbar_origin(state, overlay_region));
                     state.defer_watermark_static_redraw_once = true;
                     state.mark_static_dirty();
+                    activate_capture_tip(state);
                     return;
                 }
             }
@@ -4098,11 +4393,9 @@ fn handle_key_down(state: &mut OverlayState, key: u32, shift_down: bool) {
                 complete_copy_action(state);
             }
         }
-        0x5A if ctrl_down => {
-            if state.session.undo() {
-                state.force_web_full_snapshot = true;
-                state.mark_static_dirty();
-            }
+        0x5A if ctrl_down && state.session.undo() => {
+            state.force_web_full_snapshot = true;
+            state.mark_static_dirty();
         }
         0x53 if ctrl_down => unsafe {
             complete_save_action(state);
@@ -4129,16 +4422,14 @@ fn handle_char(state: &mut OverlayState, char_code: u32) {
         return;
     }
     if state.editing_step_number_id.is_some() {
-        if let Some(digit) = ch.to_digit(10) {
-            let replace = state.editing_step_number_replace;
-            edit_selected_step_number(state, |number| {
-                if replace {
-                    digit
-                } else {
-                    number.saturating_mul(10).saturating_add(digit)
-                }
-            });
-            state.editing_step_number_replace = false;
+        if ch.is_ascii_digit() {
+            if state.editing_step_number_select_all {
+                state.editing_step_number_buffer.clear();
+            }
+            if state.editing_step_number_buffer.len() < 4 {
+                state.editing_step_number_buffer.push(ch);
+            }
+            state.editing_step_number_select_all = false;
             state.mark_static_dirty();
         }
         return;
@@ -4165,22 +4456,6 @@ fn editing_text_accepts_line_break(state: &OverlayState) -> bool {
                 AnnotationKind::Text { .. } | AnnotationKind::Tag { .. }
             )
         })
-}
-
-fn edit_selected_step_number(state: &mut OverlayState, edit: impl FnOnce(u32) -> u32) {
-    let Some(id) = state.editing_step_number_id else {
-        return;
-    };
-    if let Some(annotation) = state.session.document.annotation_mut(id) {
-        let current = annotation.display_step_number().unwrap_or(0);
-        let next = edit(current);
-        match &mut annotation.kind {
-            AnnotationKind::StepNumber { number } => *number = next,
-            _ => annotation.step_number = Some(next),
-        }
-        state.next_step_number = state.next_step_number.max(next.saturating_add(1));
-        state.editing_step_number_replace = false;
-    }
 }
 
 fn edit_selected_text(state: &mut OverlayState, edit: impl FnOnce(&mut String)) {
@@ -4429,21 +4704,31 @@ fn handle_toolbar_action(state: &mut OverlayState, action: ToolbarAction) {
             finish_text_editing(state);
             deselect_all(state);
             if state.active_tool == ToolKind::Highlighter && tool != ToolKind::Highlighter {
+                state.highlighter_stroke_color = state.current_stroke.color;
                 state.current_stroke.color = state.normal_stroke_color;
             } else if state.active_tool != ToolKind::Highlighter && tool == ToolKind::Highlighter {
                 state.normal_stroke_color = state.current_stroke.color;
+                state.current_stroke.color = state.highlighter_stroke_color;
             }
             state.active_tool = tool;
             set_active_tool_stroke_width(state, tool);
-            if tool == ToolKind::Highlighter {
-                state.current_stroke.color = annotation_colors()[2];
-            }
             if tool == ToolKind::Watermark {
                 state.editing_watermark_text = true;
             }
             state.active_submenu = configurable_submenu_tool(tool);
         }
         ToolbarAction::Divider => state.active_submenu = None,
+        ToolbarAction::Update => {
+            state.active_submenu = None;
+            unsafe {
+                let _ = PostMessageW(
+                    state.owner,
+                    WM_OVERLAY_SHOW_UPDATE,
+                    WPARAM(state.hwnd.0 as usize),
+                    LPARAM(0),
+                );
+            }
+        }
         ToolbarAction::Undo => {
             state.active_submenu = None;
             if state.session.undo() {
@@ -4538,12 +4823,78 @@ fn configurable_submenu_tool(tool: ToolKind) -> Option<ToolKind> {
     .then_some(tool)
 }
 
+#[derive(Clone, Copy)]
+enum ColorContext {
+    Annotation,
+    Highlighter,
+    Watermark,
+}
+
+fn active_color_context(state: &OverlayState) -> Option<ColorContext> {
+    match state.active_submenu? {
+        ToolKind::Highlighter => Some(ColorContext::Highlighter),
+        ToolKind::Watermark => Some(ColorContext::Watermark),
+        ToolKind::Rectangle
+        | ToolKind::Oval
+        | ToolKind::Line
+        | ToolKind::Arrow
+        | ToolKind::Pen
+        | ToolKind::Text
+        | ToolKind::Tag => Some(ColorContext::Annotation),
+        ToolKind::StepNumber | ToolKind::Mosaic => None,
+    }
+}
+
+fn active_context_color(state: &OverlayState, context: ColorContext) -> Color {
+    match context {
+        ColorContext::Annotation => state.normal_stroke_color,
+        ColorContext::Highlighter => state.highlighter_stroke_color,
+        ColorContext::Watermark => state.watermark_color,
+    }
+}
+
+fn cycle_active_color(state: &mut OverlayState, backward: bool) -> bool {
+    let Some(context) = active_color_context(state) else {
+        return false;
+    };
+    let colors = annotation_colors();
+    let current = active_context_color(state, context);
+    let current_index = colors
+        .iter()
+        .position(|color| color.r == current.r && color.g == current.g && color.b == current.b)
+        .unwrap_or(0);
+    let offset = if backward { colors.len() - 1 } else { 1 };
+    let color = colors[(current_index + offset) % colors.len()];
+    handle_submenu_action(state, SubmenuAction::Color(color));
+    true
+}
+
+fn persist_active_color_default(state: &mut OverlayState, color: Color) -> bool {
+    let Some(context) = active_color_context(state) else {
+        return false;
+    };
+    let dto = RgbDto::from_color(color);
+    match update_settings(|settings| match context {
+        ColorContext::Annotation => settings.color_defaults.annotation = dto,
+        ColorContext::Highlighter => settings.color_defaults.highlighter = dto,
+        ColorContext::Watermark => settings.color_defaults.watermark = dto,
+    }) {
+        Ok(settings) => {
+            state.settings.color_defaults = settings.color_defaults;
+            true
+        }
+        Err(error) => {
+            diagnostics::log_event("settings", &format!("color-default-save-failed: {error}"));
+            false
+        }
+    }
+}
+
 fn finish_text_editing(state: &mut OverlayState) {
+    finish_step_number_editing(state, true);
     state.editing_text_id = None;
     state.editing_text_caret = 0;
     state.editing_watermark_text = false;
-    state.editing_step_number_id = None;
-    state.editing_step_number_replace = false;
 }
 
 fn should_remove_empty_text_annotation(state: &OverlayState, id: AnnotationId) -> bool {
@@ -4571,20 +4922,74 @@ fn handle_numbering_mode(state: &mut OverlayState, mode: &str) {
 }
 
 fn start_step_number_editing(state: &mut OverlayState, id: AnnotationId) {
-    if state
+    finish_step_number_editing(state, true);
+    let original = state
         .session
         .document
         .annotations
         .iter()
-        .any(|annotation| annotation.id == id && annotation.display_step_number().is_some())
-    {
-        state.checkpoint();
+        .find(|annotation| annotation.id == id)
+        .and_then(Annotation::display_step_number);
+    if let Some(original) = original {
         state.editing_text_id = None;
         state.editing_watermark_text = false;
         state.editing_step_number_id = Some(id);
-        state.editing_step_number_replace = true;
+        state.editing_step_number_buffer = original.to_string();
+        state.editing_step_number_select_all = true;
+        state.editing_step_number_original = Some(original);
         state.session.select_annotation(Some(id));
+        state.mark_static_dirty();
     }
+}
+
+fn select_step_number(state: &mut OverlayState, id: AnnotationId) -> bool {
+    finish_step_number_editing(state, true);
+    let is_number = state
+        .session
+        .document
+        .annotation(id)
+        .and_then(Annotation::display_step_number)
+        .is_some();
+    if !is_number {
+        return false;
+    }
+    state.editing_text_id = None;
+    state.editing_text_caret = 0;
+    state.editing_watermark_text = false;
+    state.session.select_annotation(Some(id));
+    sync_selected_annotation_controls(state, id);
+    state.mark_static_dirty();
+    true
+}
+
+fn finish_step_number_editing(state: &mut OverlayState, commit: bool) {
+    let Some(id) = state.editing_step_number_id else {
+        return;
+    };
+
+    let next = commit
+        .then(|| state.editing_step_number_buffer.parse::<u32>().ok())
+        .flatten()
+        .filter(|number| (1..=9_999).contains(number));
+    if let Some(next) = next {
+        let changed = state.editing_step_number_original != Some(next);
+        if changed {
+            state.checkpoint();
+            if let Some(annotation) = state.session.document.annotation_mut(id) {
+                match &mut annotation.kind {
+                    AnnotationKind::StepNumber { number } => *number = next,
+                    _ => annotation.step_number = Some(next),
+                }
+            }
+        }
+        state.next_step_number = next.saturating_add(1);
+    }
+
+    state.editing_step_number_id = None;
+    state.editing_step_number_buffer.clear();
+    state.editing_step_number_select_all = false;
+    state.editing_step_number_original = None;
+    state.mark_static_dirty();
 }
 
 fn handle_submenu_action(state: &mut OverlayState, action: SubmenuAction) {
@@ -4610,7 +5015,9 @@ fn handle_submenu_action(state: &mut OverlayState, action: SubmenuAction) {
                 state.watermark_color = color;
             } else {
                 state.current_stroke.color = color;
-                if state.active_tool != ToolKind::Highlighter {
+                if state.active_tool == ToolKind::Highlighter {
+                    state.highlighter_stroke_color = color;
+                } else {
                     state.normal_stroke_color = color;
                 }
             }
@@ -4622,7 +5029,10 @@ fn handle_submenu_action(state: &mut OverlayState, action: SubmenuAction) {
             if state.active_submenu == Some(ToolKind::Watermark) || state.editing_watermark_text {
                 state.watermark_font_size = size.clamp(MIN_WATERMARK_FONT_SIZE, MAX_FONT_SIZE);
             } else {
-                state.font_size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+                state.font_size = size.clamp(
+                    state.responsive_metrics.font_min,
+                    state.responsive_metrics.font_max,
+                );
             }
         }
         SubmenuAction::WatermarkMode(mode) => handle_watermark_mode_action(state, mode),
@@ -4982,6 +5392,9 @@ unsafe fn paint_overlay(state: &mut OverlayState) {
                     draw_tool_submenu(back_dc, state);
                 }
             }
+            if native_ui_fallback {
+                draw_active_capture_tip(back_dc, state);
+            }
         }
     } else if let Some(cache) = state.render_cache.as_ref() {
         paint_overlay_surface(cache.back_dc, state);
@@ -5089,9 +5502,10 @@ unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
         let region = Rect::from_points(start, current);
         draw_region_gradient_border(hdc, state, region);
         if !web_ui_owns_pointer_input(state) {
-            draw_crosshair_guides(hdc, state, current);
-            draw_sniper_cursor(hdc, current);
-            draw_pixel_magnifier(hdc, state, current);
+            let cursor = live_overlay_cursor_position(state, current);
+            draw_crosshair_guides(hdc, state, cursor);
+            draw_sniper_cursor(hdc, state, cursor);
+            draw_pixel_magnifier(hdc, state, cursor);
         }
     } else if let Some(region) = state.smart_region.as_ref().map(|candidate| {
         candidate
@@ -5105,14 +5519,25 @@ unsafe fn paint_overlay_surface(hdc: HDC, state: &mut OverlayState) {
             draw_region_controls(hdc, state, region);
         }
         if !web_ui_owns_pointer_input(state) {
-            draw_crosshair_guides(hdc, state, state.cursor_position);
-            draw_sniper_cursor(hdc, state.cursor_position);
-            draw_pixel_magnifier(hdc, state, state.cursor_position);
+            let cursor = live_overlay_cursor_position(state, state.cursor_position);
+            draw_crosshair_guides(hdc, state, cursor);
+            draw_sniper_cursor(hdc, state, cursor);
+            draw_pixel_magnifier(hdc, state, cursor);
         }
     } else if !web_ui_owns_pointer_input(state) {
-        draw_crosshair_guides(hdc, state, state.cursor_position);
-        draw_sniper_cursor(hdc, state.cursor_position);
-        draw_pixel_magnifier(hdc, state, state.cursor_position);
+        let cursor = live_overlay_cursor_position(state, state.cursor_position);
+        draw_crosshair_guides(hdc, state, cursor);
+        draw_sniper_cursor(hdc, state, cursor);
+        draw_pixel_magnifier(hdc, state, cursor);
+    }
+}
+
+unsafe fn live_overlay_cursor_position(state: &OverlayState, fallback: Point) -> Point {
+    let mut cursor = POINT::default();
+    if GetCursorPos(&mut cursor).is_ok() {
+        state.screen_to_overlay(Point::new(cursor.x as f32, cursor.y as f32))
+    } else {
+        fallback
     }
 }
 
@@ -5123,94 +5548,121 @@ unsafe fn draw_crosshair_guides(hdc: HDC, state: &OverlayState, point: Point) {
         return;
     }
 
-    let x = point.x.clamp(0.0, width);
-    let y = point.y.clamp(0.0, height);
-    let gap = 26.0;
-    let dpi = GetDpiForWindow(state.hwnd).max(96) as f32;
-    let guide_length = 75.6 * dpi / 96.0;
+    let x = point.x.round().clamp(0.0, width);
+    let y = point.y.round().clamp(0.0, height);
+    let gap = state.responsive_metrics.crosshair_gap;
+    let guide_length = state.responsive_metrics.crosshair_length;
+    let guide_width = state.responsive_metrics.crosshair_width;
     let left = (x - guide_length).max(0.0);
     let right = (x + guide_length).min(width);
     let top = (y - guide_length).max(0.0);
     let bottom = (y + guide_length).min(height);
-    let color = Color::rgb(0xff, 0x3b, 0x30);
-    let source_dc = CreateCompatibleDC(hdc);
-    let source_bitmap = CreateCompatibleBitmap(hdc, 1, 1);
-    let old_bitmap = SelectObject(source_dc, source_bitmap);
-    let brush = CreateSolidBrush(crate::util::colorref(color));
-    FillRect(
-        source_dc,
-        &rect_to_rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
-        brush,
+    draw_fading_crosshair_arm(
+        hdc,
+        Rect::new(
+            left,
+            y - guide_width / 2.0,
+            (x - gap - left).max(0.0),
+            guide_width,
+        ),
+        true,
+        false,
     );
-    let blend = BLENDFUNCTION {
-        BlendOp: AC_SRC_OVER as u8,
-        BlendFlags: 0,
-        SourceConstantAlpha: 102,
-        AlphaFormat: 0,
-    };
-
-    for rect in [
-        Rect::new(left, y, (x - gap - left).max(0.0), 1.0),
-        Rect::new((x + gap).min(right), y, (right - x - gap).max(0.0), 1.0),
-        Rect::new(x, top, 1.0, (y - gap - top).max(0.0)),
-        Rect::new(x, (y + gap).min(bottom), 1.0, (bottom - y - gap).max(0.0)),
-    ] {
-        let destination_width = rect.width.round() as i32;
-        let destination_height = rect.height.round() as i32;
-        if destination_width <= 0 || destination_height <= 0 {
-            continue;
-        }
-        let _ = AlphaBlend(
-            hdc,
-            rect.x.round() as i32,
-            rect.y.round() as i32,
-            destination_width,
-            destination_height,
-            source_dc,
-            0,
-            0,
-            1,
-            1,
-            blend,
-        );
-    }
-
-    let _ = DeleteObject(brush);
-    let _ = SelectObject(source_dc, old_bitmap);
-    let _ = DeleteObject(source_bitmap);
-    let _ = DeleteDC(source_dc);
+    draw_fading_crosshair_arm(
+        hdc,
+        Rect::new(
+            (x + gap).min(right),
+            y - guide_width / 2.0,
+            (right - x - gap).max(0.0),
+            guide_width,
+        ),
+        true,
+        true,
+    );
+    draw_fading_crosshair_arm(
+        hdc,
+        Rect::new(
+            x - guide_width / 2.0,
+            top,
+            guide_width,
+            (y - gap - top).max(0.0),
+        ),
+        false,
+        false,
+    );
+    draw_fading_crosshair_arm(
+        hdc,
+        Rect::new(
+            x - guide_width / 2.0,
+            (y + gap).min(bottom),
+            guide_width,
+            (bottom - y - gap).max(0.0),
+        ),
+        false,
+        true,
+    );
 }
 
-unsafe fn draw_sniper_cursor(hdc: HDC, point: Point) {
+unsafe fn draw_fading_crosshair_arm(hdc: HDC, rect: Rect, horizontal: bool, inner_at_start: bool) {
+    let width = rect.width.round().max(0.0) as u32;
+    let height = rect.height.round().max(0.0) as u32;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let length = if horizontal { width } else { height };
+    let denominator = length.saturating_sub(1).max(1) as f32;
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let index = if horizontal { x } else { y };
+            let distance = if inner_at_start {
+                index
+            } else {
+                length.saturating_sub(1).saturating_sub(index)
+            };
+            let alpha = (102.0 * (1.0 - distance as f32 / denominator))
+                .round()
+                .clamp(0.0, 102.0) as u8;
+            let offset = ((y * width + x) * 4) as usize;
+            bgra[offset] = ((0x30_u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 1] = ((0x3b_u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 2] = alpha;
+            bgra[offset + 3] = alpha;
+        }
+    }
+    let _ = alpha_blend_bgra(
+        hdc,
+        Rect::new(rect.x.round(), rect.y.round(), width as f32, height as f32),
+        width,
+        height,
+        &bgra,
+    );
+}
+
+unsafe fn draw_sniper_cursor(hdc: HDC, state: &OverlayState, point: Point) {
     let color = Color::rgb(255, 255, 255);
-    let _pen = SelectedPen::new(hdc, 2.0, color);
-    let radius = 10.0;
-    let gap = 5.0;
-    let arm = 20.0;
-    let rect = rect_to_rect(Rect::new(
-        point.x - radius,
-        point.y - radius,
-        radius * 2.0,
-        radius * 2.0,
-    ));
-    let _brush = SelectedStockObject::null_brush(hdc);
-    let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+    let visual_scale = state.responsive_metrics.visual_scale;
+    let _pen = SelectedPen::new(hdc, 1.0, color);
+    let center = Point::new(point.x.round(), point.y.round());
+    let gap = (3.0 * visual_scale).max(2.0);
+    let arm = (12.0 * visual_scale).max(8.0);
     for (start, end) in [
         (
-            Point::new(point.x - arm, point.y),
-            Point::new(point.x - gap, point.y),
+            Point::new(center.x - arm, center.y),
+            Point::new(center.x - gap, center.y),
         ),
         (
-            Point::new(point.x + gap, point.y),
-            Point::new(point.x + arm, point.y),
+            Point::new(center.x + gap, center.y),
+            Point::new(center.x + arm, center.y),
         ),
         (
-            Point::new(point.x, point.y - arm),
-            Point::new(point.x, point.y - gap),
+            Point::new(center.x, center.y - arm),
+            Point::new(center.x, center.y - gap),
         ),
         (
-            Point::new(point.x, point.y + gap),
-            Point::new(point.x, point.y + arm),
+            Point::new(center.x, center.y + gap),
+            Point::new(center.x, center.y + arm),
         ),
     ] {
         let _ = MoveToEx(hdc, start.x.round() as i32, start.y.round() as i32, None);
@@ -5313,7 +5765,7 @@ unsafe fn draw_region_control_backdrop(hdc: HDC, state: &OverlayState, region: R
     alpha_gradient_rect(
         hdc,
         Rect::new(region.x, region.y, region.width, height),
-        0.85,
+        0.75,
         1.65,
     );
 }
@@ -5330,14 +5782,18 @@ unsafe fn draw_region_gradient_border(hdc: HDC, state: &OverlayState, region: Re
     if !visible.is_visible() {
         return;
     }
-    let inset = 3.0;
+    let visual_scale = state.responsive_metrics.visual_scale;
+    let inset = (3.0 * visual_scale).max(1.5);
     let rect = Rect::new(
         visible.x + inset,
         visible.y + inset,
         (visible.width - inset * 2.0).max(1.0),
         (visible.height - inset * 2.0).max(1.0),
     );
-    let radius = 7.0_f32.min(rect.width / 2.0).min(rect.height / 2.0);
+    let radius = (7.0 * visual_scale)
+        .max(3.0)
+        .min(rect.width / 2.0)
+        .min(rect.height / 2.0);
     let points = rounded_region_border_points(rect, radius);
     if points.len() < 2 {
         return;
@@ -5346,7 +5802,7 @@ unsafe fn draw_region_gradient_border(hdc: HDC, state: &OverlayState, region: Re
     let count = points.len() - 1;
     for index in 0..count {
         let color = animated_region_border_color(index as f32 / count as f32 + phase);
-        let _pen = SelectedPen::new(hdc, 2.0, color);
+        let _pen = SelectedPen::new(hdc, (2.0 * visual_scale).max(1.0), color);
         let start = points[index];
         let end = points[index + 1];
         let _ = MoveToEx(hdc, start.x.round() as i32, start.y.round() as i32, None);
@@ -5636,11 +6092,24 @@ unsafe fn draw_region_controls(hdc: HDC, state: &mut OverlayState, region: Rect)
     let gap = scaled(state, REGION_CONTROL_GAP);
     let margin = scaled(state, REGION_CONTROL_MARGIN);
     let divider_height = scaled(state, REGION_CONTROL_DIVIDER_HEIGHT);
-    let top = (region.y + margin).clamp(
+    let controls_width = lock_icon + ratio_icon + gap * 2.0;
+    let needs_outside = region.width < controls_width + scaled(state, 48.0)
+        || region.height < icon + margin * 2.0 + scaled(state, 36.0);
+    let outside_above = region.y - icon - scaled(state, 14.0);
+    let outside_below = region.bottom() + scaled(state, 14.0);
+    let preferred_top = if needs_outside {
+        if outside_above >= margin {
+            outside_above
+        } else {
+            outside_below
+        }
+    } else {
+        region.y + margin
+    };
+    let top = preferred_top.clamp(
         margin,
         (state.screen_bounds.height - icon - margin).max(margin),
     );
-    let controls_width = lock_icon + ratio_icon + gap * 2.0;
     let left = (region.center().x - controls_width / 2.0)
         .max(margin)
         .min((state.screen_bounds.width - controls_width - margin).max(margin));
@@ -5715,7 +6184,196 @@ fn ratio_svg(mode: AspectRatioMode) -> &'static str {
 }
 
 fn toolbar_width(state: &OverlayState) -> f32 {
-    scaled(state, 36.0 + 24.0 + 10.0 * 36.0 + 12.0 + 4.0 * 36.0 + 12.0)
+    toolbar_actions(state)
+        .into_iter()
+        .map(|action| toolbar_action_width(state, action))
+        .sum::<f32>()
+        + scaled(state, 12.0)
+}
+
+unsafe fn draw_active_capture_tip(hdc: HDC, state: &OverlayState) {
+    let Some(active) = state.active_tip else {
+        return;
+    };
+    let elapsed = active.shown_at.elapsed().as_secs_f32();
+    let duration = CAPTURE_TIP_DURATION.as_secs_f32();
+    if elapsed >= duration {
+        return;
+    }
+    let fade = if elapsed < 0.18 {
+        smoothstep(elapsed / 0.18)
+    } else if elapsed > duration - 0.45 {
+        smoothstep((duration - elapsed) / 0.45)
+    } else {
+        1.0
+    }
+    .clamp(0.0, 1.0);
+    if fade <= 0.01 {
+        return;
+    }
+
+    let ui_scale = state.responsive_metrics.ui_scale;
+    let font_size = (11.5 * ui_scale).max(10.0);
+    let icon_size = 18.7 * ui_scale;
+    let horizontal_padding = 12.0 * ui_scale;
+    let gap = 7.0 * ui_scale;
+    let height = 34.0 * ui_scale;
+    let font = CreateFontW(
+        -(font_size.round().max(1.0) as i32),
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        w!("Segoe UI Variable"),
+    );
+    let old_font = SelectObject(hdc, font);
+    let segments = tips::segments(active.definition.text);
+    let mut segment_widths = Vec::with_capacity(segments.len());
+    let mut text_width = 0.0_f32;
+    let mut text_height = font_size;
+    for segment in &segments {
+        let wide = segment.text.encode_utf16().collect::<Vec<_>>();
+        let mut size = SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+        let width = size.cx.max(0) as f32;
+        text_width += width;
+        text_height = text_height.max(size.cy.max(0) as f32);
+        segment_widths.push(width);
+    }
+
+    let width = (horizontal_padding * 2.0 + icon_size + gap + text_width)
+        .min(state.screen_bounds.width - 16.0 * ui_scale)
+        .max(120.0 * ui_scale);
+    let toolbar = state.toolbar_origin.map(|origin| {
+        Rect::new(
+            origin.x,
+            origin.y,
+            toolbar_width(state),
+            scaled(state, TOOLBAR_HEIGHT),
+        )
+    });
+    let center_x = toolbar
+        .map(|rect| rect.center().x)
+        .or_else(|| state.region_overlay().map(|rect| rect.center().x))
+        .unwrap_or(state.screen_bounds.width / 2.0);
+    let margin = 8.0 * ui_scale;
+    let below_offset = if state.active_submenu.is_some() {
+        scaled(state, SUBMENU_HEIGHT + 32.0)
+    } else {
+        margin
+    };
+    let preferred_y = toolbar
+        .map(|rect| rect.bottom() + below_offset)
+        .unwrap_or(margin);
+    let y = if preferred_y + height + margin <= state.screen_bounds.height {
+        preferred_y
+    } else {
+        toolbar
+            .map(|rect| rect.y - height - margin)
+            .unwrap_or(margin)
+            .max(margin)
+    };
+    let x = (center_x - width / 2.0)
+        .max(margin)
+        .min((state.screen_bounds.width - width - margin).max(margin));
+    let rect = Rect::new(x, y, width, height);
+    fill_rounded_gradient(
+        hdc,
+        rect,
+        height / 2.0,
+        Color::rgba(0, 0, 0, (127.5 * fade).round() as u8),
+        Color::rgba(0x33, 0x33, 0x33, (127.5 * fade).round() as u8),
+    );
+
+    let icon_rect = Rect::new(
+        rect.x + horizontal_padding,
+        rect.y + (rect.height - icon_size) / 2.0,
+        icon_size,
+        icon_size,
+    );
+    let icon_color = blend_color(Color::rgb(0x55, 0x55, 0x55), Color::WHITE, fade);
+    let mut svg = recolor_svg(include_str!("../assets/tips/tooltip.svg"), icon_color);
+    svg = svg.replacen("<svg ", &format!("<svg opacity=\"{:.3}\" ", fade), 1);
+    let _ = draw_svg(hdc, &svg, icon_rect);
+
+    let text_x = icon_rect.right() + gap;
+    let text_y = rect.y + (rect.height - text_height) / 2.0;
+    let text_color = blend_color(Color::rgb(0x4a, 0x4a, 0x4a), Color::WHITE, fade);
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, crate::util::colorref(text_color));
+    let mut cursor_x = text_x;
+    for (segment, segment_width) in segments.iter().zip(segment_widths) {
+        let wide = segment.text.encode_utf16().collect::<Vec<_>>();
+        let _ = TextOutW(hdc, cursor_x.round() as i32, text_y.round() as i32, &wide);
+        if segment.shortcut && segment_width > 0.0 {
+            let underline_y = text_y + text_height - 1.0 * ui_scale;
+            let _pen = SelectedPen::new(hdc, (0.8 * ui_scale).max(1.0), text_color);
+            let _ = MoveToEx(
+                hdc,
+                cursor_x.round() as i32,
+                underline_y.round() as i32,
+                None,
+            );
+            let _ = LineTo(
+                hdc,
+                (cursor_x + segment_width).round() as i32,
+                underline_y.round() as i32,
+            );
+        }
+        cursor_x += segment_width;
+    }
+    let _ = SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
+fn smoothstep(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    value * value * (3.0 - 2.0 * value)
+}
+
+unsafe fn fill_rounded_gradient(hdc: HDC, rect: Rect, radius: f32, left: Color, right: Color) {
+    let width = rect.width.round().max(1.0) as u32;
+    let height = rect.height.round().max(1.0) as u32;
+    let mut bgra = vec![0_u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let t = if width <= 1 {
+                0.0
+            } else {
+                x as f32 / (width - 1) as f32
+            };
+            let color = blend_color(left, right, t);
+            let coverage = rounded_rect_coverage(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                width as f32,
+                height as f32,
+                radius,
+            );
+            let alpha = (color.a as f32 * coverage).round() as u8;
+            let offset = ((y * width + x) * 4) as usize;
+            bgra[offset] = ((color.b as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 1] = ((color.g as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 2] = ((color.r as u16 * alpha as u16) / 255) as u8;
+            bgra[offset + 3] = alpha;
+        }
+    }
+    let _ = alpha_blend_bgra(hdc, rect, width, height, &bgra);
+}
+
+#[derive(Clone, Copy)]
+struct ActiveTip {
+    definition: TipDefinition,
+    shown_at: Instant,
+    hovered: bool,
 }
 
 fn toolbar_action_width(state: &OverlayState, action: ToolbarAction) -> f32 {
@@ -5737,6 +6395,34 @@ fn annotation_colors() -> [Color; 5] {
     ]
 }
 
+fn toolbar_actions(state: &OverlayState) -> Vec<ToolbarAction> {
+    let mut actions = vec![
+        ToolbarAction::Grip,
+        ToolbarAction::Numbering,
+        ToolbarAction::Tool(ToolKind::Rectangle),
+        ToolbarAction::Tool(ToolKind::Oval),
+        ToolbarAction::Tool(ToolKind::Line),
+        ToolbarAction::Tool(ToolKind::Arrow),
+        ToolbarAction::Tool(ToolKind::Pen),
+        ToolbarAction::Tool(ToolKind::Highlighter),
+        ToolbarAction::Tool(ToolKind::Text),
+        ToolbarAction::Tool(ToolKind::Tag),
+        ToolbarAction::Tool(ToolKind::Watermark),
+        ToolbarAction::Tool(ToolKind::Mosaic),
+        ToolbarAction::Divider,
+    ];
+    actions.extend([
+        ToolbarAction::Undo,
+        ToolbarAction::Copy,
+        ToolbarAction::Save,
+    ]);
+    if state.update_available {
+        actions.push(ToolbarAction::Update);
+    }
+    actions.push(ToolbarAction::Cancel);
+    actions
+}
+
 fn centered_icon_rect(state: &OverlayState, rect: Rect) -> Rect {
     let size = scaled(state, TOOL_ICON_SIZE);
     Rect::new(
@@ -5749,6 +6435,16 @@ fn centered_icon_rect(state: &OverlayState, rect: Rect) -> Rect {
 
 fn numbering_icon_rect(state: &OverlayState, rect: Rect) -> Rect {
     let size = scaled(state, 22.0);
+    Rect::new(
+        rect.x + (rect.width - size) / 2.0,
+        rect.y + (rect.height - size) / 2.0,
+        size,
+        size,
+    )
+}
+
+fn update_icon_rect(state: &OverlayState, rect: Rect) -> Rect {
+    let size = scaled(state, TOOL_ICON_SIZE * 1.1);
     Rect::new(
         rect.x + (rect.width - size) / 2.0,
         rect.y + (rect.height - size) / 2.0,
@@ -5802,7 +6498,7 @@ unsafe fn alpha_blend_bgra(
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
-            biSizeImage: (width * height * 4) as u32,
+            biSizeImage: width * height * 4,
             ..Default::default()
         },
         ..Default::default()
@@ -5967,25 +6663,7 @@ unsafe fn draw_toolbar_border(hdc: HDC, state: &OverlayState, rect: Rect, palett
 
 unsafe fn draw_toolbar(hdc: HDC, state: &mut OverlayState, region: Rect) {
     state.toolbar_buttons.clear();
-    let actions = [
-        ToolbarAction::Grip,
-        ToolbarAction::Numbering,
-        ToolbarAction::Tool(ToolKind::Rectangle),
-        ToolbarAction::Tool(ToolKind::Oval),
-        ToolbarAction::Tool(ToolKind::Line),
-        ToolbarAction::Tool(ToolKind::Arrow),
-        ToolbarAction::Tool(ToolKind::Pen),
-        ToolbarAction::Tool(ToolKind::Highlighter),
-        ToolbarAction::Tool(ToolKind::Text),
-        ToolbarAction::Tool(ToolKind::Tag),
-        ToolbarAction::Tool(ToolKind::Watermark),
-        ToolbarAction::Tool(ToolKind::Mosaic),
-        ToolbarAction::Divider,
-        ToolbarAction::Undo,
-        ToolbarAction::Copy,
-        ToolbarAction::Save,
-        ToolbarAction::Cancel,
-    ];
+    let actions = toolbar_actions(state);
     let toolbar_height = scaled(state, TOOLBAR_HEIGHT);
     let width = toolbar_width(state);
     let total_height = toolbar_height;
@@ -6098,9 +6776,13 @@ unsafe fn draw_toolbar_button(
     let icon_rect = match action {
         ToolbarAction::Grip => rect,
         ToolbarAction::Numbering => numbering_icon_rect(state, rect),
+        ToolbarAction::Update => update_icon_rect(state, rect),
         _ => centered_icon_rect(state, rect),
     };
-    if !matches!(action, ToolbarAction::Grip | ToolbarAction::Numbering) {
+    if !matches!(
+        action,
+        ToolbarAction::Grip | ToolbarAction::Numbering | ToolbarAction::Update
+    ) {
         fill_rounded_rect_antialias(
             hdc,
             icon_rect,
@@ -6109,9 +6791,28 @@ unsafe fn draw_toolbar_button(
         );
     }
     draw_toolbar_icon(hdc, state, action, icon_rect, palette);
+    if matches!(action, ToolbarAction::Update) {
+        draw_update_status_dot(hdc, state, rect);
+    }
     if matches!(action, ToolbarAction::Numbering) {
         draw_numbering_toggle(hdc, state, numbering_toggle_rect(state, rect), palette);
     }
+}
+
+unsafe fn draw_update_status_dot(hdc: HDC, state: &OverlayState, rect: Rect) {
+    let laser_red = Color::rgb(0xff, 0x3b, 0x30);
+    let center = Point::new(rect.center().x, rect.bottom() - scaled(state, 4.5));
+    let radius = scaled(state, 1.8);
+    fill_oval_antialias(
+        hdc,
+        Rect::new(
+            center.x - radius,
+            center.y - radius,
+            radius * 2.0,
+            radius * 2.0,
+        ),
+        laser_red,
+    );
 }
 
 unsafe fn draw_numbering_toggle(
@@ -6532,6 +7233,7 @@ unsafe fn draw_submenu_divider(
     *x_cursor += scaled(state, SUBMENU_DIVIDER + SUBMENU_GAP);
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_submenu_slider(
     hdc: HDC,
     state: &mut OverlayState,
@@ -6636,7 +7338,11 @@ unsafe fn draw_font_slider(
             MAX_FONT_SIZE,
         )
     } else {
-        (state.font_size, MIN_FONT_SIZE, MAX_FONT_SIZE)
+        (
+            state.font_size,
+            state.responsive_metrics.font_min,
+            state.responsive_metrics.font_max,
+        )
     };
     let y = state.toolbar_origin.map(|p| p.y).unwrap_or(0.0) + scaled(state, TOOLBAR_HEIGHT + 18.0);
     draw_submenu_static_svg(
@@ -6860,6 +7566,7 @@ fn toolbar_label(action: ToolbarAction) -> &'static str {
         ToolbarAction::Tool(ToolKind::Highlighter) => "H",
         ToolbarAction::Tool(ToolKind::Watermark) => "W",
         ToolbarAction::Undo => "U",
+        ToolbarAction::Update => "Up",
         ToolbarAction::Copy => "C",
         ToolbarAction::Save => "Sv",
         ToolbarAction::Cancel => "X",
@@ -6894,6 +7601,7 @@ fn toolbar_svg(action: ToolbarAction, theme: AppTheme) -> Option<&'static str> {
             Some(include_str!("../assets/toolbar/pixelate.svg"))
         }
         ToolbarAction::Undo => Some(include_str!("../assets/toolbar/undo.svg")),
+        ToolbarAction::Update => Some(include_str!("../assets/toolbar/update.svg")),
         ToolbarAction::Copy => Some(include_str!("../assets/toolbar/copy.svg")),
         ToolbarAction::Save => Some(include_str!("../assets/toolbar/save.svg")),
         ToolbarAction::Cancel => Some(include_str!("../assets/toolbar/cancel.svg")),
@@ -6911,7 +7619,12 @@ unsafe fn draw_toolbar_icon(
     let Some(svg) = toolbar_svg(action, state.theme) else {
         return;
     };
-    let svg = recolor_svg(svg, palette.icon);
+    let color = if matches!(action, ToolbarAction::Update) {
+        Color::rgb(0xc8, 0x57, 0x50)
+    } else {
+        palette.icon
+    };
+    let svg = recolor_svg(svg, color);
     if draw_svg(hdc, &svg, rect).is_err() {
         draw_label(
             hdc,
@@ -6920,38 +7633,6 @@ unsafe fn draw_toolbar_icon(
             toolbar_label(action),
         );
     }
-}
-
-fn recolor_svg(svg: &str, color: Color) -> String {
-    let hex = format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b);
-    svg.replace("#4d4d4d", &hex)
-        .replace("#4D4D4D", &hex)
-        .replace("#b3b3b3", &hex)
-        .replace("#B3B3B3", &hex)
-}
-
-unsafe fn draw_svg(hdc: HDC, svg: &str, rect: Rect) -> std::result::Result<(), ()> {
-    let opt = resvg::usvg::Options::default();
-    let tree = resvg::usvg::Tree::from_str(svg, &opt).map_err(|_| ())?;
-    let width = rect.width.round().max(1.0) as u32;
-    let height = rect.height.round().max(1.0) as u32;
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height).ok_or(())?;
-    let tree_size = tree.size();
-    let transform = resvg::tiny_skia::Transform::from_scale(
-        width as f32 / tree_size.width(),
-        height as f32 / tree_size.height(),
-    );
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
-
-    let mut bgra = vec![0_u8; (width * height * 4) as usize];
-    for (source, dest) in pixmap.data().chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
-        dest[0] = source[2];
-        dest[1] = source[1];
-        dest[2] = source[0];
-        dest[3] = source[3];
-    }
-
-    alpha_blend_bgra(hdc, rect, width, height, &bgra)
 }
 
 fn effective_stroke_color(stroke: StrokeStyle) -> Color {
@@ -7084,6 +7765,7 @@ unsafe fn draw_blur_region(hdc: HDC, rect: Rect, radius: f32) {
     let _ = alpha_blend_bgra(hdc, rect, surface_width, surface_height, &bgra);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fill_mosaic_tile_bgra(
     bgra: &mut [u8],
     surface_width: u32,
@@ -7106,10 +7788,8 @@ fn fill_mosaic_tile_bgra(
         for x in left..right {
             let fx = x as f32 + 0.5;
             let in_rounded_corner = radius > 0.0
-                && ((fx < radius && fy < radius)
-                    || (fx > region_width - radius && fy < radius)
-                    || (fx < radius && fy > region_height - radius)
-                    || (fx > region_width - radius && fy > region_height - radius));
+                && (fx < radius || fx > region_width - radius)
+                && (fy < radius || fy > region_height - radius);
             let alpha = if in_rounded_corner {
                 let coverage = rounded_rect_coverage(fx, fy, region_width, region_height, radius);
                 if coverage <= 0.0 {
@@ -7212,10 +7892,12 @@ unsafe fn draw_tiny_path_with_cap(
     paint.set_color_rgba8(color.r, color.g, color.b, color.a);
     paint.anti_alias = true;
 
-    let mut stroke = resvg::tiny_skia::Stroke::default();
-    stroke.width = stroke_style.width.max(1.0);
-    stroke.line_cap = line_cap;
-    stroke.line_join = resvg::tiny_skia::LineJoin::Round;
+    let stroke = resvg::tiny_skia::Stroke {
+        width: stroke_style.width.max(1.0),
+        line_cap,
+        line_join: resvg::tiny_skia::LineJoin::Round,
+        ..Default::default()
+    };
 
     pixmap.stroke_path(
         &path,
@@ -7900,6 +8582,7 @@ fn resize_framed_text_for_text(annotation: &mut Annotation, font_size: f32) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn draw_tag_annotation(
     hdc: HDC,
     bounds: Rect,
@@ -8497,7 +9180,11 @@ fn watermark_honeycomb_tiles(
     let mut row = 0_usize;
     let mut y = region.y - actual.height;
     while y <= region.bottom() + actual.height {
-        let stagger = if row % 2 == 0 { 0.0 } else { actual.dx / 2.0 };
+        let stagger = if row.is_multiple_of(2) {
+            0.0
+        } else {
+            actual.dx / 2.0
+        };
         let mut col = 0_usize;
         let mut x = region.x - actual.width + stagger;
         while x <= region.right() + actual.width {
@@ -8818,8 +9505,8 @@ fn faded_watermark_bitmap(bitmap: &WatermarkBitmap, opacity: f32) -> WatermarkBi
     for px in bgra.chunks_exact_mut(4) {
         let alpha = (px[3] as f32 * opacity).round().clamp(0.0, 255.0) as u8;
         px[3] = alpha;
-        for channel in 0..3 {
-            px[channel] = ((px[channel] as u16 * alpha as u16) / 255) as u8;
+        for channel in px.iter_mut().take(3) {
+            *channel = ((*channel as u16 * alpha as u16) / 255) as u8;
         }
     }
     WatermarkBitmap {
@@ -9504,9 +10191,7 @@ fn local_timestamp() -> String {
 }
 
 unsafe fn render_capture_bitmap(state: &OverlayState) -> Option<HBITMAP> {
-    let Some(region) = state.session.document.capture_region else {
-        return None;
-    };
+    let region = state.session.document.capture_region?;
 
     let screen_dc = GetDC(None);
     let source_dc = CreateCompatibleDC(screen_dc);

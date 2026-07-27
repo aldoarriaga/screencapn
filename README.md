@@ -87,3 +87,6 @@ Run the local Store-readiness check with:
 ```
 
 See [`docs/microsoft-store-path-a.md`](docs/microsoft-store-path-a.md) and [`PRIVACY.md`](PRIVACY.md) before Microsoft Store submission.
+
+Store-live source tags and submitted-package hashes are recorded in
+[`RELEASES.md`](RELEASES.md).

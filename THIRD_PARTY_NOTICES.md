@@ -56,6 +56,8 @@ Screen Cap'n uses Rust crates from crates.io. The following list is based on
 | color_quant | 1.1.0 | MIT |
 | core_maths | 0.1.1 | MIT |
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 |
+| csv | 1.4.0 | Unlicense OR MIT |
+| csv-core | 0.1.13 | Unlicense OR MIT |
 | data-url | 0.3.2 | MIT OR Apache-2.0 |
 | euclid | 0.22.14 | MIT OR Apache-2.0 |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 |
@@ -71,7 +73,7 @@ Screen Cap'n uses Rust crates from crates.io. The following list is based on
 | libm | 0.2.16 | MIT |
 | log | 0.4.29 | MIT OR Apache-2.0 |
 | memchr | 2.8.1 | Unlicense OR MIT |
-| memmap2 | 0.9.10 | MIT OR Apache-2.0 |
+| memmap2 | 0.9.11 | MIT OR Apache-2.0 |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |
 | pico-args | 0.5.0 | MIT |
@@ -82,6 +84,7 @@ Screen Cap'n uses Rust crates from crates.io. The following list is based on
 | resvg | 0.45.1 | Apache-2.0 OR MIT |
 | rgb | 0.8.53 | MIT |
 | roxmltree | 0.20.0 | MIT OR Apache-2.0 |
+| ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | rustybuzz | 0.20.1 | MIT |
 | serde | 1.0.228 | MIT OR Apache-2.0 |
 | serde_core | 1.0.228 | MIT OR Apache-2.0 |

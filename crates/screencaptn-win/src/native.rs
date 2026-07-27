@@ -1,9 +1,14 @@
 use crate::diagnostics;
 use crate::hotkey::reserved_hotkey_reason;
-use crate::overlay::{open_capture_overlay, AppTheme};
-use crate::settings::{load_settings, save_settings, AppSettings, HotkeySettings};
+use crate::overlay::{
+    open_capture_overlay, AppTheme, WM_OVERLAY_CLOSED, WM_OVERLAY_OPENED, WM_OVERLAY_SHOW_UPDATE,
+    WM_OVERLAY_UPDATE_CHANGED,
+};
+use crate::settings::{
+    load_settings, load_settings_state, save_settings, update_settings, AppSettings, HotkeySettings,
+};
 use crate::shortcut_window::edit_hotkey;
-use crate::theme::{load_theme, save_theme, toggled_theme};
+use crate::theme::{load_theme, save_theme, toggled_theme, windows_theme};
 use crate::tray::{
     add_tray_icon, remove_tray_icon, show_tray_menu, update_tray_icon, TrayAction, TrayMenuState,
     WM_TRAYICON,
@@ -13,7 +18,9 @@ use crate::updates::{
     self, UpdateEvent, UpdateInstallOutcome, UpdateService, WM_UPDATE_EVENT,
     WM_UPDATE_INSTALL_READY,
 };
+use crate::welcome_window::{show_first_run, WelcomeOutcome};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::{w, Error, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
@@ -30,18 +37,20 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, IsWindow, LoadCursorW, MessageBoxW, PostQuitMessage, RegisterClassW,
-    SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, MB_ICONWARNING, MB_OK, MSG,
-    SIZE_MINIMIZED, SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    GetWindowLongPtrW, IsWindow, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassW, RegisterWindowMessageW, SetTimer, SetWindowLongPtrW, ShowWindow,
+    TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU,
+    IDC_ARROW, MB_ICONWARNING, MB_OK, MSG, SIZE_MINIMIZED, SW_HIDE, SW_SHOWNORMAL, WINDOW_EX_STYLE,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP,
+    WM_SIZE, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 const APP_CLASS: windows::core::PCWSTR = w!("ScreenCaptnHiddenWindow");
+static TASKBAR_CREATED_MESSAGE: AtomicU32 = AtomicU32::new(0);
 const HOTKEY_ID: i32 = 100;
 const UPDATE_CHECK_TIMER_ID: usize = 4;
 const UPDATE_TICK_MILLISECONDS: u32 = 60 * 60 * 1000;
+const WM_SHOW_FIRST_RUN: u32 = WM_APP + 0x51;
 
 pub struct NativeApp {
     hwnd: HWND,
@@ -52,6 +61,8 @@ struct AppState {
     settings: AppSettings,
     updates: UpdateService,
     overlay_open: bool,
+    overlay_hwnd: Option<HWND>,
+    welcome_open: bool,
     hotkey_registered: bool,
 }
 
@@ -59,6 +70,11 @@ impl NativeApp {
     pub fn new() -> Result<Self> {
         unsafe {
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let taskbar_created_message = RegisterWindowMessageW(w!("TaskbarCreated"));
+            TASKBAR_CREATED_MESSAGE.store(taskbar_created_message, Ordering::Relaxed);
+            if taskbar_created_message == 0 {
+                diagnostics::log_event("startup", "taskbar-created-message-registration-failed");
+            }
             let instance = GetModuleHandleW(None)?;
             let class = WNDCLASSW {
                 hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -71,15 +87,23 @@ impl NativeApp {
             RegisterClassW(&class);
 
             let updates = UpdateService::default();
-            let mut settings = load_settings();
+            let loaded = load_settings_state();
+            let show_first_run = loaded.is_new_install && !loaded.settings.onboarding.completed;
+            let mut settings = loaded.settings;
             if updates::clear_installed_pending_update(&mut settings.update_check) {
                 let _ = save_settings(&settings);
             }
             let mut state = Box::new(AppState {
-                theme: load_theme(),
+                theme: if show_first_run {
+                    windows_theme()
+                } else {
+                    load_theme()
+                },
                 settings,
                 updates,
                 overlay_open: false,
+                overlay_hwnd: None,
+                welcome_open: false,
                 hotkey_registered: false,
             });
             let state_ptr = state.as_mut() as *mut AppState;
@@ -113,6 +137,9 @@ impl NativeApp {
                 .updates
                 .begin_due_check(hwnd, &state.settings.update_check);
             Box::leak(state);
+            if show_first_run {
+                let _ = PostMessageW(hwnd, WM_SHOW_FIRST_RUN, WPARAM(0), LPARAM(0));
+            }
 
             Ok(Self { hwnd })
         }
@@ -148,6 +175,18 @@ unsafe extern "system" fn app_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let taskbar_created_message = TASKBAR_CREATED_MESSAGE.load(Ordering::Relaxed);
+    if taskbar_created_message != 0 && msg == taskbar_created_message {
+        if let Some(state) = app_state_mut(hwnd) {
+            if let Err(error) = add_tray_icon(hwnd, &state.settings) {
+                diagnostics::log_event("lifecycle", &format!("tray-restore-failed: {error:?}"));
+            } else {
+                diagnostics::log_event("lifecycle", "tray-restored-after-explorer-restart");
+            }
+        }
+        return LRESULT(0);
+    }
+
     match msg {
         WM_CREATE => {
             let create = lparam.0 as *const CREATESTRUCTW;
@@ -157,7 +196,7 @@ unsafe extern "system" fn app_wnd_proc(
         }
         WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
             if let Some(state) = app_state_mut(hwnd) {
-                if state.overlay_open {
+                if state.overlay_open || state.welcome_open {
                     return LRESULT(0);
                 }
                 state.overlay_open = true;
@@ -165,12 +204,16 @@ unsafe extern "system" fn app_wnd_proc(
                 let theme = state.theme;
                 state.settings = load_settings();
                 let settings = state.settings.clone();
-                let _ = open_capture_overlay(theme, settings);
+                let _ = open_capture_overlay(hwnd, theme, settings);
                 if let Some(state) = app_state_mut(hwnd) {
                     state.overlay_open = false;
                     state.settings = load_settings();
                 }
             }
+            LRESULT(0)
+        }
+        WM_SHOW_FIRST_RUN => {
+            show_first_run_setup(hwnd, false);
             LRESULT(0)
         }
         WM_TRAYICON => {
@@ -186,10 +229,14 @@ unsafe extern "system" fn app_wnd_proc(
                 match show_tray_menu(hwnd, menu) {
                     Some(TrayAction::SetShortcut) => edit_shortcut(hwnd),
                     Some(TrayAction::ToggleAutoSave) => toggle_auto_save(hwnd),
+                    Some(TrayAction::OpenAutoSaveFolder) => open_auto_save_folder(hwnd),
                     Some(TrayAction::SetAutoSaveFolder) => choose_auto_save_folder(hwnd),
                     Some(TrayAction::ToggleTheme) => toggle_theme(hwnd),
+                    Some(TrayAction::ToggleCaptureTips) => toggle_capture_tips(hwnd),
+                    Some(TrayAction::OpenSetup) => show_first_run_setup(hwnd, true),
                     Some(TrayAction::ToggleRunOnStartup) => toggle_run_on_startup(hwnd),
-                    Some(TrayAction::ShowUpdate) => show_available_update(hwnd),
+                    Some(TrayAction::ShowUpdate) => show_available_update(hwnd, None),
+                    Some(TrayAction::ReportBug) => open_bug_report_page(hwnd),
                     Some(TrayAction::Donate) => open_donation_page(hwnd),
                     Some(TrayAction::Exit) => {
                         let _ = DestroyWindow(hwnd);
@@ -209,6 +256,28 @@ unsafe extern "system" fn app_wnd_proc(
         }
         WM_UPDATE_EVENT => {
             handle_update_events(hwnd);
+            LRESULT(0)
+        }
+        WM_OVERLAY_OPENED => {
+            if let Some(state) = app_state_mut(hwnd) {
+                state.overlay_hwnd = Some(HWND(wparam.0 as *mut _));
+                notify_overlay_update_state(state);
+            }
+            LRESULT(0)
+        }
+        WM_OVERLAY_CLOSED => {
+            if let Some(state) = app_state_mut(hwnd) {
+                let closed = HWND(wparam.0 as *mut _);
+                if state.overlay_hwnd == Some(closed) {
+                    state.overlay_hwnd = None;
+                    state.overlay_open = false;
+                }
+            }
+            LRESULT(0)
+        }
+        WM_OVERLAY_SHOW_UPDATE => {
+            let owner = HWND(wparam.0 as *mut _);
+            show_available_update(hwnd, Some(owner));
             LRESULT(0)
         }
         WM_UPDATE_INSTALL_READY => {
@@ -274,24 +343,48 @@ unsafe fn toggle_theme(hwnd: HWND) {
     }
 }
 
+unsafe fn toggle_capture_tips(hwnd: HWND) {
+    if let Some(state) = app_state_mut(hwnd) {
+        let previous = state.settings.show_capture_tips;
+        let enabled = !previous;
+        match update_settings(|settings| settings.show_capture_tips = enabled) {
+            Ok(settings) => state.settings = settings,
+            Err(error) => {
+                state.settings.show_capture_tips = previous;
+                show_settings_error(hwnd, "change capture tips", &error);
+            }
+        }
+    }
+}
+
 unsafe fn edit_shortcut(hwnd: HWND) {
-    let Some(state) = app_state_mut(hwnd) else {
+    let Some((initial, theme)) =
+        app_state_mut(hwnd).map(|state| (state.settings.hotkey.clone(), state.theme))
+    else {
         return;
     };
-    if let Ok(Some(hotkey)) = edit_hotkey(state.settings.hotkey.clone()) {
+    if let Ok(Some(hotkey)) = edit_hotkey(hwnd, initial, theme) {
         if let Some(reason) = reserved_hotkey_reason(&hotkey) {
             show_hotkey_error(hwnd, reason);
             return;
         }
 
+        let Some(state) = app_state_mut(hwnd) else {
+            return;
+        };
         let previous = state.settings.hotkey.clone();
         if apply_user_hotkey(hwnd, state, hotkey).is_ok() {
-            if let Err(error) = save_settings(&state.settings) {
-                state.settings.hotkey = previous;
-                let _ = register_configured_hotkey(hwnd, state);
-                show_settings_error(hwnd, "save the shortcut", &error);
-            } else {
-                update_tray_icon(hwnd, &state.settings);
+            let next = state.settings.hotkey.clone();
+            match update_settings(|settings| settings.hotkey = next) {
+                Ok(settings) => {
+                    state.settings = settings;
+                    update_tray_icon(hwnd, &state.settings);
+                }
+                Err(error) => {
+                    state.settings.hotkey = previous;
+                    let _ = register_configured_hotkey(hwnd, state);
+                    show_settings_error(hwnd, "save the shortcut", &error);
+                }
             }
         } else {
             state.settings.hotkey = previous;
@@ -308,11 +401,16 @@ unsafe fn toggle_auto_save(hwnd: HWND) {
     if let Some(state) = app_state_mut(hwnd) {
         let previous = state.settings.auto_save.enabled;
         state.settings.auto_save.enabled = !state.settings.auto_save.enabled;
-        if let Err(error) = save_settings(&state.settings) {
-            state.settings.auto_save.enabled = previous;
-            show_settings_error(hwnd, "change automatic saving", &error);
-        } else {
-            update_tray_icon(hwnd, &state.settings);
+        let enabled = state.settings.auto_save.enabled;
+        match update_settings(|settings| settings.auto_save.enabled = enabled) {
+            Ok(settings) => {
+                state.settings = settings;
+                update_tray_icon(hwnd, &state.settings);
+            }
+            Err(error) => {
+                state.settings.auto_save.enabled = previous;
+                show_settings_error(hwnd, "change automatic saving", &error);
+            }
         }
     }
 }
@@ -322,14 +420,36 @@ unsafe fn choose_auto_save_folder(hwnd: HWND) {
         if let Some(state) = app_state_mut(hwnd) {
             let previous = state.settings.auto_save.folder.clone();
             state.settings.auto_save.folder = folder;
-            if let Err(error) = save_settings(&state.settings) {
-                state.settings.auto_save.folder = previous;
-                show_settings_error(hwnd, "change the automatic-save folder", &error);
-            } else {
-                update_tray_icon(hwnd, &state.settings);
+            let next = state.settings.auto_save.folder.clone();
+            match update_settings(|settings| settings.auto_save.folder = next) {
+                Ok(settings) => {
+                    state.settings = settings;
+                    update_tray_icon(hwnd, &state.settings);
+                }
+                Err(error) => {
+                    state.settings.auto_save.folder = previous;
+                    show_settings_error(hwnd, "change the automatic-save folder", &error);
+                }
             }
         }
     }
+}
+
+unsafe fn open_auto_save_folder(hwnd: HWND) {
+    let folder = app_settings(hwnd).auto_save.folder;
+    if let Err(error) = std::fs::create_dir_all(&folder) {
+        show_settings_error(hwnd, "open the automatic-save folder", &error);
+        return;
+    }
+    let folder = wide_null(&folder.to_string_lossy());
+    let _ = ShellExecuteW(
+        hwnd,
+        w!("open"),
+        windows::core::PCWSTR(folder.as_ptr()),
+        None,
+        None,
+        SW_SHOWNORMAL,
+    );
 }
 
 unsafe fn toggle_run_on_startup(hwnd: HWND) {
@@ -345,7 +465,7 @@ unsafe fn toggle_run_on_startup(hwnd: HWND) {
     }
 }
 
-unsafe fn show_available_update(hwnd: HWND) {
+unsafe fn show_available_update(hwnd: HWND, dialog_owner: Option<HWND>) {
     let Some(state) = app_state_mut(hwnd) else {
         return;
     };
@@ -353,9 +473,9 @@ unsafe fn show_available_update(hwnd: HWND) {
         return;
     };
     let theme = state.theme;
-    match show_update_dialog(hwnd, theme, pending.clone()) {
+    match show_update_dialog(dialog_owner.unwrap_or(hwnd), theme, pending.clone()) {
         Ok(Some(UpdateDialogAction::UpdateNow)) => state.updates.begin_install(hwnd),
-        Ok(Some(UpdateDialogAction::MoreDetails)) => open_update_details(hwnd, &pending.version),
+        Ok(Some(UpdateDialogAction::MoreDetails)) => open_update_details(hwnd, &pending),
         _ => {}
     }
 }
@@ -368,21 +488,45 @@ unsafe fn handle_update_events(hwnd: HWND) {
         match event {
             UpdateEvent::CheckCompleted(outcome) => {
                 updates::apply_check_outcome(&mut state.settings.update_check, outcome);
-                if let Err(error) = save_settings(&state.settings) {
-                    diagnostics::log_event("updates", &format!("settings-save-failed: {error}"));
+                let next = state.settings.update_check.clone();
+                match update_settings(|settings| settings.update_check = next) {
+                    Ok(settings) => state.settings = settings,
+                    Err(error) => {
+                        diagnostics::log_event(
+                            "updates",
+                            &format!("settings-save-failed: {error}"),
+                        );
+                    }
                 }
+                notify_overlay_update_state(state);
             }
             UpdateEvent::InstallCompleted(UpdateInstallOutcome::Completed) => {
                 state.settings.update_check.pending = None;
-                if let Err(error) = save_settings(&state.settings) {
-                    diagnostics::log_event("updates", &format!("settings-save-failed: {error}"));
+                let next = state.settings.update_check.clone();
+                match update_settings(|settings| settings.update_check = next) {
+                    Ok(settings) => state.settings = settings,
+                    Err(error) => {
+                        diagnostics::log_event(
+                            "updates",
+                            &format!("settings-save-failed: {error}"),
+                        );
+                    }
                 }
+                notify_overlay_update_state(state);
             }
             UpdateEvent::InstallCompleted(UpdateInstallOutcome::NoUpdate) => {
                 state.settings.update_check.pending = None;
-                if let Err(error) = save_settings(&state.settings) {
-                    diagnostics::log_event("updates", &format!("settings-save-failed: {error}"));
+                let next = state.settings.update_check.clone();
+                match update_settings(|settings| settings.update_check = next) {
+                    Ok(settings) => state.settings = settings,
+                    Err(error) => {
+                        diagnostics::log_event(
+                            "updates",
+                            &format!("settings-save-failed: {error}"),
+                        );
+                    }
                 }
+                notify_overlay_update_state(state);
             }
             UpdateEvent::InstallCompleted(UpdateInstallOutcome::Failed) => {
                 show_update_install_error(hwnd);
@@ -391,8 +535,8 @@ unsafe fn handle_update_events(hwnd: HWND) {
     }
 }
 
-unsafe fn open_update_details(hwnd: HWND, version: &str) {
-    let url = updates::details_url(version);
+unsafe fn open_update_details(hwnd: HWND, pending: &crate::settings::PendingUpdate) {
+    let url = updates::details_url(pending);
     let url = wide_null(&url);
     let _ = ShellExecuteW(
         hwnd,
@@ -424,6 +568,94 @@ unsafe fn open_donation_page(hwnd: HWND) {
         None,
         None,
         SW_SHOWNORMAL,
+    );
+}
+
+unsafe fn open_bug_report_page(hwnd: HWND) {
+    let _ = ShellExecuteW(
+        hwnd,
+        w!("open"),
+        w!("https://screencapn.com/feedback/"),
+        None,
+        None,
+        SW_SHOWNORMAL,
+    );
+}
+
+unsafe fn show_first_run_setup(hwnd: HWND, manual: bool) {
+    let Some(state) = app_state_mut(hwnd) else {
+        return;
+    };
+    if state.welcome_open || (!manual && state.settings.onboarding.completed) {
+        return;
+    }
+    state.welcome_open = true;
+    let settings = state.settings.clone();
+    let theme = state.theme;
+    let startup_enabled = crate::startup::state().is_enabled();
+    let outcome = show_first_run(
+        hwnd,
+        &settings,
+        theme,
+        startup_enabled,
+        !settings.onboarding.completed,
+    )
+    .unwrap_or(WelcomeOutcome::Skip);
+
+    let Some(state) = app_state_mut(hwnd) else {
+        return;
+    };
+    state.welcome_open = false;
+    match outcome {
+        WelcomeOutcome::Finish(choices) => {
+            state.settings.auto_save.enabled = choices.auto_save;
+            state.settings.auto_save.folder = choices.folder;
+            state.settings.diagnostics.enabled = choices.diagnostics;
+            state.settings.onboarding.completed = true;
+            state.theme = choices.theme;
+            save_theme(choices.theme);
+            diagnostics::set_enabled(choices.diagnostics);
+            if let Err(message) = crate::startup::set_enabled(choices.startup) {
+                let message = wide_null(&message);
+                let title = wide_null("Screen Cap'n Startup");
+                let _ = MessageBoxW(
+                    hwnd,
+                    windows::core::PCWSTR(message.as_ptr()),
+                    windows::core::PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONWARNING,
+                );
+            }
+        }
+        WelcomeOutcome::Skip => {
+            state.settings.onboarding.completed = true;
+        }
+    }
+    let auto_save = state.settings.auto_save.clone();
+    let diagnostics = state.settings.diagnostics.clone();
+    let onboarding = state.settings.onboarding.clone();
+    match update_settings(|settings| {
+        settings.auto_save = auto_save;
+        settings.diagnostics = diagnostics;
+        settings.onboarding = onboarding;
+    }) {
+        Ok(settings) => {
+            state.settings = settings;
+            update_tray_icon(hwnd, &state.settings);
+        }
+        Err(error) => show_settings_error(hwnd, "finish first-run setup", &error),
+    }
+}
+
+unsafe fn notify_overlay_update_state(state: &AppState) {
+    let Some(overlay) = state.overlay_hwnd else {
+        return;
+    };
+    let available = usize::from(state.settings.update_check.pending.is_some());
+    let _ = PostMessageW(
+        overlay,
+        WM_OVERLAY_UPDATE_CHANGED,
+        WPARAM(available),
+        LPARAM(0),
     );
 }
 

@@ -41,16 +41,21 @@ pub fn state() -> RunOnStartupState {
 }
 
 pub fn toggle() -> Result<RunOnStartupState, String> {
+    set_enabled(!state().is_enabled())
+}
+
+pub fn set_enabled(enabled: bool) -> Result<RunOnStartupState, String> {
     if let Ok(task) = packaged_task() {
-        return toggle_packaged(&task);
+        return set_packaged(&task, enabled);
     }
-    let enabled = registry_entry_exists();
     if enabled {
+        if !registry_entry_exists() {
+            write_registry_entry().map_err(|error| error.to_string())?;
+        }
+        Ok(RunOnStartupState::Enabled)
+    } else {
         remove_registry_entry().map_err(|error| error.to_string())?;
         Ok(RunOnStartupState::Disabled)
-    } else {
-        write_registry_entry().map_err(|error| error.to_string())?;
-        Ok(RunOnStartupState::Enabled)
     }
 }
 
@@ -72,13 +77,13 @@ fn packaged_state(state: StartupTaskState) -> RunOnStartupState {
     }
 }
 
-fn toggle_packaged(task: &StartupTask) -> Result<RunOnStartupState, String> {
+fn set_packaged(task: &StartupTask, enabled: bool) -> Result<RunOnStartupState, String> {
     match packaged_state(task.State().map_err(|error| error.to_string())?) {
-        RunOnStartupState::Enabled => {
+        RunOnStartupState::Enabled if !enabled => {
             task.Disable().map_err(|error| error.to_string())?;
             Ok(RunOnStartupState::Disabled)
         }
-        RunOnStartupState::Disabled => {
+        RunOnStartupState::Disabled if enabled => {
             let state = task
                 .RequestEnableAsync()
                 .and_then(|operation| operation.get())
@@ -95,6 +100,9 @@ fn toggle_packaged(task: &StartupTask) -> Result<RunOnStartupState, String> {
                 ),
                 _ => Ok(state),
             }
+        }
+        RunOnStartupState::Enabled | RunOnStartupState::Disabled => {
+            Ok(packaged_state(task.State().map_err(|error| error.to_string())?))
         }
         RunOnStartupState::DisabledByUser => Err(
             "Windows has disabled Screen Cap'n in Startup Apps. Re-enable it from Windows Settings > Apps > Startup."

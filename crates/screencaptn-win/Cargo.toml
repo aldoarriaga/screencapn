@@ -21,6 +21,7 @@ windows = { version = "0.58", features = [
   "Foundation",
   "Foundation_Collections",
   "Services_Store",
+  "UI_ViewManagement",
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
@@ -42,3 +43,6 @@ windows = { version = "0.58", features = [
   "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+csv = "1"
