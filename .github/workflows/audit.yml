@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
-      - run: cargo audit
+      - run: cargo +stable audit
 
   npm-audit:
     runs-on: ubuntu-latest
